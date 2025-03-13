@@ -8,3 +8,4 @@ torchrl
 tensordict
 tqdm
 matplotlib
+lion-pytorch
