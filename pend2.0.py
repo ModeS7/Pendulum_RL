@@ -1,4 +1,3 @@
-
 from collections import defaultdict
 from typing import Optional
 
@@ -27,64 +26,125 @@ from torchrl.envs.utils import check_env_specs, step_mdp
 
 DEFAULT_X = np.pi
 DEFAULT_Y = 1.0
+# System Parameters (from the QUBE-Servo 2 manual)
+# Motor and Pendulum parameters
+Rm = 8.4  # Motor resistance (Ohm)
+kt = 0.042  # Motor torque constant (N·m/A)
+km = 0.042  # Motor back-EMF constant (V·s/rad)
+Jm = 4e-6  # Motor moment of inertia (kg·m²)
+Jp = 3.3e-5  # Pendulum moment of inertia (kg·m²)
+Mp = 0.024  # Pendulum mass (kg)
+Lp = 0.129  # Pendulum length from pivot to center of mass (m) (0.085 + 0.129)/2
+Br = 0.001  # Rotary arm viscous damping coefficient (N·m·s/rad)
+Bp = 0.0005  # Pendulum viscous damping coefficient (N·m·s/rad)
+g_default = 9.81  # Gravity constant (m/s²)
+
+def angle_normalize(x):
+    return ((x + np.pi) % (2 * np.pi)) - np.pi
+
+def pendulum_dynamics(state, vm, params):
+    """
+    Compute derivatives for the QUBE-Servo 2 pendulum system
+
+    state = [theta, alpha, theta_dot, alpha_dot]
+    where:
+        theta = rotary arm angle
+        alpha = pendulum angle
+        theta_dot = rotary arm angular velocity
+        alpha_dot = pendulum angular velocity
+
+    Returns [theta_dot, alpha_dot, theta_ddot, alpha_ddot]
+    """
+    theta, alpha, theta_dot, alpha_dot = torch.split(state, 1, dim=-1)
+
+    Rm = params["Rm"]
+    kt = params["kt"]
+    km = params["km"]
+    Jm = params["Jm"]
+    Jp = params["Jp"]
+    Mp = params["Mp"]
+    Lp = params["Lp"]
+    Br = params["Br"]
+    Bp = params["Bp"]
+    g = params["g"]
+
+    # Motor current
+    im = (vm - km * theta_dot) / Rm
+
+    # Motor torque
+    tau = kt * im
+
+    # Equations of motion
+    # Inertia matrix elements
+    M11 = Jm + Jp * torch.sin(alpha) ** 2
+    M12 = Jp * Lp * torch.cos(alpha)
+    M21 = M12
+    M22 = Jp
+
+    # Coriolis and centrifugal terms
+    C1 = Jp * torch.sin(2 * alpha) * theta_dot * alpha_dot / 2 + Br * theta_dot
+    C2 = -Jp * torch.sin(alpha) * theta_dot ** 2 / 2 + Bp * alpha_dot
+
+    # Gravity terms
+    G1 = 0
+    G2 = Mp * g * Lp * torch.sin(alpha)
+
+    # Torque input vector
+    B1 = tau
+    B2 = 0
+
+    # Solve for accelerations
+    det = M11 * M22 - M12 * M21
+    theta_ddot = (M22 * (B1 - C1 - G1) - M12 * (B2 - C2 - G2)) / det
+    alpha_ddot = (-M21 * (B1 - C1 - G1) + M11 * (B2 - C2 - G2)) / det
+
+    return torch.cat([theta_dot, alpha_dot, theta_ddot, alpha_ddot], dim=-1)
 
 
 def _step(tensordict):
-    th, thdot, thdotdot = tensordict["th"], tensordict["thdot"], tensordict["thdotdot"]
-    phi, phidot, phidotdot = tensordict["phi"], tensordict["phidot"], tensordict["phidotdot"]
-
-    g = tensordict["params", "g"]
-    m_p = tensordict["params", "m"]
-    l = tensordict["params", "l"]
-    dt = tensordict["params", "dt"]
+    th = tensordict["th"]
+    thdot = tensordict["thdot"]
+    phi = tensordict["phi"]
+    phidot = tensordict["phidot"]
     u = tensordict["action"].squeeze(-1)
-    u = u.clamp(-tensordict["params", "max_voltage"], tensordict["params", "max_voltage"])
-    J_p = m_p * (l * 2.0) ** 2.0 / 3.0
+    params = tensordict["params"]
+    dt = params["dt"]
+    max_voltage = params["max_voltage"]
 
-    costs = angle_normalize(th) ** 2.0 + 0.1 * thdot ** 2.0 + 0.001 * (u ** 2.0)
+    u = u.clamp(-max_voltage, max_voltage)
 
-    # Phi angle penalty to reward
-    #costs += 0.1 * angle_normalize(phi) ** 2
+    state = torch.stack([th, phi, thdot, phidot], dim=-1)
+    d_state = pendulum_dynamics(state, u.unsqueeze(-1), params)
+    thdot_new, phidot_new, thddot_new, phiddot_new = torch.split(d_state, 1, dim=-1)
 
-    # Add action variance penalty to reward
+    new_th = th + thdot_new * dt
+    new_thdot = thdot + thddot_new * dt
+    new_phi = phi + phidot_new * dt
+    new_phidot = phidot + phiddot_new * dt
+
+    costs = angle_normalize(new_th) ** 2.0 + 0.1 * new_thdot ** 2.0 + 0.001 * (u ** 2.0)
+    costs += 0.1 * angle_normalize(new_phi) ** 2
     costs += 1 * ((u - u.mean()) ** 2.0).mean()
 
-    #new_phidotdot = u / 19.0
-    new_phidotdot = 149.3 * th - 14.93 * phidot + 4.915 * thdot + 49.73 * u
-    #new_phidotdot = -41.6 * th - 4.16 * phidot + 1.37 * thdot + 13.9 * u
-    new_phidot = phidot + new_phidotdot * dt
-    new_phi = phi + new_phidot * dt
-    #new_thdotdot = -(m_p * g * l * 0.5 * th.sin() + m_p * l * 0.5 * u / 1.615 * th.cos()) / J_p
-    new_thdotdot = -261.6 * th + 14.76 * phidot - 8.614 * thdot - 49.15 * u
-    #new_thdotdot = 72.4 * th - 4.11 * phidot - 2.4 * thdot + 13.7 * u
-    new_thdot = thdot + new_thdotdot * dt
-    new_th = th + new_thdot * dt
-
-    #new_thdotdot = new_thdotdot.clamp(-torch.pi, torch.pi)
-    #new_thdot = (thdot + new_thdotdot * dt).clamp(-10.0, 10.0)
-
-    #new_phi = new_phi.clamp(-tensordict["params", "max_phi"], tensordict["params", "max_phi"])
     reward = -costs.view(*tensordict.shape, 1)
     done = torch.zeros_like(reward, dtype=torch.bool)
+
     out = TensorDict(
         {
             "th": new_th,
             "thdot": new_thdot,
-            "thdotdot": new_thdotdot,
             "phi": new_phi,
             "phidot": new_phidot,
-            "phidotdot": new_phidotdot,
-            "params": tensordict["params"],
             "reward": reward,
             "done": done,
+            "params": params,
+            "action": tensordict["action"] # Keep action for next step if needed
         },
         tensordict.shape,
     )
     return out
 
 
-def angle_normalize(x):
-    return ((x + torch.pi) % (2 * torch.pi)) - torch.pi
 def _reset(self, tensordict):
     if tensordict is None or tensordict.is_empty():
         tensordict = self.gen_params(batch_size=self.batch_size)
@@ -98,20 +158,18 @@ def _reset(self, tensordict):
         torch.rand(tensordict.shape, generator=self.rng, device=self.device)
         * (high_th - low_th)
         + low_th
-    )
+    ).unsqueeze(-1)
     thdot = (
         torch.rand(tensordict.shape, generator=self.rng, device=self.device)
         * (high_thdot - low_thdot)
         + low_thdot
-    )
+    ).unsqueeze(-1)
     out = TensorDict(
         {
             "th": th,
             "thdot": thdot,
-            "thdotdot": torch.zeros_like(th),
             "phi": torch.zeros_like(th),
             "phidot": torch.zeros_like(th),
-            "phidotdot": torch.zeros_like(th),
             "params": tensordict["params"],
         },
         batch_size=tensordict.shape,
@@ -119,84 +177,27 @@ def _reset(self, tensordict):
     )
     return out
 def _make_spec(self, td_params):
-    # Under the hood, this will populate self.output_spec["observation"]
-    """self.observation_spec = CompositeSpec(
-        th=BoundedTensorSpec(
-            low=-torch.pi,
-            high=torch.pi,
-            shape=(),
-            dtype=torch.float32,
-        ),
-        thdot=BoundedTensorSpec(
-            low=-20.0,
-            high=20.0,
-            shape=(),
-            dtype=torch.float32,
-        ),
-        thdotdot=BoundedTensorSpec(
-            low=-torch.pi,
-            high=torch.pi,
-            shape=(),
-            dtype=torch.float32,
-        ),
-        phi=BoundedTensorSpec(
-            #low=-td_params["params", "max_phi"],
-            #high=td_params["params", "max_phi"],
-            low=-torch.pi,
-            high=torch.pi,
-            shape=(),
-            dtype=torch.float32,
-        ),
-        phidot=BoundedTensorSpec(
-            low=-torch.pi,
-            high=torch.pi,
-            shape=(),
-            dtype=torch.float32,
-        ),
-        phidotdot=BoundedTensorSpec(
-            low=-torch.pi,
-            high=torch.pi,
-            shape=(),
-            dtype=torch.float32,
-        ),"""
-
     self.observation_spec = CompositeSpec(
         th=UnboundedContinuousTensorSpec(
-            shape=(),
+            shape=(1,),
             dtype=torch.float32,
         ),
         thdot=UnboundedContinuousTensorSpec(
-            shape=(),
-            dtype=torch.float32,
-        ),
-        thdotdot=UnboundedContinuousTensorSpec(
-            shape=(),
+            shape=(1,),
             dtype=torch.float32,
         ),
         phi=UnboundedContinuousTensorSpec(
-            shape=(),
+            shape=(1,),
             dtype=torch.float32,
         ),
         phidot=UnboundedContinuousTensorSpec(
-            shape=(),
+            shape=(1,),
             dtype=torch.float32,
         ),
-        phidotdot=UnboundedContinuousTensorSpec(
-            shape=(),
-            dtype=torch.float32,
-        ),
-
-        # we need to add the ``params`` to the observation specs, as we want
-        # to pass it at each step during a rollout
         params=make_composite_from_td(td_params["params"]),
         shape=(),
     )
-
-    # since the environment is stateless, we expect the previous output as input.
-    # For this, ``EnvBase`` expects some state_spec to be available
     self.state_spec = self.observation_spec.clone()
-    # action-spec will be automatically wrapped in input_spec when
-    # `self.action_spec = spec` will be called supported
     self.action_spec = BoundedTensorSpec(
         low=-td_params["params", "max_voltage"],
         high=td_params["params", "max_voltage"],
@@ -207,8 +208,6 @@ def _make_spec(self, td_params):
 
 
 def make_composite_from_td(td):
-    # custom function to convert a ``tensordict`` in a similar spec structure
-    # of unbounded values.
     composite = CompositeSpec(
         {
             key: make_composite_from_td(tensor)
@@ -225,20 +224,26 @@ def _set_seed(self, seed: Optional[int]):
     rng = torch.manual_seed(seed)
     self.rng = rng
 
-def gen_params(g=9.81, batch_size=None) -> TensorDictBase:
-    """Returns a ``tensordict`` containing the physical parameters such as gravitational force and torque or speed limits."""
+def gen_params(g=g_default, batch_size=None) -> TensorDictBase:
+    """Returns a ``tensordict`` containing the physical parameters for the QUBE-Servo 2."""
     if batch_size is None:
         batch_size = []
     td = TensorDict(
         {
             "params": TensorDict(
                 {
-                    #"max_phi": 2.0/3.0,
-                    "max_voltage": 5.0,
-                    "dt": 0.05,
-                    "g": g,
-                    "m": 0.024,
-                    "l": 0.129/2.0,
+                    "max_voltage": torch.tensor(5.0),
+                    "dt": torch.tensor(0.05),  # Using the simulation dt from the manual
+                    "g": torch.tensor(g),
+                    "Rm": torch.tensor(Rm),
+                    "kt": torch.tensor(kt),
+                    "km": torch.tensor(km),
+                    "Jm": torch.tensor(Jm),
+                    "Jp": torch.tensor(Jp),
+                    "Mp": torch.tensor(Mp),
+                    "Lp": torch.tensor(Lp),
+                    "Br": torch.tensor(Br),
+                    "Bp": torch.tensor(Bp),
                 },
                 [],
             )
@@ -248,6 +253,7 @@ def gen_params(g=9.81, batch_size=None) -> TensorDictBase:
     if batch_size:
         td = td.expand(batch_size).contiguous()
     return td
+
 class PendulumEnv(EnvBase):
     metadata = {
         "render_modes": ["human", "rgb_array"],
@@ -259,7 +265,7 @@ class PendulumEnv(EnvBase):
         if td_params is None:
             td_params = self.gen_params()
 
-        super().__init__(device=device, batch_size=[])
+        super().__init__(device=device, batch_size=td_params.shape)
         self._make_spec(td_params)
         if seed is None:
             seed = torch.empty((), dtype=torch.int64).random_().item()
@@ -285,11 +291,10 @@ td = env.rand_step(td)
 print("random step tensordict", td)
 env = TransformedEnv(
     env,
-    # ``Unsqueeze`` the observations that we will concatenate
     UnsqueezeTransform(
         dim=-1,
-        in_keys=["th", "thdot", "thdotdot", "phi", "phidot", "phidotdot"],
-        in_keys_inv=["th", "thdot", "thdotdot", "phi", "phidot", "phidotdot"],
+        in_keys=["th", "thdot", "phi", "phidot"],
+        in_keys_inv=["th", "thdot", "phi", "phidot"],
     ),
 )
 
@@ -297,15 +302,11 @@ class SinTransform(Transform):
     def _apply_transform(self, obs: torch.Tensor) -> None:
         return obs.sin()
 
-    # The transform must also modify the data at reset time
     def _reset(
         self, tensordict: TensorDictBase, tensordict_reset: TensorDictBase
     ) -> TensorDictBase:
         return self._call(tensordict_reset)
 
-    # _apply_to_composite will execute the observation spec transform across all
-    # in_keys/out_keys pairs and write the result in the observation_spec which
-    # is of type ``Composite``
     @_apply_to_composite
     def transform_observation_spec(self, observation_spec):
         return BoundedTensorSpec(
@@ -321,15 +322,11 @@ class CosTransform(Transform):
     def _apply_transform(self, obs: torch.Tensor) -> None:
         return obs.cos()
 
-    # The transform must also modify the data at reset time
     def _reset(
         self, tensordict: TensorDictBase, tensordict_reset: TensorDictBase
     ) -> TensorDictBase:
         return self._call(tensordict_reset)
 
-    # _apply_to_composite will execute the observation spec transform across all
-    # in_keys/out_keys pairs and write the result in the observation_spec which
-    # is of type ``Composite``
     @_apply_to_composite
     def transform_observation_spec(self, observation_spec):
         return BoundedTensorSpec(
@@ -358,12 +355,10 @@ env.append_transform(cat_transform)
 check_env_specs(env)
 
 def simple_rollout(steps=100):
-    # preallocate:
     data = TensorDict({}, [steps])
-    # reset
     _data = env.reset()
     for i in range(steps):
-        _data["action"] = env.action_spec.rand()
+        _data["action"] = env.action_spec.rand(_data.shape)
         _data = env.step(_data)
         data[i] = _data
         _data = step_mdp(_data, keep_other=True)
@@ -372,15 +367,15 @@ def simple_rollout(steps=100):
 
 print("data from rollout:", simple_rollout(100))
 
-batch_size = 10  # number of environments to be executed in batch
+batch_size = 10
 td = env.reset(env.gen_params(batch_size=[batch_size]))
 print("reset (batch size of 10)", td)
 td = env.rand_step(td)
 print("rand step (batch size of 10)", td)
 
 rollout = env.rollout(
-    6,
-    auto_reset=False,  # we're executing the reset out of the ``rollout`` call
+    4,
+    auto_reset=False,
     tensordict=env.reset(env.gen_params(batch_size=[batch_size])),
 )
 print("rollout of len 3 (batch size of 10):", rollout)
@@ -390,7 +385,7 @@ env.set_seed(0)
 
 
 net = nn.Sequential(
-    nn.Linear(6, 64),  # Initialize with zero bias
+    nn.Linear(6, 64),  # Correct input size after concatenation
     nn.ReLU(),
     nn.Linear(64, 1),
 )
@@ -401,7 +396,6 @@ policy = TensorDictModule(
 )
 
 optim = torch.optim.Adam(policy.parameters(), lr=2e-3)
-#optim = Lion(policy.parameters(), lr=2e-3)
 batch_size = 8
 pbar = tqdm.tqdm(range(100 // batch_size))
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, 1_000)
