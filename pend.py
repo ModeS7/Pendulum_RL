@@ -39,13 +39,20 @@ def _step(tensordict):
     dt = tensordict["params", "dt"]
     u = tensordict["action"].squeeze(-1)
     u = u.clamp(-tensordict["params", "max_voltage"], tensordict["params", "max_voltage"])
-    costs = angle_normalize(th) ** 2 + 0.1 * thdot ** 2 + 0.001 * (u ** 2) + 0.1 * angle_normalize(phi) ** 2
-    J_p = m_p * (l * 2) ** 2 / 3
+    J_p = m_p * (l * 2.0) ** 2.0 / 3.0
 
-    new_phidotdot = phidotdot + u / 19 * dt
+    costs = angle_normalize(th) ** 2.0 + 0.1 * thdot ** 2.0 + 0.001 * (u ** 2.0)
+
+    # Phi angle penalty to reward
+    #costs += 0.1 * angle_normalize(phi) ** 2
+
+    # Add action variance penalty to reward
+    costs +=  1 * ((u - u.mean()) ** 2.0).mean()
+
+    new_phidotdot = phidotdot + u / 19.0 * dt
     new_phidot = phidot + new_phidotdot * dt
     new_phi = phi + new_phidot * dt
-    new_thdotdot = thdotdot - (m_p * g * l * 0.5 * th.sin() + m_p * l * 0.5 * u / 1.615 * th.cos()) / J_p * dt
+    new_thdotdot = thdotdot + (-m_p * g * l * 0.5 * th.sin() + m_p * l * 0.5 * u / 1.615 * th.cos()) / J_p * dt
     new_thdot = thdot + new_thdotdot * dt
     new_th = th + new_thdot * dt
 
@@ -348,8 +355,9 @@ print("rollout of len 3 (batch size of 10):", rollout)
 torch.manual_seed(0)
 env.set_seed(0)
 
+
 net = nn.Sequential(
-    nn.Linear(6, 64),
+    nn.Linear(6, 64),  # Initialize with zero bias
     nn.ReLU(),
     nn.Linear(64, 1),
 )
