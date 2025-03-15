@@ -33,13 +33,23 @@ def _step(tensordict):
     th, thdot = tensordict["th"], tensordict["thdot"]
     phi, phidot = tensordict["phi"], tensordict["phidot"]
 
-    g = tensordict["params", "g"]
-    mp = tensordict["params", "m"]
-    l = tensordict["params", "l"]
+    g = tensordict["params", "g"] # Gravity constant (m/s²)
+    Mp = tensordict["params", "m"]  # Pendulum mass (kg)
+    Lp = tensordict["params", "l"]  # Pendulum length from pivot to center of mass (m) (0.085 + 0.129)/2
     dt = tensordict["params", "dt"]
     u = tensordict["action"].squeeze(-1)
     u = u.clamp(-tensordict["params", "max_voltage"], tensordict["params", "max_voltage"])
-    J_p = m_p * (l * 2.0) ** 2.0 / 3.0
+    Rm = 8.4  # Motor resistance (Ohm)
+    kt = 0.042  # Motor torque constant (N·m/A)
+    km = 0.042  # Motor back-EMF constant (V·s/rad)
+    Jm = 4e-6  # Motor moment of inertia (kg·m²)
+    Jh = 0.6e-6  # Hub moment of inertia (kg·m^2)
+    Mr = 0.095  # Rotary arm mass (kg)
+    Lr = 0.085  # Arm length, pivot to end (m)
+    Jp = (1 / 3) * Mp * Lp ** 2  # Pendulum moment of inertia (kg·m²)
+    Br = 0.001  # Rotary arm viscous damping coefficient (N·m·s/rad)
+    Bp = 0.0001  # Pendulum viscous damping coefficient (N·m·s/rad)
+    Jr = Jm + Jh + Mr * Lr ** 2 / 3  # Assuming arm is like a rod pivoting at one end
 
     costs = angle_normalize(th) ** 2.0 + 0.1 * thdot ** 2.0 + 0.001 * (u ** 2.0)
 
@@ -49,14 +59,39 @@ def _step(tensordict):
     # Add action variance penalty to reward
     costs += 1 * ((u - u.mean()) ** 2.0).mean()
 
-    #new_phidotdot = u / 19.0
-    new_phidotdot = 149.3 * th - 14.93 * phidot + 4.915 * thdot + 49.73 * u
-    #new_phidotdot = -41.6 * th - 4.16 * phidot + 1.37 * thdot + 13.9 * u
+    # Motor current
+    im = (u - km * phidot) / Rm
+
+    # Motor torque
+    tau = kt * im
+
+    # Equations of motion
+    # Inertia matrix elements
+    M11 = Jr + Mp * Lr ** 2
+    M12 = Mp * Lr * (Lp / 2) * th.cos()
+    M21 = M12
+    M22 = Jp
+
+    # Coriolis and centrifugal terms
+    C1 = -Mp * Lr * (Lp / 2) * thdot ** 2 * th.sin() - Br * phidot
+    C2 = Mp * g * (Lp / 2) * th.sin() - Bp * thdot
+
+    # Torque input vector
+    B1 = tau
+    B2 = 0
+
+    # Solve for the accelerations
+    det_M = M11 * M22 - M12 * M21
+
+    # Check for singularity
+    #if abs(det_M) < 1e-10:
+    #    det_M = np.sign(det_M) * 1e-10
+
+    new_phidotdot = (M22 * (B1 + C1) - M12 * (B2 + C2)) / det_M
+    new_thdotdot = (M11 * (B2 + C2) - M21 * (B1 + C1)) / det_M
+
     new_phidot = phidot + new_phidotdot * dt
     new_phi = phi + new_phidot * dt
-    #new_thdotdot = -(m_p * g * l * 0.5 * th.sin() + m_p * l * 0.5 * u / 1.615 * th.cos()) / J_p
-    new_thdotdot = -261.6 * th + 14.76 * phidot - 8.614 * thdot - 49.15 * u
-    #new_thdotdot = 72.4 * th - 4.11 * phidot - 2.4 * thdot + 13.7 * u
     new_thdot = thdot + new_thdotdot * dt
     new_th = th + new_thdot * dt
 

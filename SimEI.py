@@ -8,12 +8,18 @@ Rm = 8.4  # Motor resistance (Ohm)
 kt = 0.042  # Motor torque constant (N·m/A)
 km = 0.042  # Motor back-EMF constant (V·s/rad)
 Jm = 4e-6  # Motor moment of inertia (kg·m²)
-Jp = (1/3) * Mp * Lp**2   # Pendulum moment of inertia (kg·m²)
+mh = 0.016  # Hub mass (kg)
+rh = 0.0111  # Hub radius (m)
+Jh = 0.6e-6  # Hub moment of inertia (kg·m^2)
+Mr = 0.095  # Rotary arm mass (kg)
+Lr = 0.085  # Arm length, pivot to end (m)
 Mp = 0.024  # Pendulum mass (kg)
 Lp = 0.129  # Pendulum length from pivot to center of mass (m) (0.085 + 0.129)/2
+Jp = (1/3) * Mp * Lp ** 2   # Pendulum moment of inertia (kg·m²)
 Br = 0.001  # Rotary arm viscous damping coefficient (N·m·s/rad)
-Bp = 0.0005  # Pendulum viscous damping coefficient (N·m·s/rad)
+Bp = 0.0001  # Pendulum viscous damping coefficient (N·m·s/rad)
 g = 9.81  # Gravity constant (m/s²)
+Jr = Jm + Jh + Mr * Lr ** 2 / 3  # Assuming arm is like a rod pivoting at one end
 
 # Simulation parameters
 dt = 0.001  # Time step size (s)
@@ -46,27 +52,28 @@ def pendulum_dynamics(state, vm):
 
     # Equations of motion
     # Inertia matrix elements
-    M11 = Jm + Jp * np.sin(alpha) ** 2
-    M12 = Jp * Lp * np.cos(alpha)
+    M11 = Jr + Mp * Lr ** 2
+    M12 = Mp * Lr * Lp / 2 * np.cos(alpha)
     M21 = M12
     M22 = Jp
 
     # Coriolis and centrifugal terms
-    C1 = Jp * np.sin(2 * alpha) * theta_dot * alpha_dot / 2 + Br * theta_dot
-    C2 = -Jp * np.sin(alpha) * theta_dot ** 2 / 2 + Bp * alpha_dot
-
-    # Gravity terms
-    G1 = 0
-    G2 = Mp * g * Lp * np.sin(alpha)
+    C1 = -Mp * Lr * (Lp / 2) * alpha_dot ** 2 * np.sin(alpha) - Br * theta_dot
+    C2 = Mp * g * (Lp / 2) * np.sin(alpha) - Bp * alpha_dot
 
     # Torque input vector
     B1 = tau
     B2 = 0
 
-    # Solve for accelerations
-    det = M11 * M22 - M12 * M21
-    theta_ddot = (M22 * (B1 - C1 - G1) - M12 * (B2 - C2 - G2)) / det
-    alpha_ddot = (-M21 * (B1 - C1 - G1) + M11 * (B2 - C2 - G2)) / det
+    # Solve for the accelerations
+    det_M = M11 * M22 - M12 * M21
+
+    # Check for singularity
+    if abs(det_M) < 1e-10:
+        det_M = np.sign(det_M) * 1e-10
+
+    theta_ddot = (M22 * (B1 + C1) - M12 * (B2 + C2)) / det_M
+    alpha_ddot = (M11 * (B2 + C2) - M21 * (B1 + C1)) / det_M
 
     return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot])
 
