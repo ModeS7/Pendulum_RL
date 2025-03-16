@@ -455,13 +455,13 @@ policy = TensorDictModule(
 # Wrap policy with exploration
 exploration_policy = ExplorationPolicy(policy, noise_scale=1.0)
 
-optim = torch.optim.Adam(policy.parameters(), lr=2e-4)
+optim = torch.optim.Adam(policy.parameters(), lr=2e-3)
 #optim = torch.optim.RMSprop(policy.parameters(), lr=1e-4)
 #optim = Lion(policy.parameters(), lr=2e-3)
 batch_size = 8192*6
 
 # Modify your training loop for better stability
-pbar = tqdm.tqdm(range(2_000))  # Smaller number of iterations for testing
+pbar = tqdm.tqdm(range(20))  # Smaller number of iterations for testing
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, 2_000_000)
 logs = defaultdict(list)
 best_return = float('-inf')
@@ -760,12 +760,3 @@ def evaluate_and_visualize(policy, env, save_path=None):
 if __name__ == "__main__":
     # Get the animation from the tuple
     animation_result, history = evaluate_and_visualize(policy, env, save_path="pendulum_animation.gif")
-
-    # Display in notebook/interactive environment
-    try:
-        from IPython.display import display
-
-        plt.close()  # Close the current figure to avoid duplicates
-        display(animation_result.to_jshtml())
-    except ImportError:
-        plt.show()  # Fallback to regular display

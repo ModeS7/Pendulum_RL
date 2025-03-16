@@ -832,33 +832,503 @@ def create_debug_env():
     """Create a basic pendulum environment without transforms for debugging"""
     return PendulumEnv()
 
+
+from typing import Optional
+import torch
+from torchrl.envs import EnvBase, TransformedEnv
+from tensordict import TensorDict
+
+
+class FixedTransformedEnv(EnvBase):
+    """
+    Wrapper around TransformedEnv that ensures state updates are properly handled.
+    """
+
+    def __init__(self, transformed_env):
+        """
+        Initialize with a transformed environment
+
+        Args:
+            transformed_env: The transformed environment to wrap
+        """
+        super().__init__(
+            device=transformed_env.device,
+            batch_size=transformed_env.batch_size
+        )
+        self.env = transformed_env
+
+        # Copy specs from the wrapped environment
+        self.observation_spec = transformed_env.observation_spec
+        self.state_spec = transformed_env.state_spec
+        self.action_spec = transformed_env.action_spec
+        self.reward_spec = transformed_env.reward_spec
+
+    def _reset(self, tensordict=None, **kwargs):
+        """Reset the environment."""
+        return self.env.reset(tensordict, **kwargs)
+
+    def _step(self, tensordict):
+        """
+        Step the environment, ensuring state is updated.
+
+        This is a critical function that ensures the state updates
+        are properly propagated through the transform chain.
+        """
+        # Make a deep copy to avoid modifying the original
+        tensordict_copy = tensordict.clone()
+
+        # Get the base environment
+        base_env = self.env
+        while hasattr(base_env, "base_env"):
+            base_env = base_env.base_env
+
+        # Step the base environment directly first to see changes
+        # Note: We need to map the action through transforms first
+        td_for_base = tensordict_copy.clone()
+
+        # Get result from base environment
+        result_from_base = base_env._step(td_for_base)
+
+        # Now step through the full transform chain
+        result = self.env.step(tensordict_copy)
+
+        # Verify if state changed in the transformed result
+        if torch.allclose(result["th"], tensordict_copy["th"]) and torch.allclose(result["thdot"],
+                                                                                  tensordict_copy["thdot"]):
+            print("WARNING: Transform didn't update state, forcing update from base environment")
+            # Force update the critical state variables from the base result
+            result["th"] = result_from_base["th"]
+            result["thdot"] = result_from_base["thdot"]
+            result["phi"] = result_from_base["phi"]
+            result["phidot"] = result_from_base["phidot"]
+
+        return result
+
+    def _set_seed(self, seed: Optional[int]):
+        """Set random seed for the environment."""
+        # Just forward to the wrapped environment
+        return self.env.set_seed(seed)
+
+    # Forward any other methods to the wrapped environment
+    def __getattr__(self, name):
+        if name in self.__dict__:
+            return self.__dict__[name]
+        return getattr(self.env, name)
+
+
+# Alternative solution: Create a direct implementation without transforms
+class DirectPendulumEnv(PendulumEnv):
+    """
+    A direct implementation of the pendulum environment without using transforms.
+    This avoids any issues with the transform chain.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Update observation spec to include the concatenated observation
+        self.observation_spec = CompositeSpec(
+            th=self.observation_spec["th"],
+            thdot=self.observation_spec["thdot"],
+            phi=self.observation_spec["phi"],
+            phidot=self.observation_spec["phidot"],
+            sin_th=BoundedTensorSpec(low=-1, high=1, shape=()),
+            cos_th=BoundedTensorSpec(low=-1, high=1, shape=()),
+            sin_phi=BoundedTensorSpec(low=-1, high=1, shape=()),
+            cos_phi=BoundedTensorSpec(low=-1, high=1, shape=()),
+            observation=BoundedTensorSpec(low=-1, high=1, shape=(6,)),
+            params=self.observation_spec["params"],
+            shape=(),
+        )
+
+    def _step(self, tensordict):
+        # Process the base step
+        result = super()._step(tensordict)
+
+        # Add the transformed observations
+        self._add_transformed_obs(result)
+
+        return result
+
+    def _reset(self, tensordict=None, **kwargs):
+        # Process the base reset
+        result = super()._reset(tensordict, **kwargs)
+
+        # Add the transformed observations
+        self._add_transformed_obs(result)
+
+        return result
+
+    def _add_transformed_obs(self, tensordict):
+        """Helper method to add transformed observations to a tensordict."""
+        # Calculate sin and cos transforms
+        tensordict["sin_th"] = torch.sin(tensordict["th"])
+        tensordict["cos_th"] = torch.cos(tensordict["th"])
+        tensordict["sin_phi"] = torch.sin(tensordict["phi"])
+        tensordict["cos_phi"] = torch.cos(tensordict["phi"])
+
+        # Create the concatenated observation
+        # Unsqueeze for proper dimensions if needed
+        sin_th = tensordict["sin_th"].unsqueeze(-1) if tensordict["sin_th"].ndim == tensordict["th"].ndim else \
+        tensordict["sin_th"]
+        cos_th = tensordict["cos_th"].unsqueeze(-1) if tensordict["cos_th"].ndim == tensordict["th"].ndim else \
+        tensordict["cos_th"]
+        thdot = tensordict["thdot"].unsqueeze(-1) if tensordict["thdot"].ndim == tensordict["th"].ndim else tensordict[
+            "thdot"]
+        sin_phi = tensordict["sin_phi"].unsqueeze(-1) if tensordict["sin_phi"].ndim == tensordict["phi"].ndim else \
+        tensordict["sin_phi"]
+        cos_phi = tensordict["cos_phi"].unsqueeze(-1) if tensordict["cos_phi"].ndim == tensordict["phi"].ndim else \
+        tensordict["cos_phi"]
+        phidot = tensordict["phidot"].unsqueeze(-1) if tensordict["phidot"].ndim == tensordict["phi"].ndim else \
+        tensordict["phidot"]
+
+        # Concatenate observations
+        tensordict["observation"] = torch.cat([
+            sin_th, cos_th, thdot, sin_phi, cos_phi, phidot
+        ], dim=-1)
+
+        return tensordict
+
+
+# Modified setup function to use the direct environment
+def setup_direct_environment():
+    """
+    Set up the pendulum environment using the direct implementation.
+
+    Returns:
+        DirectPendulumEnv: The environment ready for training
+    """
+    env = DirectPendulumEnv()
+
+    # Verify environment specs
+    check_env_specs(env)
+
+    return env
+
+
+# Use this function to create the fixed environment
+def create_fixed_environment():
+    """
+    Create an environment with our special wrapper to fix state update issues.
+
+    Returns:
+        FixedTransformedEnv: A wrapped environment that correctly handles state updates
+    """
+    # First create the standard environment with transforms
+    env = setup_environment()
+
+    # Wrap it with our special wrapper
+    fixed_env = FixedTransformedEnv(env)
+
+    return fixed_env
+
+
+# This is a completely standalone solution that bypasses the transform issues
+# with a direct manual rollout.
+
+def manual_debug_policy(policy, env, steps=10):
+    """Debug policy behavior by directly accessing the base environment."""
+    # Get base environment (the one without transforms)
+    base_env = env
+    while hasattr(base_env, "base_env"):
+        base_env = base_env.base_env
+
+    # Reset environment
+    td = base_env.reset()
+
+    # Helper function to safely get item values from tensors
+    def safe_item(tensor):
+        if tensor.ndim > 0 and tensor.size(0) > 1:
+            return tensor[0].item()
+        return tensor.item()
+
+    print("Initial state:",
+          f"th={safe_item(td['th']):.4f}",
+          f"thdot={safe_item(td['thdot']):.4f}",
+          f"phi={safe_item(td['phi']):.4f}",
+          f"phidot={safe_item(td['phidot']):.4f}")
+
+    print("\nPolicy outputs and state transitions:")
+    for i in range(steps):
+        # Create an expanded TensorDict with all the transformed observations needed for policy
+        full_td = td.clone()
+
+        # Add sin/cos transforms manually
+        full_td["sin_th"] = torch.sin(full_td["th"])
+        full_td["cos_th"] = torch.cos(full_td["th"])
+        full_td["sin_phi"] = torch.sin(full_td["phi"])
+        full_td["cos_phi"] = torch.cos(full_td["phi"])
+
+        # Handle dimensionality for concatenation
+        sin_th = full_td["sin_th"].unsqueeze(-1) if full_td["sin_th"].ndim == full_td["th"].ndim else full_td["sin_th"]
+        cos_th = full_td["cos_th"].unsqueeze(-1) if full_td["cos_th"].ndim == full_td["th"].ndim else full_td["cos_th"]
+        thdot = full_td["thdot"].unsqueeze(-1) if full_td["thdot"].ndim == full_td["th"].ndim else full_td["thdot"]
+        sin_phi = full_td["sin_phi"].unsqueeze(-1) if full_td["sin_phi"].ndim == full_td["phi"].ndim else full_td[
+            "sin_phi"]
+        cos_phi = full_td["cos_phi"].unsqueeze(-1) if full_td["cos_phi"].ndim == full_td["phi"].ndim else full_td[
+            "cos_phi"]
+        phidot = full_td["phidot"].unsqueeze(-1) if full_td["phidot"].ndim == full_td["phi"].ndim else full_td["phidot"]
+
+        # Concatenate observations
+        full_td["observation"] = torch.cat([
+            sin_th, cos_th, thdot, sin_phi, cos_phi, phidot
+        ], dim=-1)
+
+        # Store original state for display
+        orig_th = safe_item(td['th'])
+        orig_thdot = safe_item(td['thdot'])
+        orig_phi = safe_item(td['phi'])
+        orig_phidot = safe_item(td['phidot'])
+
+        # Get action from policy using the fully populated tensordict
+        with torch.no_grad():
+            action_td = policy(full_td.clone())
+
+        # Get scalar action value for display
+        action = safe_item(action_td["action"])
+
+        print(f"Step {i}: State=[{orig_th:.4f}, {orig_thdot:.4f}, "
+              f"{orig_phi:.4f}, {orig_phidot:.4f}], Action={action:.4f}")
+
+        # Apply action directly to base environment
+        td_with_action = td.clone()
+        td_with_action["action"] = action_td["action"]
+
+        # Step base environment directly
+        td_next = base_env._step(td_with_action)
+
+        # CRITICAL: Replace td with the new state
+        td = td_next
+
+        # Print resulting state
+        print(f"  → Next state: [{safe_item(td['th']):.4f}, {safe_item(td['thdot']):.4f}, "
+              f"{safe_item(td['phi']):.4f}, {safe_item(td['phidot']):.4f}]")
+
+    return td
+
+
+def manual_train_policy(env, policy, iterations=500, batch_size=32):
+    """
+    Train a policy on the pendulum environment using manual rollouts.
+
+    This completely bypasses the environment's step and rollout methods,
+    working directly with the base environment.
+
+    Args:
+        env: The environment to train on
+        policy: The policy to train
+        iterations: Number of training iterations
+        batch_size: Batch size for training
+
+    Returns:
+        policy: The trained policy
+        logs: Training logs
+    """
+    # Get the base environment (without transforms)
+    base_env = env
+    while hasattr(base_env, "base_env"):
+        base_env = base_env.base_env
+
+    # Create exploration policy
+    exploration_policy = ExplorationPolicy(policy, noise_scale=1.0)
+
+    # Create optimizer and scheduler
+    optim = torch.optim.Adam(policy.parameters(), lr=2e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, batch_size * iterations)
+
+    # Set up training loop
+    pbar = tqdm.tqdm(range(iterations))
+    logs = defaultdict(list)
+    best_return = float('-inf')
+    patience = 0
+    max_patience = 20
+    noise_scale = 1.0
+
+    for i in pbar:
+        # Reduce exploration noise over time
+        if i % 100 == 0 and noise_scale > 0.1:
+            noise_scale *= 0.9
+            exploration_policy.noise_scale = noise_scale
+
+        # Process each batch element
+        all_returns = []
+        all_final_rewards = []
+
+        # Generate parameters
+        param_td = base_env.gen_params(batch_size=[batch_size])
+
+        for b in range(batch_size):
+            # Extract single element parameters
+            batch_params = TensorDict({
+                "params": TensorDict({
+                    k: v[b:b + 1] if v.ndim > 0 else v
+                    for k, v in param_td["params"].items()
+                }, [])
+            }, [])
+
+            # Reset base environment
+            td = base_env._reset(batch_params)
+
+            # Initialize accumulators
+            rewards = []
+
+            # Perform manual rollout for 100 steps
+            for step in range(100):
+                # Create the observation needed by the policy
+                full_td = td.clone()
+
+                # Add sin/cos transforms manually
+                full_td["sin_th"] = torch.sin(full_td["th"])
+                full_td["cos_th"] = torch.cos(full_td["th"])
+                full_td["sin_phi"] = torch.sin(full_td["phi"])
+                full_td["cos_phi"] = torch.cos(full_td["phi"])
+
+                # Handle dimensionality for concatenation
+                sin_th = full_td["sin_th"].unsqueeze(-1) if full_td["sin_th"].ndim == full_td["th"].ndim else full_td[
+                    "sin_th"]
+                cos_th = full_td["cos_th"].unsqueeze(-1) if full_td["cos_th"].ndim == full_td["th"].ndim else full_td[
+                    "cos_th"]
+                thdot = full_td["thdot"].unsqueeze(-1) if full_td["thdot"].ndim == full_td["th"].ndim else full_td[
+                    "thdot"]
+                sin_phi = full_td["sin_phi"].unsqueeze(-1) if full_td["sin_phi"].ndim == full_td["phi"].ndim else \
+                full_td["sin_phi"]
+                cos_phi = full_td["cos_phi"].unsqueeze(-1) if full_td["cos_phi"].ndim == full_td["phi"].ndim else \
+                full_td["cos_phi"]
+                phidot = full_td["phidot"].unsqueeze(-1) if full_td["phidot"].ndim == full_td["phi"].ndim else full_td[
+                    "phidot"]
+
+                # Concatenate observations
+                full_td["observation"] = torch.cat([
+                    sin_th, cos_th, thdot, sin_phi, cos_phi, phidot
+                ], dim=-1)
+
+                # Get action from exploration policy
+                with torch.no_grad():
+                    action_td = exploration_policy(full_td.clone())
+
+                # Add action to state
+                td_with_action = td.clone()
+                td_with_action["action"] = action_td["action"]
+
+                # Step environment directly
+                next_td = base_env._step(td_with_action)
+
+                # Store reward
+                rewards.append(next_td["reward"])
+
+                # Update state
+                td = next_td
+
+            # Calculate return for this batch element
+            batch_return = torch.stack(rewards).mean()
+            all_returns.append(batch_return)
+            all_final_rewards.append(rewards[-1])
+
+        # Compute average return across batch
+        traj_return = torch.mean(torch.stack(all_returns))
+        last_reward = torch.mean(torch.stack(all_final_rewards))
+
+        # Compute loss and update policy
+        (-traj_return).backward()
+
+        # Gradient clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+
+        optim.step()
+        optim.zero_grad()
+
+        # Track best model
+        if traj_return > best_return:
+            best_return = traj_return
+            # Save best model
+            torch.save(policy.state_dict(), "best_pendulum_policy.pt")
+            patience = 0
+        else:
+            patience += 1
+
+        # Early stopping
+        if patience > max_patience:
+            print(f"Early stopping at iteration {i}")
+            # Load best model
+            policy.load_state_dict(torch.load("best_pendulum_policy.pt"))
+            break
+
+        # Update progress bar
+        pbar.set_description(
+            f"reward: {traj_return: 4.4f}, "
+            f"last reward: {last_reward: 4.4f}, "
+            f"noise: {noise_scale:.3f}, grad norm: {grad_norm: 4.4}"
+        )
+
+        # Log metrics
+        logs["return"].append(traj_return.item())
+        logs["last_reward"].append(last_reward.item())
+
+        # Step scheduler
+        scheduler.step()
+
+        # Occasionally debug policy
+        if i % 50 == 0:
+            manual_debug_policy(policy, env)
+
+    return policy, logs
+
+
+def manual_test_environment_step(env):
+    """Test if the base environment step function is working correctly."""
+    # Get base environment
+    base_env = env
+    while hasattr(base_env, "base_env"):
+        base_env = base_env.base_env
+
+    # Reset environment
+    td = base_env.reset()
+
+    print(f"Initial state: th={td['th'].item():.4f}, thdot={td['thdot'].item():.4f}")
+
+    # Apply a constant action
+    action_value = 1.0
+    td["action"] = torch.tensor([action_value], device=td.device)
+
+    # Step directly with the base environment's _step method
+    new_td = base_env._step(td)
+
+    print(f"After base _step: th={new_td['th'].item():.4f}, thdot={new_td['thdot'].item():.4f}")
+
+    # Check if the state is being updated
+    if td['th'].item() != new_td['th'].item():
+        print("Base _step is correctly updating the state ✓")
+    else:
+        print("Base _step is NOT updating the state ✗")
+
+
 def main():
     """
     Main function to run the pendulum simulation.
     """
-    # Set up environment
+    # Set up standard environment - we'll use the base env directly
     env = setup_environment()
 
     # Create policy
     policy = create_policy_network(env)
 
-    test_environment_step(env)
-    # Train policy
-    trained_policy, logs = train_policy(env, policy)
+    # Test base environment step function
+    manual_test_environment_step(env)
+
+    # Train policy with manual rollouts
+    trained_policy, logs = manual_train_policy(env, policy)
 
     # Plot training results
     plot_training_results(logs)
 
-    # Evaluate and visualize policy
-    animation, history = evaluate_and_visualize(trained_policy, env, save_path="pendulum_animation.gif")
+    # Debug the trained policy
+    print("\nDebug of trained policy:")
+    manual_debug_policy(trained_policy, env, steps=20)
 
-    # Display animation in interactive environment if possible
-    try:
-        from IPython.display import display
-        plt.close()
-        display(animation.to_jshtml())
-    except ImportError:
-        plt.show()
+    # Evaluate and visualize policy - implement a manual version if needed
+    # animation, history = evaluate_and_visualize(trained_policy, env, save_path="pendulum_animation.gif")
+
+    print("Training complete!")
 
 
 if __name__ == "__main__":
