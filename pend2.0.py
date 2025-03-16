@@ -39,8 +39,8 @@ def _step(tensordict):
     dt = tensordict["params", "dt"]
 
     u = tensordict["action"].squeeze(-1)
-    u = u.clamp(-tensordict["params", "max_voltage"], tensordict["params", "max_voltage"])
-    u = u * 5 # Scale the action
+    #u = u.clamp(-tensordict["params", "max_voltage"], tensordict["params", "max_voltage"])
+    #u = u * 5 # Scale the action
 
     Rm = 8.4  # Motor resistance (Ohm)
     kt = 0.042  # Motor torque constant (N·m/A)
@@ -63,14 +63,14 @@ def _step(tensordict):
 
         # Inertia matrix elements
         M11 = Jr + Mp * Lr ** 2
-        M12 = Mp * Lr * (Lp / 2) * th.cos()
+        M12 = Mp * Lr * (Lp / 2) * torch.cos(th)
         M21 = M12
         M22 = Jp
         det_M = M11 * M22 - M12 * M21
 
         # Coriolis and gravitational (plus damping) terms
-        C1 = -Mp * Lr * (Lp / 2) * thdot ** 2 * th.sin() - Br * phidot
-        C2 = Mp * g * (Lp / 2) * th.sin() - Bp * thdot
+        C1 = -Mp * Lr * (Lp / 2) * thdot ** 2 * torch.sin(th) - Br * phidot
+        C2 = Mp * g * (Lp / 2) * torch.sin(th) - Bp * thdot
 
         # Solve for accelerations
         phidotdot = (M22 * (tau + C1) - M12 * (0 + C2)) / det_M
@@ -101,13 +101,18 @@ def _step(tensordict):
 
     #new_thdotdot = new_thdotdot.clamp(-torch.pi, torch.pi)
     #new_thdot = (thdot + new_thdotdot * dt).clamp(-10.0, 10.0)
+
     #new_phi = new_phi.clamp(-tensordict["params", "max_phi"], tensordict["params", "max_phi"])
 
-    costs = angle_normalize(th) ** 2.0 + 0.1 * thdot ** 2.0 + 0.001 * (u ** 2.0)
+    costs = (angle_normalize(th) ** 2.0 + 0.1 * thdot ** 2.0 + 0.001 * (u ** 2.0)) * 0.1
+
     # Phi angle penalty to reward
     #costs += 0.1 * angle_normalize(phi) ** 2
+
     # Add action variance penalty to reward
     #costs += 1 * ((u - u.mean()) ** 2.0).mean()
+
+    costs = torch.clamp(costs, 0.0, 10.0)
 
     reward = -costs.view(*tensordict.shape, 1)
     done = torch.zeros_like(reward, dtype=torch.bool)
@@ -190,10 +195,14 @@ def _make_spec(self, td_params):
     self.state_spec = self.observation_spec.clone()
     # action-spec will be automatically wrapped in input_spec when
     # `self.action_spec = spec` will be called supported
-    self.action_spec = BoundedTensorSpec(
+    """self.action_spec = BoundedTensorSpec(
         low=-td_params["params", "max_voltage"],
         high=td_params["params", "max_voltage"],
         shape=(1,),
+        dtype=torch.float32,
+    )"""
+    self.action_spec = UnboundedContinuousTensorSpec(
+        shape=(),
         dtype=torch.float32,
     )
     self.reward_spec = UnboundedContinuousTensorSpec(shape=(*td_params.shape, 1))
@@ -215,32 +224,45 @@ def make_composite_from_td(td):
     )
     return composite
 def _set_seed(self, seed: Optional[int]):
-    rng = torch.manual_seed(seed)
-    self.rng = rng
+    # Set the global seed
+    torch.manual_seed(seed)
+    # Create a device-specific generator
+    if self.device.type == 'cuda':
+        # For CUDA device
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(seed)
+    else:
+        # For CPU device
+        self.rng = torch.manual_seed(seed)
 
-def gen_params(g=9.81, batch_size=None) -> TensorDictBase:
-    """Returns a ``tensordict`` containing the physical parameters such as gravitational force and torque or speed limits."""
+
+def gen_params(g=9.81, batch_size=None, device=None) -> TensorDictBase:
     if batch_size is None:
         batch_size = []
+    if device is None:
+        device = torch.device("cpu")
+
     td = TensorDict(
         {
             "params": TensorDict(
                 {
-                    #"max_phi": 2.0/3.0,
-                    "max_voltage": 1.0,
-                    "dt": 0.05,
-                    "g": g,
-                    "m": 0.024,
-                    "l": 0.129/2.0,
+                    #"max_voltage": torch.tensor(1.0, device=device),
+                    "dt": torch.tensor(0.05, device=device),
+                    "g": torch.tensor(g, device=device),
+                    "m": torch.tensor(0.024, device=device),
+                    "l": torch.tensor(0.129 / 2.0, device=device),
                 },
                 [],
+                device=device,
             )
         },
         [],
+        device=device,
     )
     if batch_size:
         td = td.expand(batch_size).contiguous()
     return td
+
 class PendulumEnv(EnvBase):
     metadata = {
         "render_modes": ["human", "rgb_array"],
@@ -248,7 +270,8 @@ class PendulumEnv(EnvBase):
     }
     batch_locked = False
 
-    def __init__(self, td_params=None, seed=None, device="cpu"):
+    def __init__(self, td_params=None, seed=None,
+                 device = torch.device("cpu")):
         if td_params is None:
             td_params = self.gen_params()
 
@@ -382,45 +405,146 @@ torch.manual_seed(0)
 env.set_seed(0)
 
 
+# Get the device from the environment
+device = env.device
+
+# Define the network
 net = nn.Sequential(
-    nn.LazyLinear(64),
-    nn.Tanh(),
-    nn.LazyLinear(64),
-    nn.Tanh(),
-    nn.LazyLinear(64),
-    nn.Tanh(),
-    nn.LazyLinear(1),
-)
+    nn.Linear(6, 128),
+    nn.ReLU(),
+    nn.Linear(128, 128),
+    nn.ReLU(),
+    nn.Linear(128, 1),
+).to(device)  # Move to device
+
+# Initialize weights properly
+for m in net.modules():
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+        nn.init.zeros_(m.bias)
+
+
+class ExplorationPolicy(TensorDictModule):
+    def __init__(self, policy, noise_scale=0.5):
+        # Create a dummy module that will be overridden by our custom forward
+        dummy_module = nn.Identity()
+        super().__init__(
+            module=dummy_module,  # This was the missing argument
+            in_keys=policy.in_keys,
+            out_keys=policy.out_keys
+        )
+        self.policy = policy
+        self.noise_scale = noise_scale
+
+    def forward(self, tensordict):
+        # Get the base action from the policy
+        action_td = self.policy(tensordict)
+
+        # Add exploration noise
+        noise = torch.randn_like(action_td["action"]) * self.noise_scale
+        action_td["action"] = action_td["action"] + noise
+
+        return action_td
+
 policy = TensorDictModule(
     net,
     in_keys=["observation"],
     out_keys=["action"],
 )
 
-optim = torch.optim.Adam(policy.parameters(), lr=2e-3)
-#optim = Lion(policy.parameters(), lr=2e-3)
-batch_size = 32
-pbar = tqdm.tqdm(range(20_000 // batch_size))
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, 20_000)
-logs = defaultdict(list)
+# Wrap policy with exploration
+exploration_policy = ExplorationPolicy(policy, noise_scale=1.0)
 
-for _ in pbar:
+optim = torch.optim.Adam(policy.parameters(), lr=2e-4)
+#optim = torch.optim.RMSprop(policy.parameters(), lr=1e-4)
+#optim = Lion(policy.parameters(), lr=2e-3)
+batch_size = 8192*6
+
+# Modify your training loop for better stability
+pbar = tqdm.tqdm(range(2_000))  # Smaller number of iterations for testing
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, 2_000_000)
+logs = defaultdict(list)
+best_return = float('-inf')
+patience = 0
+max_patience = 50
+noise_scale = 1.0
+
+for i in pbar:
+    # Reduce exploration noise over time
+    if i % 100 == 0 and noise_scale > 0.1:
+        noise_scale *= 0.9
+        exploration_policy.noise_scale = noise_scale
+
     init_td = env.reset(env.gen_params(batch_size=[batch_size]))
-    rollout = env.rollout(100, policy, tensordict=init_td, auto_reset=False)
+
+    # Use exploration during training
+    rollout = env.rollout(100, exploration_policy, tensordict=init_td, auto_reset=False)
+
     traj_return = rollout["next", "reward"].mean()
     (-traj_return).backward()
+
+    # Gradient clipping
     gn = torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+
     optim.step()
     optim.zero_grad()
+
+    # Track best model
+    if traj_return > best_return:
+        best_return = traj_return
+        # Save best model
+        torch.save(policy.state_dict(), "best_pendulum_policy.pt")
+        patience = 0
+    else:
+        patience += 1
+
+    # Early stopping
+    if patience > max_patience:
+        print(f"Early stopping at iteration {i}")
+        # Load best model
+        policy.load_state_dict(torch.load("best_pendulum_policy.pt"))
+        break
+
     pbar.set_description(
         f"reward: {traj_return: 4.4f}, "
-        f"last reward: {rollout[..., -1]['next', 'reward'].mean(): 4.4f}, gradient norm: {gn: 4.4}"
+        f"last reward: {rollout[..., -1]['next', 'reward'].mean(): 4.4f}, "
+        f"noise: {noise_scale:.3f}, grad norm: {gn: 4.4}"
     )
+
     logs["return"].append(traj_return.item())
     logs["last_reward"].append(rollout[..., -1]["next", "reward"].mean().item())
     scheduler.step()
 
 
+def debug_policy(policy, env, steps=10):
+    # Reset environment
+    td = env.reset()
+
+    print("Initial state:",
+          f"th={td['th'].item():.4f}",
+          f"thdot={td['thdot'].item():.4f}",
+          f"phi={td['phi'].item():.4f}",
+          f"phidot={td['phidot'].item():.4f}")
+
+    print("\nPolicy outputs and state transitions:")
+    for i in range(steps):
+        # Get action from policy
+        with torch.no_grad():
+            action_td = policy(td.clone())
+            action = action_td["action"].item()
+
+        print(f"Step {i}: State=[{td['th'].item():.4f}, {td['thdot'].item():.4f}, "
+              f"{td['phi'].item():.4f}, {td['phidot'].item():.4f}], Action={action:.4f}")
+
+        # Apply policy action
+        td["action"] = action_td["action"]
+        td = env.step(td)
+
+        # Print resulting state
+        print(f"  → Next state: [{td['th'].item():.4f}, {td['thdot'].item():.4f}, "
+              f"{td['phi'].item():.4f}, {td['phidot'].item():.4f}]")
+
+debug_policy(policy, env)
 def plot():
 
     plt.figure(figsize=(10, 5))
@@ -450,9 +574,8 @@ def visualize_policy(policy, env, steps=100, save_path=None):
     }
 
     # Record initial state
-    history['theta'].append(td["th"].item())
-    history['phi'].append(td["phi"].item())
-    history['action'].append(0.0)
+    history['theta'].append(td["th"].cpu().item())
+    history['phi'].append(td["phi"].cpu().item())
 
     # Collect simulation data
     for i in range(steps):
@@ -480,7 +603,6 @@ def visualize_policy(policy, env, steps=100, save_path=None):
 
         if td["done"].any():
             break
-
 
     # Diagnostic - print state variations
     theta_changes = np.diff(history['theta'])
@@ -519,7 +641,7 @@ def visualize_policy(policy, env, steps=100, save_path=None):
     # Plots for tracking variables
     ax2 = fig.add_subplot(gs[1, 0])
     ax2.set_xlim(0, steps)
-    ax2.set_ylim(-5*np.pi, 5*np.pi)
+    ax2.set_ylim(-5 * np.pi, 5 * np.pi)
     ax2.set_title('Angles')
     ax2.set_xlabel('Step')
     ax2.set_ylabel('Angle (rad)')
@@ -564,14 +686,20 @@ def visualize_policy(policy, env, steps=100, save_path=None):
         pendulum_line.set_data([arm_x, bob_x], [arm_y, bob_y])
         pendulum_bob.set_center((bob_x, bob_y))
 
-        # Update plots
+        # Update plots - only use as many points as we have for each time step
         theta_line.set_data(range(i + 1), history['theta'][:i + 1])
         phi_line.set_data(range(i + 1), history['phi'][:i + 1])
-        action_line.set_data(range(i + 1), history['action'][:i + 1])
+
+        # Handle the action plot separately (we have one fewer action than theta/phi)
+        if i < len(history['action']):
+            action_line.set_data(range(len(history['action'][:i + 1])), history['action'][:i + 1])
+        else:
+            # For the last frame, use all actions
+            action_line.set_data(range(len(history['action'])), history['action'])
 
         return arm_line, pendulum_line, pendulum_bob, theta_line, phi_line, action_line
 
-    # Create animation
+    # Create animation - use the length of theta as the number of frames
     ani = FuncAnimation(fig, update, frames=len(history['theta']),
                         interval=100,  # Fixed interval for smoother animation
                         blit=True)
@@ -581,8 +709,26 @@ def visualize_policy(policy, env, steps=100, save_path=None):
     # Save if requested
     if save_path:
         print(f"Saving animation to {save_path}...")
-        ani.save(save_path, writer='pillow', fps=30)
-        print("Animation saved!")
+        # Use a writer that doesn't require ffmpeg for GIF creation
+        writer = 'imagemagick' if save_path.endswith('.gif') else 'pillow'
+        try:
+            ani.save(save_path, writer=writer, fps=30)
+            print("Animation saved!")
+        except ValueError as e:
+            print(f"Error saving with {writer}, trying different writer...")
+            if writer == 'pillow':
+                try:
+                    ani.save(save_path, writer='imagemagick', fps=30)
+                    print("Animation saved with imagemagick!")
+                except Exception as e:
+                    print(f"Failed to save animation: {e}")
+                    # Save figures instead as a fallback
+                    plt.savefig(save_path.replace('.gif', '.png'))
+                    print(f"Saved still image instead.")
+            else:
+                print(f"Failed to save animation: {e}")
+                plt.savefig(save_path.replace('.gif', '.png'))
+                print(f"Saved still image instead.")
 
     return ani, history
 
