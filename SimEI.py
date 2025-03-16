@@ -77,53 +77,6 @@ def pendulum_dynamics(state, vm):
 
     return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot])
 
-
-# Initialize state variables [theta, alpha, theta_dot, alpha_dot]
-# Starting with pendulum in downward position (alpha = π)
-state = np.zeros((num_points, 4))
-state[0] = [0, np.pi, 0, 0]  # Initial conditions
-
-# Input voltage (you can modify this)
-# Example: Step input
-vm = np.zeros(num_points)
-vm[int(1 / dt):] = 3.0  # 3V step input after 1 second
-
-# Euler Integration
-for i in range(1, num_points):
-    derivatives = pendulum_dynamics(state[i - 1], vm[i - 1])
-    state[i] = state[i - 1] + dt * derivatives
-
-# Unwrap pendulum angle for continuous plotting
-alpha_unwrapped = np.unwrap(state[:, 1])
-
-# Plot results
-plt.figure(figsize=(12, 10))
-
-plt.subplot(3, 1, 1)
-plt.plot(t, vm)
-plt.ylabel('Input Voltage (V)')
-plt.title('QUBE-Servo 2 Pendulum Simulation')
-plt.grid(True)
-
-plt.subplot(3, 1, 2)
-plt.plot(t, state[:, 0], label='Arm angle (θ)')
-plt.plot(t, alpha_unwrapped - np.pi, label='Pendulum angle (α)')
-plt.ylabel('Angle (rad)')
-plt.legend()
-plt.grid(True)
-
-plt.subplot(3, 1, 3)
-plt.plot(t, state[:, 2], label='Arm angular velocity')
-plt.plot(t, state[:, 3], label='Pendulum angular velocity')
-plt.xlabel('Time (s)')
-plt.ylabel('Angular velocity (rad/s)')
-plt.legend()
-plt.grid(True)
-
-plt.tight_layout()
-plt.show()
-
-
 # Animate the pendulum motion
 def animate_pendulum(t, theta, alpha, dt_anim=0.05):
     """
@@ -182,6 +135,55 @@ def animate_pendulum(t, theta, alpha, dt_anim=0.05):
     plt.show()
 
     return ani
+
+
+# Initialize state variables [theta, alpha, theta_dot, alpha_dot]
+# Starting with pendulum in downward position (alpha = π)
+state = np.zeros((num_points, 4))
+state[0] = [0, np.pi, 0, 0]  # Initial conditions
+
+# Input voltage (you can modify this)
+# Example: Step input
+vm = np.zeros(num_points)
+vm[int(1 / dt):] = 3.0  # 3V step input after 1 second
+
+# Euler Integration
+for i in range(1, num_points):
+    derivatives = pendulum_dynamics(state[i - 1], vm[i - 1])
+    state[i] = state[i - 1] + dt * derivatives
+
+# Unwrap pendulum angle for continuous plotting
+alpha_unwrapped = np.unwrap(state[:, 1])
+
+# Call the animate_pendulum function to visualize the motion
+ani = animate_pendulum(t, state[:, 0], alpha_unwrapped)
+
+# Plot results
+plt.figure(figsize=(12, 10))
+
+plt.subplot(3, 1, 1)
+plt.plot(t, vm)
+plt.ylabel('Input Voltage (V)')
+plt.title('QUBE-Servo 2 Pendulum Simulation')
+plt.grid(True)
+
+plt.subplot(3, 1, 2)
+plt.plot(t, state[:, 0], label='Arm angle (θ)')
+plt.plot(t, alpha_unwrapped - np.pi, label='Pendulum angle (α)')
+plt.ylabel('Angle (rad)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(3, 1, 3)
+plt.plot(t, state[:, 2], label='Arm angular velocity')
+plt.plot(t, state[:, 3], label='Pendulum angular velocity')
+plt.xlabel('Time (s)')
+plt.ylabel('Angular velocity (rad/s)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
 
 
 # To animate the pendulum motion, uncomment the following line
