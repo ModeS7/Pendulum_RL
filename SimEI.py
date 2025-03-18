@@ -79,10 +79,10 @@ def positive_voltage(t):
     if 10.0 >= t >= 0.2:
         return 3.0
     else:
-        return -0.0
+        return 0.0
 def negative_voltage(t):
     if 10.0 >= t >= 0.2:
-        return 0.0
+        return -3.0
     else:
         return 0.0
 
