@@ -90,8 +90,6 @@ def lagrangian_dynamics(t, state, voltage_func):
 
     # Motor current
     im = (vm - km * theta_dot) / Rm
-
-    # Motor torque
     tau = kt * im
 
     # Inertia matrix elements
@@ -99,22 +97,15 @@ def lagrangian_dynamics(t, state, voltage_func):
     M12 = Mp * Lr * Lp / 2 * np.cos(alpha)
     M21 = M12
     M22 = Jp
+    det_M = M11 * M22 - M12 * M21
 
-    # Coriolis and centrifugal terms
+    # Coriolis and gravitational (plus damping) terms
     C1 = -Mp * Lr * (Lp / 2) * alpha_dot ** 2 * np.sin(alpha) - Br * theta_dot
-    C2 = Mp * g * (Lp / 2) * np.sin(alpha) - Bp * alpha_dot + Mp * Lr * (Lp / 2) * theta_dot ** 2 * np.cos(alpha)
-
-    # Torque input vector
+    C2 = Mp * g * (Lp / 2) * np.sin(alpha) - Bp * alpha_dot
     B1 = tau
     B2 = 0
 
-    # Solve for the accelerations
-    det_M = M11 * M22 - M12 * M21
-
-    # Check for singularity
-    if abs(det_M) < 1e-10:
-        det_M = np.sign(det_M) * 1e-10
-
+    # Solve for accelerations
     theta_ddot = (M22 * (B1 + C1) - M12 * (B2 + C2)) / det_M
     alpha_ddot = (M11 * (B2 + C2) - M21 * (B1 + C1)) / det_M
 
