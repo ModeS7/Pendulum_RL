@@ -5,11 +5,6 @@ import time
 from tqdm.notebook import tqdm  # For progress tracking
 import sys
 
-#   System Dynamics and Parameters from the system identification document:
-#   System identiﬁcations of a 2DOF pendulum controlled
-#   by QUBE-servo and its unwanted oscillation factors
-#   https://bibliotekanauki.pl/articles/1845011.pdf
-
 # System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.0431  # Motor back-emf constant
@@ -61,22 +56,15 @@ def pendulum_dynamics(t, state, voltage_func):
 
     # Equations of motion coefficients from Eq. (9)
     # For theta_m equation:
-    M11 = (mL * LA ** 2 + (1 / 4) * mL * LL ** 2
-           - (1 / 4) * mL * LL ** 2 * np.cos(theta_L) ** 2 + JA)
-
+    M11 = mL * LA ** 2 + (1 / 4) * mL * LL ** 2 - (1 / 4) * mL * LL ** 2 * np.cos(theta_L) ** 2 + JA
     M12 = -(1 / 2) * mL * LL * LA * np.cos(theta_L)
-
-    C1 = ((1 / 2) * mL * LL ** 2 * np.sin(theta_L)
-          * np.cos(theta_L) * theta_m_dot * theta_L_dot)
-
-    C2 = ((1 / 2) * mL * LL * LA * np.sin(theta_L)
-          * theta_L_dot ** 2)
+    C1 = (1 / 2) * mL * LL ** 2 * np.sin(theta_L) * np.cos(theta_L) * theta_m_dot * theta_L_dot
+    C2 = (1 / 2) * mL * LL * LA * np.sin(theta_L) * theta_L_dot ** 2
 
     # For theta_L equation:
     M21 = (1 / 2) * mL * LL * LA * np.cos(theta_L)
     M22 = JL + (1 / 4) * mL * LL ** 2
-    C3 = (-(1 / 4) * mL * LL ** 2 * np.cos(theta_L)
-          * np.sin(theta_L) * theta_m_dot ** 2)
+    C3 = -(1 / 4) * mL * LL ** 2 * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
     G = (1 / 2) * mL * LL * g * np.sin(theta_L)
 
     # Calculate determinant for matrix inversion
@@ -100,28 +88,26 @@ def pendulum_dynamics(t, state, voltage_func):
 
     # Cable dynamics (second-order system)
     omega_n = omega_cable * 2 * np.pi  # Convert from Hz to rad/s
-    cable_acc = (-2 * zeta_cable * omega_n * cable_vel
-                 - omega_n ** 2 * cable_pos + theta_L_ddot)
+    cable_acc = -2 * zeta_cable * omega_n * cable_vel - omega_n ** 2 * cable_pos + theta_L_ddot
 
     # Calculate unwanted damping from encoder cable using Fourier series
     # This affects motor dynamics but we've incorporated its effect in the coupled equations
 
-    return [theta_m_dot, theta_L_dot, theta_m_ddot,
-            theta_L_ddot, cable_vel, cable_acc]
+    return [theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot, cable_vel, cable_acc]
+
 
 # Voltage functions
-def positive_voltage(t):
-    if 5.0 >= t >= 0.2:
-        return 0.0
+def step_voltage(t):
+    """Step voltage of 3V at t=0.2s"""
+    if t >= 0.2:
+        return 3.0
     else:
         return 0.0
 
 
-def negative_voltage(t):
-    if 5.0 >= t >= 0.2:
-        return 0.0
-    else:
-        return 0.0
+def zero_voltage(t):
+    """Zero voltage (no input)"""
+    return 0.0
 
 
 # Performance optimization option
@@ -158,10 +144,10 @@ if OPTIMIZE_PERFORMANCE:
 
         return [theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot, cable_vel, cable_acc]
 
-
 # Time span for the simulation
 t_span = (0, 10)
-t_eval = np.linspace(0, 10, 100)  # Points at which to store the solution
+# Reduce number of evaluation points for faster execution
+t_eval = np.linspace(0, 10, 10)  # Points at which to store the solution
 
 # Initial conditions [theta_m, theta_L, theta_m_dot, theta_L_dot, cable_pos, cable_vel]
 initial_state = [0, np.pi, 0, 0, 0, 0]  # Pendulum hanging down (alpha = pi)
@@ -222,83 +208,138 @@ def progress_solve_ivp(dynamics_func, t_span, initial_state, method='RK45', t_ev
     return solution
 
 
-# Solve using solve_ivp
-print("Simulating positive voltage...")
-solution_pos = progress_solve_ivp(
-    lambda t, y: pendulum_dynamics(t, y, positive_voltage),
-    t_span,
-    initial_state,
-    method='RK45',  # Runge-Kutta 4(5)
-    t_eval=t_eval,
-    rtol=1e-6,
-    atol=1e-9  # Tight tolerances for better accuracy
-)
-
-print("Simulating negative voltage...")
-solution_neg = progress_solve_ivp(
-    lambda t, y: pendulum_dynamics(t, y, negative_voltage),
+# Simulate with step voltage
+print("Starting step voltage simulation...")
+solution_step = progress_solve_ivp(
+    lambda t, y: pendulum_dynamics(t, y, step_voltage),
     t_span,
     initial_state,
     method='RK45',
     t_eval=t_eval,
     rtol=1e-6,
-    atol=1e-9
+    atol=1e-9,
+    description="Step voltage simulation"
 )
 
-# Extract results for plotting
-t = solution_pos.t
-theta_pos = solution_pos.y[0]
-alpha_pos = solution_pos.y[1]
-theta_dot_pos = solution_pos.y[2]
-alpha_dot_pos = solution_pos.y[3]
+# Simulate with zero voltage for comparison
+print("\nStarting zero voltage simulation...")
+solution_zero = progress_solve_ivp(
+    lambda t, y: pendulum_dynamics(t, y, zero_voltage),
+    t_span,
+    initial_state,
+    method='RK45',
+    t_eval=t_eval,
+    rtol=1e-6,
+    atol=1e-9,
+    description="Zero voltage simulation"
+)
 
-theta_neg = solution_neg.y[0]
-alpha_neg = solution_neg.y[1]
-theta_dot_neg = solution_neg.y[2]
-alpha_dot_neg = solution_neg.y[3]
+# Extract results
+t = solution_step.t
+theta_m_step = solution_step.y[0]
+theta_L_step = solution_step.y[1]
+theta_m_dot_step = solution_step.y[2]
+theta_L_dot_step = solution_step.y[3]
+cable_pos_step = solution_step.y[4]
 
-# Unwrap angles for continuous plotting
-alpha_pos_unwrapped = np.unwrap(alpha_pos)
-alpha_neg_unwrapped = np.unwrap(alpha_neg)
+theta_m_zero = solution_zero.y[0]
+theta_L_zero = solution_zero.y[1]
+theta_m_dot_zero = solution_zero.y[2]
+theta_L_dot_zero = solution_zero.y[3]
+cable_pos_zero = solution_zero.y[4]
+
+# For easier comparison with the paper, subtract pi from pendulum angle to make 0 the hanging position
+theta_L_step_adj = theta_L_step - np.pi
+theta_L_zero_adj = theta_L_zero - np.pi
 
 # Plot results
-plt.figure(figsize=(14, 10))
+plt.figure(figsize=(16, 12))
 
-# Plot arm angles
-plt.subplot(2, 2, 1)
-plt.plot(t, theta_pos, 'b-', label='+3.0V')
-plt.plot(t, theta_neg, 'r-', label='-3.0V')
-plt.ylabel('Arm angle (rad)')
-plt.title('Arm Angle Comparison (Lagrangian Model)')
+# Plot motor angles
+plt.subplot(3, 2, 1)
+plt.plot(t, theta_m_step, 'b-', label='Step Voltage')
+plt.plot(t, theta_m_zero, 'r-', label='Zero Voltage')
+plt.ylabel('Motor angle (rad)')
+plt.title('Motor Angle Comparison')
 plt.legend()
 plt.grid(True)
 
 # Plot pendulum angles
-plt.subplot(2, 2, 2)
-plt.plot(t, alpha_pos_unwrapped - np.pi, 'b-', label='+3.0V')
-plt.plot(t, alpha_neg_unwrapped - np.pi, 'r-', label='-3.0V')
+plt.subplot(3, 2, 2)
+plt.plot(t, theta_L_step_adj, 'b-', label='Step Voltage')
+plt.plot(t, theta_L_zero_adj, 'r-', label='Zero Voltage')
 plt.ylabel('Pendulum angle (rad)')
 plt.title('Pendulum Angle Comparison')
 plt.legend()
 plt.grid(True)
 
-# Plot arm angular velocities
-plt.subplot(2, 2, 3)
-plt.plot(t, theta_dot_pos, 'b-', label='+3.0V')
-plt.plot(t, theta_dot_neg, 'r-', label='-3.0V')
+# Plot motor angular velocities
+plt.subplot(3, 2, 3)
+plt.plot(t, theta_m_dot_step, 'b-', label='Step Voltage')
+plt.plot(t, theta_m_dot_zero, 'r-', label='Zero Voltage')
 plt.xlabel('Time (s)')
-plt.ylabel('Arm angular velocity (rad/s)')
+plt.ylabel('Motor angular velocity (rad/s)')
 plt.legend()
 plt.grid(True)
 
 # Plot pendulum angular velocities
-plt.subplot(2, 2, 4)
-plt.plot(t, alpha_dot_pos, 'b-', label='+3.0V')
-plt.plot(t, alpha_dot_neg, 'r-', label='-3.0V')
+plt.subplot(3, 2, 4)
+plt.plot(t, theta_L_dot_step, 'b-', label='Step Voltage')
+plt.plot(t, theta_L_dot_zero, 'r-', label='Zero Voltage')
 plt.xlabel('Time (s)')
 plt.ylabel('Pendulum angular velocity (rad/s)')
 plt.legend()
 plt.grid(True)
 
+# Plot cable oscillation
+plt.subplot(3, 2, 5)
+plt.plot(t, cable_pos_step, 'b-', label='Step Voltage')
+plt.plot(t, cable_pos_zero, 'r-', label='Zero Voltage')
+plt.xlabel('Time (s)')
+plt.ylabel('Cable oscillation (rad)')
+plt.title('Encoder Cable Effect')
+plt.legend()
+plt.grid(True)
+
+# Plot combined pendulum angle (with cable effect)
+plt.subplot(3, 2, 6)
+combined_angle_step = theta_L_step_adj + cable_pos_step
+combined_angle_zero = theta_L_zero_adj + cable_pos_zero
+plt.plot(t, combined_angle_step, 'b-', label='Step Voltage')
+plt.plot(t, combined_angle_zero, 'r-', label='Zero Voltage')
+plt.xlabel('Time (s)')
+plt.ylabel('Combined angle (rad)')
+plt.title('Pendulum Angle with Cable Effect')
+plt.legend()
+plt.grid(True)
+
 plt.tight_layout()
 plt.show()
+
+# Calculate and print some key parameters for comparison with the paper
+print("\nSystem Characteristics:")
+print("------------------------")
+
+# Calculate damping ratio of pendulum oscillation using log decrement method
+# Find peaks in the pendulum motion (for the zero voltage case which should oscillate freely)
+from scipy.signal import find_peaks
+
+peaks, _ = find_peaks(theta_L_zero_adj)
+if len(peaks) >= 2:
+    y1 = theta_L_zero_adj[peaks[0]]
+    y2 = theta_L_zero_adj[peaks[1]]
+    log_dec = np.log(abs(y1 / y2))
+    damping_ratio = 1 / np.sqrt(1 + (2 * np.pi / log_dec) ** 2)
+    print(f"Estimated pendulum damping ratio: {damping_ratio:.4f}")
+    print(f"Paper reported pendulum damping ratio: 0.367")
+
+    # Natural frequency
+    Td = t[peaks[1]] - t[peaks[0]]  # Period of damped oscillation
+    damped_freq = 2 * np.pi / Td
+    natural_freq = damped_freq / np.sqrt(1 - damping_ratio ** 2)
+    print(f"Estimated pendulum natural frequency: {natural_freq / (2 * np.pi):.2f} Hz")
+    print(f"Paper reported pendulum natural frequency: 11.12 Hz")
+
+# Cable oscillation parameters
+print(f"Cable damping ratio (input): {zeta_cable}")
+print(f"Cable natural frequency (input): {omega_cable} Hz")
