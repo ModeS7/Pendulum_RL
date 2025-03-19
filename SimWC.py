@@ -1,552 +1,451 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
+from time import time
+import numba as nb
 
-# System Parameters (from the QUBE-Servo 2 manual)
-Rm = 8.4  # Motor resistance (Ohm)
-kt = 0.042  # Motor torque constant (N·m/A)
-km = 0.042  # Motor back-EMF constant (V·s/rad)
-Jm = 4e-6  # Motor moment of inertia (kg·m²)
-mh = 0.016  # Hub mass (kg)
-rh = 0.0111  # Hub radius (m)
-Jh = 0.6e-6  # Hub moment of inertia (kg·m^2)
-Mr = 0.095  # Rotary arm mass (kg)
-Lr = 0.085  # Arm length, pivot to end (m)
-Mp = 0.024  # Pendulum mass (kg)
-Lp = 0.129  # Pendulum length from pivot to center of mass (m)
-Jp = (1 / 3) * Mp * Lp ** 2  # Pendulum moment of inertia (kg·m²)
-Br = 0.001  # Rotary arm viscous damping coefficient (N·m·s/rad)
-Bp = 0.0001  # Pendulum viscous damping coefficient (N·m·s/rad)
-g = 9.81  # Gravity constant (m/s²)
-Jr = Jm + Jh + Mr * Lr ** 2 / 3  # Total rotary arm inertia
+# System Parameters from the system identification document (Table 3)
+Rm = 8.94  # Motor resistance (Ohm)
+Km = 0.0431  # Motor back-emf constant
+Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
+bm = 3e-4  # Viscous damping coefficient (Nm/rad/s)
+DA = 3e-4  # Damping coefficient of pendulum arm (Nm/rad/s)
+DL = 5e-4  # Damping coefficient of pendulum link (Nm/rad/s)
+mA = 0.053  # Weight of pendulum arm (kg)
+mL = 0.024  # Weight of pendulum link (kg)
+LA = 0.086  # Length of pendulum arm (m)
+LL = 0.128  # Length of pendulum link (m)
+JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
+JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
+g = 9.81  # Gravity constant (m/s^2)
+
+# Define controller mode constants
+EMERGENCY_MODE = 0
+BANGBANG_MODE = 1
+LQR_MODE = 2
+ENERGY_MODE = 3
+
+# Pre-compute constants for optimization
+half_mL_LL_g = 0.5 * mL * LL * g
+half_mL_LL_LA = 0.5 * mL * LL * LA
+quarter_mL_LL_squared = 0.25 * mL * LL ** 2
+Mp_g_Lp = mL * g * LL
+Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
+
+max_voltage = 0.0  # Maximum motor voltage
+THETA_MIN = -2.7  # Minimum arm angle (radians)
+THETA_MAX = 2.7  # Maximum arm angle (radians)
 
 
-def lagrangian_dynamics(t, state, voltage_func):
-    """
-    Lagrangian formulation of the QUBE-Servo 2 dynamics
+# -------------------- CUSTOM MATH OPERATIONS --------------------
+@nb.njit(fastmath=True, cache=True)
+def clip_value(value, min_value, max_value):
+    """Fast custom clip function"""
+    if value < min_value:
+        return min_value
+    elif value > max_value:
+        return max_value
+    else:
+        return value
 
-    state = [theta, alpha, theta_dot, alpha_dot]
-    where:
-        theta = rotary arm angle
-        alpha = pendulum angle (α=π is hanging down)
-        theta_dot, alpha_dot = respective angular velocities
-    """
+
+@nb.njit(fastmath=True, cache=True)
+def apply_voltage_deadzone(vm):
+    """Apply motor voltage dead zone"""
+    if -0.2 <= vm <= 0.2:
+        return 0.0
+    return vm
+
+
+@nb.njit(fastmath=True, cache=True)
+def normalize_angle(angle):
+    """Normalize angle to [-π, π]"""
+    angle = angle % (2 * np.pi)
+    if angle > np.pi:
+        angle -= 2 * np.pi
+    return angle
+
+
+# -------------------- CONTROL ALGORITHMS --------------------
+@nb.njit(fastmath=True, cache=True)
+def simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot):
+    """Ultra-fast bang-bang controller"""
+    # Add theta limit avoidance to controller
+    if theta > THETA_MAX - 0.2 and theta_dot > 0:
+        return -max_voltage  # If close to upper limit, push back
+    elif theta < THETA_MIN + 0.2 and theta_dot < 0:
+        return max_voltage  # If close to lower limit, push back
+
+    if t < 0.5:
+        return max_voltage
+    elif t < 1.0:
+        return -max_voltage
+    else:
+        if alpha_dot < -2.0:
+            return -max_voltage
+        elif alpha_dot > 2.0:
+            return max_voltage
+        else:
+            alpha_norm = normalize_angle(alpha + np.pi)
+            return max_voltage if alpha_norm < 0 else -max_voltage
+
+
+@nb.njit(fastmath=True, cache=True)
+def energy_control(t, theta, alpha, theta_dot, alpha_dot):
+    """Ultra-fast energy-based controller"""
+    alpha_norm = normalize_angle(alpha + np.pi)
+    E = Mp_g_Lp * (1 - np.cos(alpha_norm)) + 0.5 * Jp * alpha_dot ** 2
+    E_ref = 2 * Mp_g_Lp
+    E_error = E - E_ref
+
+    # Stronger penalty for approaching theta limits
+    theta_penalty = 0.0
+
+    # Regular arm angle penalty
+    if abs(theta) > 1.0:
+        theta_penalty = 5.0 * (abs(theta) - 1.0)
+        if theta < 0:
+            theta_penalty = -theta_penalty
+
+    # Additional exponential penalty when approaching limits
+    limit_margin = 0.1  # How close to the limit before strong penalty
+    if theta > THETA_MAX - limit_margin:
+        limit_penalty = 10.0 * np.exp((theta - (THETA_MAX - limit_margin)) / limit_margin)
+        theta_penalty += limit_penalty
+    elif theta < THETA_MIN + limit_margin:
+        limit_penalty = -10.0 * np.exp(((THETA_MIN + limit_margin) - theta) / limit_margin)
+        theta_penalty += limit_penalty
+
+    direction = 1.0 if np.cos(alpha_norm) * alpha_dot > 0 else -1.0
+    u = 0.5 * E_error * direction - theta_penalty
+
+    return clip_value(u, -max_voltage, max_voltage)
+
+
+@nb.njit(fastmath=True, cache=True)
+def lqr_balance(theta, alpha, theta_dot, alpha_dot):
+    """Ultra-fast LQR controller with theta limits consideration"""
+    alpha_upright = normalize_angle(alpha - np.pi)
+
+    # Regular LQR control
+    u = -(-5.0 * theta + 50.0 * alpha_upright - 5.0 * theta_dot + 8.0 * alpha_dot)
+
+    # Add limit avoidance term
+    limit_margin = 0.3
+    if theta > THETA_MAX - limit_margin:
+        # Add strong negative control to avoid upper limit
+        avoid_factor = 20.0 * (theta - (THETA_MAX - limit_margin)) / limit_margin
+        u -= avoid_factor
+    elif theta < THETA_MIN + limit_margin:
+        # Add strong positive control to avoid lower limit
+        avoid_factor = 20.0 * ((THETA_MIN + limit_margin) - theta) / limit_margin
+        u += avoid_factor
+
+    return clip_value(u, -max_voltage, max_voltage)
+
+
+@nb.njit(fastmath=True, cache=True)
+def control_decision(t, state):
+    """Combined controller with controller mode tracking"""
+    theta, alpha, theta_dot, alpha_dot = state[0], state[1], state[2], state[3]
+    alpha_norm = normalize_angle(alpha + np.pi)
+
+    # Emergency limit handling - override all other controllers
+    if (theta >= THETA_MAX and theta_dot > 0) or (theta <= THETA_MIN and theta_dot < 0):
+        control_value = -max_voltage if theta_dot > 0 else max_voltage
+        return control_value, EMERGENCY_MODE
+
+    if t < 2.0:
+        control_value = simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot)
+        return control_value, BANGBANG_MODE
+
+    if abs(alpha_norm) < 0.3 and abs(alpha_dot) < 5.0:
+        control_value = lqr_balance(theta, alpha, theta_dot, alpha_dot)
+        return control_value, LQR_MODE
+    else:
+        control_value = energy_control(t, theta, alpha, theta_dot, alpha_dot)
+        return control_value, ENERGY_MODE
+
+
+# -------------------- CUSTOM INTEGRATOR --------------------
+@nb.njit(fastmath=True, cache=True)
+def enforce_theta_limits(state):
+    """Enforce hard limits on theta angle and velocity"""
     theta, alpha, theta_dot, alpha_dot = state
 
-    # Input voltage
-    def VM(vm):  # Motor voltage dead zone at 0.2V
-        return 0 if -0.2 <= vm <= 0.2 else vm
+    # Apply hard limit on theta
+    if theta > THETA_MAX:
+        theta = THETA_MAX
+        # If hitting upper limit with positive velocity, stop the motion
+        if theta_dot > 0:
+            theta_dot = 0.0
+    elif theta < THETA_MIN:
+        theta = THETA_MIN
+        # If hitting lower limit with negative velocity, stop the motion
+        if theta_dot < 0:
+            theta_dot = 0.0
 
-    vm = VM(voltage_func(t))
-    # Motor current
-    im = (vm - km * theta_dot) / Rm
+    return np.array([theta, alpha, theta_dot, alpha_dot])
 
-    # Motor torque
-    tau = kt * im
 
-    # Inertia matrix elements
-    M11 = Jr + Mp * Lr ** 2
-    M12 = Mp * Lr * Lp / 2 * np.cos(alpha)
-    M21 = M12
-    M22 = Jp
+@nb.njit(fastmath=True, parallel=False, cache=True)
+def rk4_step(state, t, dt, control_func):
+    """
+    4th-order Runge-Kutta integrator step with theta limits enforcement
+    """
+    # Get control input based on current state
+    control_output = control_func(t, state)
+    vm = control_output[0]  # Extract control value only for dynamics
+
+    # Apply limits to initial state
+    state = enforce_theta_limits(state)
+
+    # RK4 integration with limit enforcement at each step
+    k1 = dynamics_step(state, t, vm)
+
+    # Apply limits after each partial step
+    state_k2 = enforce_theta_limits(state + 0.5 * dt * k1)
+    k2 = dynamics_step(state_k2, t + 0.5 * dt, vm)
+
+    state_k3 = enforce_theta_limits(state + 0.5 * dt * k2)
+    k3 = dynamics_step(state_k3, t + 0.5 * dt, vm)
+
+    state_k4 = enforce_theta_limits(state + dt * k3)
+    k4 = dynamics_step(state_k4, t + dt, vm)
+
+    # Apply limits to final integrated state
+    new_state = state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return enforce_theta_limits(new_state)
+
+
+@nb.njit(fastmath=True, cache=True)
+def dynamics_step(state, t, vm):
+    """Ultra-optimized dynamics calculation with theta limits"""
+    theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
+
+    # Check theta limits - implement hard stops
+    if (theta_m >= THETA_MAX and theta_m_dot > 0) or (theta_m <= THETA_MIN and theta_m_dot < 0):
+        theta_m_dot = 0.0  # Stop the arm motion at the limits
+
+    # Apply dead zone and calculate motor torque
+    if -0.2 <= vm <= 0.2:
+        vm = 0.0
+
+    # Motor torque calculation
+    im = (vm - Km * theta_m_dot) / Rm
+    Tm = Km * im
+
+    # Equations of motion coefficients from Eq. (9) in paper
+    # For theta_m equation:
+    M11 = mL * LA ** 2 + quarter_mL_LL_squared - quarter_mL_LL_squared * np.cos(theta_L) ** 2 + JA
+    M12 = -half_mL_LL_LA * np.cos(theta_L)
+    C1 = 0.5 * mL * LL ** 2 * np.sin(theta_L) * np.cos(theta_L) * theta_m_dot * theta_L_dot
+    C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
+
+    # For theta_L equation:
+    M21 = half_mL_LL_LA * np.cos(theta_L)
+    M22 = JL + quarter_mL_LL_squared
+    C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
+    G = half_mL_LL_g * np.sin(theta_L)
+
+    # Calculate determinant for matrix inversion
     det_M = M11 * M22 - M12 * M21
 
-    # Nonlinear terms
-    C = -Mp * Lr * Lp * np.sin(alpha) * alpha_dot ** 2  # For arm
-    G = -Mp * Lp * g * np.sin(alpha)  # Gravity for pendulum
-    F_theta = Br * theta_dot
-    F_alpha = Bp * alpha_dot
-
-    # Solve for accelerations: M * [theta_ddot; alpha_ddot] = [tau - C - F_theta; -G - F_alpha]
-    M = np.array([[M11, M12], [M21, M22]])
-    # Right-hand side with centrifugal term added for pendulum
-    rhs = np.array([
-        tau - C - F_theta,
-        -G - F_alpha - Mp * Lr * Lp * np.sin(alpha) * theta_dot ** 2
-    ])
-    acc = np.linalg.solve(M, rhs)
-
-    # Solve for accelerations
-    if abs(det_M) < 1e-10:  # Handle near-singular matrix
-        theta_ddot = 0
-        alpha_ddot = 0
+    # Handle near-singular matrix
+    if abs(det_M) < 1e-10:
+        theta_m_ddot = 0
+        theta_L_ddot = 0
     else:
-        theta_ddot = acc[0]
-        alpha_ddot = acc[1]
+        # Right-hand side of equations
+        RHS1 = Tm - C1 - C2 - DA * theta_m_dot
+        RHS2 = -G - DL * theta_L_dot - C3
 
-    return [theta_dot, alpha_dot, theta_ddot, alpha_ddot]
+        # Solve for accelerations
+        theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
+        theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
+
+    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 
-# ============== Energy-based Swing-up Controller ==============
-def energy_swing_up(state):
+@nb.njit(fastmath=True, parallel=False, cache=True)
+def custom_integrate(state0, t_span, dt, control_func):
     """
-    Energy-based swing-up controller for the pendulum
-
-    The idea is to inject energy into the system when the pendulum is below
-    the horizontal, and remove energy when it's above. This pumps the pendulum
-    higher with each swing until it reaches the upright position.
-
-    Args:
-        state: [theta, alpha, theta_dot, alpha_dot]
-
-    Returns:
-        control voltage
+    Custom integrator with theta limits enforcement and controller logging
     """
-    theta, alpha, theta_dot, alpha_dot = state
+    t_start, t_end = t_span
+    n_steps = int((t_end - t_start) / dt) + 1
 
-    # Reference energy for upright position (potential energy at upright)
-    # Note: in this system, alpha=π is hanging down, alpha=0 or 2π is upright
-    E_ref = Mp * g * Lp  # Energy needed at upright position
+    # Pre-allocate arrays for results
+    t = np.linspace(t_start, t_end, n_steps)
+    states = np.zeros((4, n_steps))
+    controls = np.zeros(n_steps)
+    controller_modes = np.zeros(n_steps, dtype=np.int32)  # Track active controller
 
-    # Current energy of pendulum (kinetic + potential)
-    # Potential energy is relative to hanging down position (alpha=π)
-    E_kinetic = 0.5 * Jp * alpha_dot ** 2
-    E_potential = Mp * g * Lp * (np.cos(alpha) - (-1))  # -1 is cos(π)
-    E_total = E_kinetic + E_potential
+    # Set initial state with limits applied
+    states[:, 0] = enforce_theta_limits(state0)
 
-    # Energy error
-    E_error = E_ref - E_total
+    # Get initial control and controller mode
+    control_output = control_func(t_start, states[:, 0])
+    controls[0] = control_output[0]
+    controller_modes[0] = control_output[1]
 
-    # Swing-up control law
-    k_energy = 0.8  # Increased energy control gain for more aggressive swing-up
+    # Integration loop
+    for i in range(1, n_steps):
+        states[:, i] = rk4_step(states[:, i - 1], t[i - 1], dt, control_func)
 
-    # For small oscillations at the beginning, give a stronger push
-    if abs(alpha - np.pi) < 0.1 and abs(alpha_dot) < 0.2:
-        # Initial push to get the pendulum moving
-        return 5.0 * np.sign(np.sin(theta))
+        # Get control value and controller mode
+        control_output = control_func(t[i], states[:, i])
+        controls[i] = control_output[0]
+        controller_modes[i] = control_output[1]
 
-    # Use the sign of pendulum velocity and sign of pendulum position
-    # to determine when to apply torque
-    control = k_energy * E_error * np.sign(alpha_dot * np.sin(alpha))
+    return t, states, controls, controller_modes
 
-    # Add direct term to ensure arm is moving
-    control += 0.5 * np.sign(np.sin(alpha)) - 0.1 * theta_dot  # Add damping
 
-    # Limit control output
-    max_voltage = 5.0
-    control = np.clip(control, -max_voltage, max_voltage)
-
-    return control
-
-
-# ============== PID Controller for Stabilization ==============
-class PIDController:
-    def __init__(self, kp, ki, kd, setpoint=0):
-        self.kp = kp  # Proportional gain
-        self.ki = ki  # Integral gain
-        self.kd = kd  # Derivative gain
-        self.setpoint = setpoint  # Target angle (0 = upright)
-        self.integral = 0  # Integral term
-        self.prev_error = 0  # Previous error for derivative
-        self.prev_time = 0  # Previous time for dt calculation
-
-    def compute(self, t, state):
-        """
-        Compute PID control action
-
-        Args:
-            t: current time
-            state: [theta, alpha, theta_dot, alpha_dot]
-
-        Returns:
-            control voltage
-        """
-        theta, alpha, theta_dot, alpha_dot = state
-
-        # Calculate dt (time step)
-        dt = t - self.prev_time if t > self.prev_time else 0.001
-        self.prev_time = t
-
-        # Calculate error (relative to upright position)
-        # Note: We want alpha = 0 (or 2π), and current reference is α=π for hanging down
-        error = (alpha - np.pi) - self.setpoint  # Get angle relative to upright
-
-        # Normalize angle to [-π, π]
-        error = ((error + np.pi) % (2 * np.pi)) - np.pi
-
-        # Proportional term
-        p_term = self.kp * error
-
-        # Integral term with anti-windup
-        self.integral += error * dt
-        self.integral = np.clip(self.integral, -10.0, 10.0)  # Anti-windup
-        i_term = self.ki * self.integral
-
-        # Derivative term (use actual measured alpha_dot instead of error derivative for cleaner signal)
-        d_term = self.kd * alpha_dot  # Use pendulum angular velocity directly
-
-        # Total control effort
-        control = -(p_term + i_term + d_term)
-
-        # Add arm position control to keep the arm near center
-        control -= 1.0 * theta + 0.5 * theta_dot
-
-        # Limit control output
-        max_voltage = 5.0
-        control = np.clip(control, -max_voltage, max_voltage)
-
-        # Update previous error for next iteration
-        self.prev_error = error
-
-        return control
-
-
-# ============== Combined Controller (Swing-up + PID) ==============
-class CombinedController:
-    def __init__(self):
-        # PID gains tuned for stabilization - increased for better performance
-        self.pid = PIDController(kp=20.0, ki=1.0, kd=2.0)
-        self.control_history = []  # For storing control voltages
-        self.state_history = []  # For storing system states
-        self.swing_time = 0  # Time in swing-up mode
-        self.stabilize_time = 0  # Time in stabilization mode
-        self.control_mode = "swing-up"  # Track current control mode
-
-    def compute(self, t, state):
-        """
-        Combined controller that switches between swing-up and stabilization
-
-        Args:
-            t: current time
-            state: [theta, alpha, theta_dot, alpha_dot]
-
-        Returns:
-            control voltage
-        """
-        theta, alpha, theta_dot, alpha_dot = state
-
-        # Store state for analysis
-        self.state_history.append((t, state))
-
-        # Normalize pendulum angle relative to upright (0 = upright, ±π = hanging down)
-        alpha_norm = ((alpha - np.pi + np.pi) % (2 * np.pi)) - np.pi
-        alpha_norm = alpha
-
-        # Define region where PID controller takes over
-        # When pendulum is within ±0.4 radians of upright position and not moving too fast
-        stabilization_region = 0.4  # radians
-
-        # Determine control mode
-        if abs(alpha_norm) < stabilization_region and abs(alpha_dot) < 2.0:
-            # Use PID control for stabilization
-            control = self.pid.compute(t, state)
-            if self.control_mode != "stabilize":
-                print(f"Switching to stabilization at t={t:.2f}s")
-                self.control_mode = "stabilize"
-            self.stabilize_time += 1
-        else:
-            # Use energy-based swing-up
-            control = energy_swing_up(state)
-            if self.control_mode != "swing-up":
-                print(f"Switching to swing-up at t={t:.2f}s")
-                self.control_mode = "swing-up"
-            self.swing_time += 1
-
-        # Store control for plotting
-        self.control_history.append((t, control))
-
-        return control
-
-
-# ============== Simulation of Combined Controller ==============
-def run_controlled_simulation():
-    # Create combined controller
-    controller = CombinedController()
-
-    # Define voltage function that uses the controller
-    def controlled_voltage(t):
-        # This is called by the ODE solver, which doesn't pass state
-        # We need to get the state from the solution at previous time steps
-
-        # Initial state (if t=0)
-        if t == 0 or len(t_points) == 0:
-            return 0.0
-
-        # Find closest time point
-        idx = np.argmin(np.abs(np.array(t_points) - t))
-        if idx < len(states):
-            return controller.compute(t, states[idx])
-        return 0.0
-
-    # Storage for states during simulation
-    t_points = []
-    states = []
-
-    # Event function to record states during simulation
-    def record_state(t, y):
-        t_points.append(t)
-        states.append(y.copy())
-        return False  # Continue integration
-
-    # Time span for the simulation
-    t_span = (0, 20)  # 20 seconds
-    t_eval = np.linspace(0, 20, 10000)
-
-    # Initial conditions (pendulum hanging down)
-    initial_state = [0, 2, 0, 0]  # [theta, alpha, theta_dot, alpha_dot]
-
-    # Solve using solve_ivp with the controlled voltage
-    print("Simulating with swing-up and PID control...")
-    solution = solve_ivp(
-        lambda t, y: lagrangian_dynamics(t, y, controlled_voltage),
-        t_span,
-        initial_state,
-        method='RK45',
-        t_eval=t_eval,
-        rtol=1e-6,
-        atol=1e-9,
-        events=record_state
-    )
-
-    # Extract control voltages for plotting
-    control_times, control_values = zip(*controller.control_history) if controller.control_history else ([], [])
-
-    return solution, np.array(control_times), np.array(control_values)
-
-
-# ============== Alternative Implementation Using RK4 Integration ==============
-# This approach gives more direct control over the simulation process
-def run_controlled_simulation_rk4():
-    # Create combined controller
-    controller = CombinedController()
-
-    # Time settings
-    t_end = 15.0
-    dt = 0.001
-    num_steps = int(t_end / dt)
-    t = np.linspace(0, t_end, num_steps)
-
-    # Arrays to store results
-    theta = np.zeros(num_steps)
-    alpha = np.zeros(num_steps)
-    theta_dot = np.zeros(num_steps)
-    alpha_dot = np.zeros(num_steps)
-    control_voltages = np.zeros(num_steps)
-
-    # Initial state (pendulum hanging down with small perturbation to break symmetry)
-    state = np.array([0, np.pi + 0.01, 0, 0])  # [theta, alpha, theta_dot, alpha_dot]
-    theta[0], alpha[0], theta_dot[0], alpha_dot[0] = state
-
-    # RK4 integration step function
-    def rk4_step(func, t, y, h, voltage):
-        # Define a voltage function that returns the constant voltage
-        def voltage_func(_):
-            return voltage
-
-        # Calculate derivatives
-        k1 = np.array(func(t, y, voltage_func))
-        k2 = np.array(func(t + 0.5 * h, y + 0.5 * h * k1, voltage_func))
-        k3 = np.array(func(t + 0.5 * h, y + 0.5 * h * k2, voltage_func))
-        k4 = np.array(func(t + h, y + h * k3, voltage_func))
-
-        # Update state
-        return y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-    # Add some initial energy (small push)
-    control_voltages[0] = 3.0
-
-    # Simulation loop
-    for i in range(1, num_steps):
-        # Calculate control voltage
-        control = controller.compute(t[i - 1], state)
-        control_voltages[i - 1] = control
-
-        # RK4 integration step
-        state = rk4_step(lagrangian_dynamics, t[i - 1], state, dt, control)
-
-        # Store state
-        theta[i], alpha[i], theta_dot[i], alpha_dot[i] = state
-
-        # Print progress at intervals
-        if i % 1000 == 0:
-            print(f"Time: {t[i]:.2f}s, Pendulum angle: {(alpha[i] - np.pi):.4f}, Arm angle: {theta[i]:.4f}")
-
-    # Store the last control voltage
-    control_voltages[-1] = controller.compute(t[-1], state)
-
-    # Print summary
-    print(
-        f"Simulation complete. Swing-up time: {controller.swing_time * dt:.2f}s, Stabilization time: {controller.stabilize_time * dt:.2f}s")
-
-    # Create a solution object similar to solve_ivp output
-    class Solution:
-        def __init__(self):
-            self.t = t
-            self.y = np.array([theta, alpha, theta_dot, alpha_dot])
-
-    return Solution(), t, control_voltages
-
-
-# ============== Run and Visualize the Simulation ==============
 def main():
-    # Use RK4 method for more control over the simulation
-    solution, t_control, control_voltages = run_controlled_simulation_rk4()
+    start_time = time()
+    print("Starting pendulum simulation with theta limits...")
+
+    # Simulation parameters
+    t_span = (0.0, 10.0)  # 10 seconds of simulation
+    dt = 0.02  # 20ms timestep (50Hz)
+
+    # Initial conditions
+    initial_state = np.array([0.0, np.pi-0.1, 0.0, 0.0])  # [theta, alpha, theta_dot, alpha_dot]
+
+    print("=" * 50)
+    print(f"STARTING SIMULATION WITH THETA LIMITS: [{THETA_MIN}, {THETA_MAX}]")
+    print("=" * 50)
+
+    # Custom integration with controller mode tracking
+    t, states, controls, controller_modes = custom_integrate(initial_state, t_span, dt, control_decision)
+
+    sim_time = time() - start_time
+    print(f"Simulation completed in {sim_time:.2f} seconds!")
 
     # Extract results
-    t = solution.t
-    theta = solution.y[0]
-    alpha = solution.y[1]
-    theta_dot = solution.y[2]
-    alpha_dot = solution.y[3]
+    theta = states[0]
+    alpha = states[1]
+    theta_dot = states[2]
+    alpha_dot = states[3]
 
-    # Calculate energy over time (for analysis)
-    energy = np.zeros_like(t)
+    # Normalize alpha for visualization
+    alpha_normalized = np.zeros(len(alpha))
+    for i in range(len(alpha)):
+        alpha_normalized[i] = normalize_angle(alpha[i] + np.pi)
+
+    # Calculate performance metrics
+    print("Calculating performance metrics...")
+    inversion_success = False
+    balanced_time = 0.0
+    num_upright_points = 0
+    limit_hits = 0
+
+    # Count controller mode statistics
+    emergency_time = 0.0
+    bangbang_time = 0.0
+    lqr_time = 0.0
+    energy_time = 0.0
+
     for i in range(len(t)):
-        E_kinetic = 0.5 * Jp * alpha_dot[i] ** 2
-        E_potential = Mp * g * Lp * (np.cos(alpha[i]) - (-1))
-        energy[i] = E_kinetic + E_potential
+        # Check if pendulum is close to upright
+        if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
+            balanced_time += t[i] - t[i - 1] if i > 0 else 0
+            num_upright_points += 1
+            inversion_success = True
 
-    # Unwrap pendulum angle for better visualization
-    alpha_unwrapped = np.unwrap(alpha)
+        # Count limit hits
+        if abs(theta[i] - THETA_MAX) < 0.01 or abs(theta[i] - THETA_MIN) < 0.01:
+            limit_hits += 1
 
-    # Create 3x3 grid of plots for comprehensive analysis
-    plt.figure(figsize=(18, 12))
+        # Tally controller mode usage time
+        dt_i = t[i] - t[i - 1] if i > 0 else 0
+        if controller_modes[i] == EMERGENCY_MODE:
+            emergency_time += dt_i
+        elif controller_modes[i] == BANGBANG_MODE:
+            bangbang_time += dt_i
+        elif controller_modes[i] == LQR_MODE:
+            lqr_time += dt_i
+        elif controller_modes[i] == ENERGY_MODE:
+            energy_time += dt_i
+
+    print(f"Did pendulum reach inverted position? {inversion_success}")
+    print(f"Time spent balanced (approximately): {balanced_time:.2f} seconds")
+    print(f"Number of data points with pendulum upright: {num_upright_points}")
+    print(f"Max arm angle: {np.max(np.abs(theta)):.2f} rad")
+    print(f"Theta limit hits: {limit_hits} times")
+    print(f"Max pendulum angular velocity: {np.max(np.abs(alpha_dot)):.2f} rad/s")
+    final_angle_deg = abs(alpha_normalized[-1]) * 180 / np.pi
+    print(f"Final pendulum angle from vertical: {abs(alpha_normalized[-1]):.2f} rad ({final_angle_deg:.1f} degrees)")
+    print("\nController usage statistics:")
+    print(f"- Emergency limit control: {emergency_time:.2f}s ({emergency_time / t_span[1] * 100:.1f}%)")
+    print(f"- Bang-bang control: {bangbang_time:.2f}s ({bangbang_time / t_span[1] * 100:.1f}%)")
+    print(f"- LQR balance control: {lqr_time:.2f}s ({lqr_time / t_span[1] * 100:.1f}%)")
+    print(f"- Energy swing-up control: {energy_time:.2f}s ({energy_time / t_span[1] * 100:.1f}%)")
+
+    # Plot results
+    print("Generating plots...")
+    plt.figure(figsize=(14, 16))  # Make figure taller for 4 subplots
 
     # Plot arm angle
-    plt.subplot(3, 3, 1)
+    plt.subplot(4, 1, 1)
     plt.plot(t, theta, 'b-')
+    plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
+    plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
     plt.ylabel('Arm angle (rad)')
-    plt.title('Arm Angle (θ)')
+    plt.title(f'Inverted Pendulum Control with Theta Limits (Simulation time: {sim_time:.2f}s)')
+    plt.legend()
     plt.grid(True)
 
     # Plot pendulum angle
-    plt.subplot(3, 3, 2)
-    plt.plot(t, alpha, 'r-')
-    #plt.axhline(y=0, color='k', linestyle='--')  # Upright position
-    #plt.axhline(y=np.pi, color='g', linestyle='--')  # Hanging position
-    #plt.axhline(y=-np.pi, color='g', linestyle='--')  # Hanging position
+    plt.subplot(4, 1, 2)
+    plt.plot(t, alpha_normalized, 'r-')
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
     plt.ylabel('Pendulum angle (rad)')
-    plt.title('Pendulum Angle Relative to Upright')
     plt.grid(True)
 
-    # Plot arm angular velocity
-    plt.subplot(3, 3, 4)
-    plt.plot(t, theta_dot, 'b-')
-    plt.ylabel('Arm velocity (rad/s)')
-    plt.title('Arm Angular Velocity')
-    plt.grid(True)
-
-    # Plot pendulum angular velocity
-    plt.subplot(3, 3, 5)
-    plt.plot(t, alpha_dot, 'r-')
-    plt.ylabel('Pendulum velocity (rad/s)')
-    plt.title('Pendulum Angular Velocity')
-    plt.grid(True)
-
-    # Plot control voltage
-    plt.subplot(3, 3, 7)
-    plt.plot(t_control, control_voltages, 'g-')
-    plt.xlabel('Time (s)')
+    # Plot control signal
+    plt.subplot(4, 1, 3)
+    plt.plot(t, controls, 'g-')
     plt.ylabel('Control voltage (V)')
-    plt.title('Control Voltage')
     plt.grid(True)
 
-    # Plot pendulum phase portrait
-    plt.subplot(3, 3, 8)
-    plt.plot(alpha_unwrapped - np.pi, alpha_dot, 'r-')
-    plt.xlabel('Pendulum angle (rad)')
-    plt.ylabel('Pendulum velocity (rad/s)')
-    plt.title('Pendulum Phase Portrait')
+    # Plot controller mode
+    plt.subplot(4, 1, 4)
+    colors = ['red', 'orange', 'green', 'blue']
+    labels = ['Emergency', 'Bang-Bang', 'LQR', 'Energy']
+
+    # Create colored regions for different controller modes
+    for i in range(4):
+        mode_mask = controller_modes == i
+        if np.any(mode_mask):
+            plt.fill_between(t, 0, 1, where=mode_mask, color=colors[i], alpha=0.3, label=labels[i])
+
+    # Create custom colored bars for controller transitions
+    prev_mode = controller_modes[0]
+    mode_changes = []
+    for i in range(1, len(t)):
+        if controller_modes[i] != prev_mode:
+            mode_changes.append((t[i], prev_mode, controller_modes[i]))
+            prev_mode = controller_modes[i]
+
+    # Mark transition points with vertical lines
+    for tc, _, _ in mode_changes:
+        plt.axvline(x=tc, color='black', linestyle='-', alpha=0.2)
+
+    # Add legend and labels
+    plt.xlabel('Time (s)')
+    plt.ylabel('Controller Mode')
+    plt.yticks([0.25, 0.5, 0.75], ['Emergency', 'Bang-Bang', 'LQR/Energy'])
+    plt.legend(title='Controller Modes', loc='upper right')
     plt.grid(True)
-
-    # Plot total energy of the pendulum
-    plt.subplot(3, 3, 3)
-    plt.plot(t, energy, 'purple')
-    plt.ylabel('Energy (J)')
-    plt.title('Pendulum Energy')
-    plt.grid(True)
-
-    # Plot pendulum vs arm motion (2D projection)
-    plt.subplot(3, 3, 6)
-    plt.plot(theta, alpha_unwrapped - np.pi, 'b-')
-    plt.xlabel('Arm angle (rad)')
-    plt.ylabel('Pendulum angle (rad)')
-    plt.title('2D System Trajectory')
-    plt.grid(True)
-
-    # Plot animation frames for visualization (select points)
-    plt.subplot(3, 3, 9)
-    num_frames = 10
-    frame_indices = np.linspace(0, len(t) - 1, num_frames).astype(int)
-
-    # Plot arm and pendulum positions
-    L_arm = Lr  # Arm length
-    L_pend = Lp  # Pendulum length
-
-    for i in frame_indices:
-        # Arm endpoint
-        arm_x = L_arm * np.sin(theta[i])
-        arm_y = -L_arm * np.cos(theta[i])
-
-        # Pendulum endpoint
-        pend_x = arm_x + L_pend * np.sin(theta[i] + alpha[i] - np.pi)
-        pend_y = arm_y - L_pend * np.cos(theta[i] + alpha[i] - np.pi)
-
-        # Plot arm
-        plt.plot([0, arm_x], [0, arm_y], 'b-', linewidth=1)
-
-        # Plot pendulum
-        plt.plot([arm_x, pend_x], [arm_y, pend_y], 'r-', linewidth=1)
-
-        # Annotate time
-        plt.annotate(f"{t[i]:.1f}s", (arm_x, arm_y), fontsize=8)
-
-    plt.xlim(-0.3, 0.3)
-    plt.ylim(-0.3, 0.1)
-    plt.xlabel('x (m)')
-    plt.ylabel('y (m)')
-    plt.title('System Animation Frames')
-    plt.grid(True)
-    plt.axis('equal')
 
     plt.tight_layout()
+    plt.savefig("pendulum_with_controller_modes.png")
+    print("Plot saved as 'pendulum_with_controller_modes.png'")
     plt.show()
 
-    # Create a separate animation figure
-    plt.figure(figsize=(10, 8))
-    plt.title("Inverted Pendulum Motion")
-
-    # More dense sampling for smoother animation
-    frame_indices = np.linspace(0, len(t) - 1, 50).astype(int)
-
-    """for i in frame_indices:
-        plt.clf()  # Clear figure
-
-        # Arm endpoint
-        arm_x = L_arm * np.sin(theta[i])
-        arm_y = -L_arm * np.cos(theta[i])
-
-        # Pendulum endpoint
-        pend_x = arm_x + L_pend * np.sin(theta[i] + alpha[i] - np.pi)
-        pend_y = arm_y - L_pend * np.cos(theta[i] + alpha[i] - np.pi)
-
-        # Plot pivot point
-        plt.plot(0, 0, 'ko', markersize=8)
-
-        # Plot arm
-        plt.plot([0, arm_x], [0, arm_y], 'b-', linewidth=3)
-        plt.plot(arm_x, arm_y, 'bo', markersize=6)
-
-        # Plot pendulum
-        plt.plot([arm_x, pend_x], [arm_y, pend_y], 'r-', linewidth=3)
-        plt.plot(pend_x, pend_y, 'ro', markersize=6)
-
-        # Add information
-        plt.annotate(f"Time: {t[i]:.2f}s", (-0.25, 0.15), fontsize=12)
-        plt.annotate(f"Pendulum angle: {(alpha[i] - np.pi):.2f} rad", (-0.25, 0.1), fontsize=12)
-        plt.annotate(f"Arm angle: {theta[i]:.2f} rad", (-0.25, 0.05), fontsize=12)
-        plt.annotate(f"Control: {control_voltages[i]:.2f} V", (-0.25, 0), fontsize=12)
-
-        plt.xlim(-0.3, 0.3)
-        plt.ylim(-0.3, 0.2)
-        plt.xlabel('x (m)')
-        plt.ylabel('y (m)')
-        plt.grid(True)
-        plt.axis('equal')
-
-        plt.pause(0.05)  # Pause to create animation effect
-
-    plt.show()"""
+    print("=" * 50)
+    print(f"PROGRAM EXECUTION COMPLETE IN {time() - start_time:.2f} SECONDS")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
