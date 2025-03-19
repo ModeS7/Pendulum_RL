@@ -5,6 +5,11 @@ import time
 from tqdm.notebook import tqdm  # For progress tracking
 import sys
 
+#   System Dynamics and Parameters from the system identification document:
+#   System identiﬁcations of a 2DOF pendulum controlled
+#   by QUBE-servo and its unwanted oscillation factors
+#   https://bibliotekanauki.pl/articles/1845011.pdf
+
 # System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.0431  # Motor back-emf constant

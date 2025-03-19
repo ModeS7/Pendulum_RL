@@ -220,6 +220,7 @@ class CombinedController:
 
         # Normalize pendulum angle relative to upright (0 = upright, ±π = hanging down)
         alpha_norm = ((alpha - np.pi + np.pi) % (2 * np.pi)) - np.pi
+        alpha_norm = alpha
 
         # Define region where PID controller takes over
         # When pendulum is within ±0.4 radians of upright position and not moving too fast
@@ -282,7 +283,7 @@ def run_controlled_simulation():
     t_eval = np.linspace(0, 20, 10000)
 
     # Initial conditions (pendulum hanging down)
-    initial_state = [0, 0, 0, 0]  # [theta, alpha, theta_dot, alpha_dot]
+    initial_state = [0, 2, 0, 0]  # [theta, alpha, theta_dot, alpha_dot]
 
     # Solve using solve_ivp with the controlled voltage
     print("Simulating with swing-up and PID control...")
@@ -410,10 +411,10 @@ def main():
 
     # Plot pendulum angle
     plt.subplot(3, 3, 2)
-    plt.plot(t, alpha_unwrapped - np.pi, 'r-')
-    plt.axhline(y=0, color='k', linestyle='--')  # Upright position
-    plt.axhline(y=np.pi, color='g', linestyle='--')  # Hanging position
-    plt.axhline(y=-np.pi, color='g', linestyle='--')  # Hanging position
+    plt.plot(t, alpha, 'r-')
+    #plt.axhline(y=0, color='k', linestyle='--')  # Upright position
+    #plt.axhline(y=np.pi, color='g', linestyle='--')  # Hanging position
+    #plt.axhline(y=-np.pi, color='g', linestyle='--')  # Hanging position
     plt.ylabel('Pendulum angle (rad)')
     plt.title('Pendulum Angle Relative to Upright')
     plt.grid(True)
@@ -543,9 +544,9 @@ def main():
         plt.grid(True)
         plt.axis('equal')
 
-        plt.pause(0.05)  # Pause to create animation effect"""
+        plt.pause(0.05)  # Pause to create animation effect
 
-    plt.show()
+    plt.show()"""
 
 
 if __name__ == "__main__":
