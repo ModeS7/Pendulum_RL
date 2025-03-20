@@ -32,7 +32,7 @@ quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
-max_voltage = 18.0  # Maximum motor voltage
+max_voltage = 7.0  # Maximum motor voltage
 THETA_MIN = -2.2 # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -129,11 +129,11 @@ def energy_control(t, theta, alpha, theta_dot, alpha_dot):
     # Stronger penalty for approaching theta limits
     theta_penalty = 0.0
 
-    # Regular arm angle penalty
+    """# Regular arm angle penalty
     if abs(theta) > 1.0:
         theta_penalty = 4.5 * (abs(theta) - 1.0)
         if theta < 0:
-            theta_penalty = -theta_penalty
+            theta_penalty = -theta_penalty"""
 
     # Additional exponential penalty when approaching limits
     limit_margin = 0.1  # How close to the limit before strong penalty
@@ -183,7 +183,10 @@ def control_decision(t, state):
         control_value = -max_voltage if theta_dot > 0 else max_voltage
         return control_value, EMERGENCY_MODE
 
-    if t < 2.0 and not(abs(alpha_norm) < 0.3 and abs(alpha_dot) < 5.0):
+    current_energy = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2
+    min_energy_threshold = Mp_g_Lp * 0.8  # Adjust this value based on testing
+    if current_energy < min_energy_threshold and not (abs(alpha_norm) < 0.3 and abs(alpha_dot) < 5.0):
+    #if t < 2.0 and not(abs(alpha_norm) < 0.3 and abs(alpha_dot) < 5.0):
         control_value = simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot)
         return control_value, BANGBANG_MODE
 
