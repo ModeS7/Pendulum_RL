@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from time import time
 import numba as nb
-from adodbapi.ado_consts import directions
 
 # System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
