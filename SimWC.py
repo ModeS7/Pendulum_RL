@@ -31,9 +31,9 @@ quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
-max_voltage = 0.0  # Maximum motor voltage
-THETA_MIN = -2.7  # Minimum arm angle (radians)
-THETA_MAX = 2.7  # Maximum arm angle (radians)
+max_voltage = 12.0  # Maximum motor voltage
+THETA_MIN = -2.9  # Minimum arm angle (radians)
+THETA_MAX = 2.9  # Maximum arm angle (radians)
 
 
 # -------------------- CUSTOM MATH OPERATIONS --------------------
@@ -93,7 +93,7 @@ def simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot):
 def energy_control(t, theta, alpha, theta_dot, alpha_dot):
     """Ultra-fast energy-based controller"""
     alpha_norm = normalize_angle(alpha + np.pi)
-    E = Mp_g_Lp * (1 - np.cos(alpha_norm)) + 0.5 * Jp * alpha_dot ** 2
+    E = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2
     E_ref = 2 * Mp_g_Lp
     E_error = E - E_ref
 
@@ -305,11 +305,11 @@ def main():
     print("Starting pendulum simulation with theta limits...")
 
     # Simulation parameters
-    t_span = (0.0, 10.0)  # 10 seconds of simulation
+    t_span = (0.0, 15.0)  # 10 seconds of simulation
     dt = 0.02  # 20ms timestep (50Hz)
 
     # Initial conditions
-    initial_state = np.array([0.0, np.pi-0.1, 0.0, 0.0])  # [theta, alpha, theta_dot, alpha_dot]
+    initial_state = np.array([0.0, 0.1, 0.0, 0.0])  # [theta, alpha, theta_dot, alpha_dot]
 
     print("=" * 50)
     print(f"STARTING SIMULATION WITH THETA LIMITS: [{THETA_MIN}, {THETA_MAX}]")
