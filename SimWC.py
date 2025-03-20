@@ -4,7 +4,7 @@ from time import time
 import numba as nb
 from adodbapi.ado_consts import directions
 
-"""# System Parameters from the system identification document (Table 3)
+# System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.0431  # Motor back-emf constant
 Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
@@ -17,7 +17,7 @@ LA = 0.086  # Length of pendulum arm (m)
 LL = 0.128  # Length of pendulum link (m)
 JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
 JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
-g = 9.81  # Gravity constant (m/s^2)"""
+g = 9.81  # Gravity constant (m/s^2)
 
 # Define controller mode constants
 EMERGENCY_MODE = 0
@@ -25,41 +25,17 @@ BANGBANG_MODE = 1
 LQR_MODE = 2
 ENERGY_MODE = 3
 
-"""# Pre-compute constants for optimization
+# Pre-compute constants for optimization
 half_mL_LL_g = 0.5 * mL * LL * g
 half_mL_LL_LA = 0.5 * mL * LL * LA
 quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
-Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)"""
+Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
 max_voltage = 10.0  # Maximum motor voltage
 THETA_MIN = -2.2 # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
-# System Parameters (from the QUBE-Servo 2 manual)
-Rm = 8.4  # Motor resistance (Ohm)
-kt = 0.042  # Motor torque constant (N·m/A)
-km = 0.042  # Motor back-EMF constant (V·s/rad)
-Jm = 4e-6  # Motor moment of inertia (kg·m²)
-mh = 0.016  # Hub mass (kg)
-rh = 0.0111  # Hub radius (m)
-Jh = 0.6e-6  # Hub moment of inertia (kg·m^2)
-Mr = 0.095  # Rotary arm mass (kg)
-Lr = 0.085  # Arm length, pivot to end (m)
-Mp = 0.024  # Pendulum mass (kg)
-Lp = 0.129  # Pendulum length from pivot to center of mass (m)
-Jp = (1 / 3) * Mp * Lp ** 2  # Pendulum moment of inertia (kg·m²)
-Br = 0.001  # Rotary arm viscous damping coefficient (N·m·s/rad)
-Bp = 0.0001  # Pendulum viscous damping coefficient (N·m·s/rad)
-g = 9.81  # Gravity constant (m/s²)
-Jr = Jm + Jh + Mr * Lr ** 2 / 3  # Total rotary arm inertia
-
-# Pre-compute constants for optimization
-half_mL_LL_g = 0.5 * Mp * Lp * g
-half_mL_LL_LA = 0.5 * Mp * Lp * Lr
-quarter_mL_LL_squared = 0.25 * Mp * Lp ** 2
-Mp_g_Lp = Mp * g * Lp
-Jp = (1 / 3) * Mp * Lp ** 2  # Pendulum moment of inertia (kg·m²)
 
 
 # -------------------- CUSTOM MATH OPERATIONS --------------------
@@ -152,7 +128,7 @@ def lqr_balance(theta, alpha, theta_dot, alpha_dot):
     alpha_upright = normalize_angle(alpha - np.pi)
 
     # Regular LQR control
-    u = -(-1.0 * theta + 50.0 * alpha_upright - 1.5 * theta_dot + 8.0 * alpha_dot)
+    u = -(-5.0 * theta + 50.0 * alpha_upright - 1.5 * theta_dot + 8.0 * alpha_dot)
 
     # Add limit avoidance term
     limit_margin = 0.3
@@ -241,16 +217,16 @@ def rk4_step(state, t, dt, control_func):
 @nb.njit(fastmath=True, cache=True)
 def dynamics_step(state, t, vm):
     """Ultra-optimized dynamics calculation with theta limits"""
-    theta, alpha, theta_dot, alpha_dot = state[0], state[1], state[2], state[3]
+    theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
 
     # Check theta limits - implement hard stops
-    if (theta >= THETA_MAX and theta_dot > 0) or (theta <= THETA_MIN and theta_dot < 0):
+    if (theta_m >= THETA_MAX and theta_m_dot > 0) or (theta_m <= THETA_MIN and theta_m_dot < 0):
         theta_m_dot = 0.0  # Stop the arm motion at the limits
 
     # Apply dead zone and calculate motor torque
     apply_voltage_deadzone(vm)
 
-    """# Motor torque calculation
+    # Motor torque calculation
     im = (vm - Km * theta_m_dot) / Rm
     Tm = Km * im
 
@@ -283,45 +259,7 @@ def dynamics_step(state, t, vm):
         theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
         theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
 
-    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])"""
-    # Motor current
-    im = (vm - km * theta_dot) / Rm
-
-    # Motor torque
-    tau = kt * im
-
-    # Inertia matrix elements
-    M11 = Jr + Mp * Lr ** 2
-    M12 = Mp * Lr * Lp / 2 * np.cos(alpha)
-    M21 = M12
-    M22 = Jp
-    det_M = M11 * M22 - M12 * M21
-
-    # Nonlinear terms
-    C = -Mp * Lr * Lp * np.sin(alpha) * alpha_dot ** 2  # For arm
-    G = -Mp * Lp * g * np.sin(alpha)  # Gravity for pendulum
-    F_theta = Br * theta_dot
-    F_alpha = Bp * alpha_dot
-
-    # Solve for accelerations: M * [theta_ddot; alpha_ddot] = [tau - C - F_theta; -G - F_alpha]
-    M = np.array([[M11, M12], [M21, M22]])
-    # Right-hand side with centrifugal term added for pendulum
-    rhs = np.array([
-        tau - C - F_theta,
-        -G - F_alpha - Mp * Lr * Lp * np.sin(alpha) * theta_dot ** 2
-    ])
-    acc = np.linalg.solve(M, rhs)
-
-    # Solve for accelerations
-    if abs(det_M) < 1e-10:  # Handle near-singular matrix
-        theta_ddot = 0
-        alpha_ddot = 0
-    else:
-        theta_ddot = acc[0]
-        alpha_ddot = acc[1]
-
-    return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot])
-
+    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 @nb.njit(fastmath=True, parallel=False, cache=True)
 def custom_integrate(state0, t_span, dt, control_func):
