@@ -61,8 +61,8 @@ class PendulumEnv:
         self.history_length = 10  # Number of actions to keep in history
 
         # Action and observation spaces
-        self.action_space_low = -5.0  # Minimum voltage
-        self.action_space_high = 5.0  # Maximum voltage
+        self.action_space_low = -18.0  # Minimum voltage
+        self.action_space_high = 18.0  # Maximum voltage
         self.observation_space_dim = 6  # [cos(θ), sin(θ), cos(α), sin(α), θ_dot, α_dot]
 
         # Current state

@@ -9,3 +9,4 @@ tensordict
 tqdm
 matplotlib
 lion-pytorch
+numba

@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from time import time
 import numba as nb
+from adodbapi.ado_consts import directions
 
 # System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
@@ -31,9 +32,9 @@ quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
-max_voltage = 12.0  # Maximum motor voltage
-THETA_MIN = -2.9  # Minimum arm angle (radians)
-THETA_MAX = 2.9  # Maximum arm angle (radians)
+max_voltage = 18.0  # Maximum motor voltage
+THETA_MIN = -2.2 # Minimum arm angle (radians)
+THETA_MAX = 2.2  # Maximum arm angle (radians)
 
 
 # -------------------- CUSTOM MATH OPERATIONS --------------------
@@ -52,7 +53,7 @@ def clip_value(value, min_value, max_value):
 def apply_voltage_deadzone(vm):
     """Apply motor voltage dead zone"""
     if -0.2 <= vm <= 0.2:
-        return 0.0
+        vm = 0.0
     return vm
 
 
@@ -75,7 +76,36 @@ def simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot):
     elif theta < THETA_MIN + 0.2 and theta_dot < 0:
         return max_voltage  # If close to lower limit, push back
 
-    if t < 0.5:
+    if alpha == 0:
+        alpha = 0
+    else:
+        side = np.cos(alpha)/abs(np.cos(alpha))
+    if alpha_dot == 0:
+        alpha_dot = 0
+    else:
+        direction = alpha_dot / abs(alpha_dot)
+
+    if side == 1 and direction == 1:
+        v = -max_voltage
+    elif side == 1 and direction == -1:
+        v = max_voltage
+    elif side == -1 and direction == 1:
+        v = max_voltage
+    elif side == -1 and direction == -1:
+        v = -max_voltage
+    else:
+        v = 0
+
+    # Regular arm angle penalty (slightly reduced)
+    theta_penalty = 0.0
+    if abs(theta) > 1.0:
+        theta_penalty = 4.5 * (abs(theta) - 1.0)
+        if theta < 0:
+            theta_penalty = -theta_penalty
+
+    return clip_value(v - theta_penalty, -max_voltage, max_voltage)
+
+    """if t < 0.5:
         return max_voltage
     elif t < 1.0:
         return -max_voltage
@@ -86,15 +116,14 @@ def simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot):
             return max_voltage
         else:
             alpha_norm = normalize_angle(alpha + np.pi)
-            return max_voltage if alpha_norm < 0 else -max_voltage
+            return max_voltage if alpha_norm < 0 else -max_voltage"""
 
 
 @nb.njit(fastmath=True, cache=True)
 def energy_control(t, theta, alpha, theta_dot, alpha_dot):
-    """Ultra-fast energy-based controller"""
     alpha_norm = normalize_angle(alpha + np.pi)
     E = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2
-    E_ref = 2 * Mp_g_Lp
+    E_ref = Mp_g_Lp * 2.2
     E_error = E - E_ref
 
     # Stronger penalty for approaching theta limits
@@ -102,7 +131,7 @@ def energy_control(t, theta, alpha, theta_dot, alpha_dot):
 
     # Regular arm angle penalty
     if abs(theta) > 1.0:
-        theta_penalty = 5.0 * (abs(theta) - 1.0)
+        theta_penalty = 4.5 * (abs(theta) - 1.0)
         if theta < 0:
             theta_penalty = -theta_penalty
 
@@ -127,7 +156,7 @@ def lqr_balance(theta, alpha, theta_dot, alpha_dot):
     alpha_upright = normalize_angle(alpha - np.pi)
 
     # Regular LQR control
-    u = -(-5.0 * theta + 50.0 * alpha_upright - 5.0 * theta_dot + 8.0 * alpha_dot)
+    u = -(-5.0 * theta + 50.0 * alpha_upright - 1.5 * theta_dot + 8.0 * alpha_dot)
 
     # Add limit avoidance term
     limit_margin = 0.3
@@ -154,7 +183,7 @@ def control_decision(t, state):
         control_value = -max_voltage if theta_dot > 0 else max_voltage
         return control_value, EMERGENCY_MODE
 
-    if t < 2.0:
+    if t < 2.0 and not(abs(alpha_norm) < 0.3 and abs(alpha_dot) < 5.0):
         control_value = simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot)
         return control_value, BANGBANG_MODE
 
@@ -396,7 +425,7 @@ def main():
 
     # Plot pendulum angle
     plt.subplot(4, 1, 2)
-    plt.plot(t, alpha_normalized, 'r-')
+    plt.scatter(t, alpha_normalized)
     plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
     plt.ylabel('Pendulum angle (rad)')
     plt.grid(True)
