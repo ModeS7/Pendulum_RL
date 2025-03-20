@@ -227,8 +227,7 @@ def dynamics_step(state, t, vm):
         theta_m_dot = 0.0  # Stop the arm motion at the limits
 
     # Apply dead zone and calculate motor torque
-    if -0.2 <= vm <= 0.2:
-        vm = 0.0
+    apply_voltage_deadzone(vm)
 
     # Motor torque calculation
     im = (vm - Km * theta_m_dot) / Rm
