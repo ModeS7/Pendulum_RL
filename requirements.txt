@@ -10,3 +10,4 @@ tqdm
 matplotlib
 lion-pytorch
 numba
+dataclasses

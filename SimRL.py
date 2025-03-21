@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numba as nb
 from time import time
+from dataclasses import dataclass
+from collections import deque
 
 # Import the necessary constants and functions from your existing code
 # System Parameters (same as in your original code)
@@ -135,16 +137,103 @@ def dynamics_step(state, t, vm):
     return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 
-# Simulation environment for RL
+@dataclass
+class SystemParameters:
+    """Dataclass to store the physical parameters of the system with randomization capabilities"""
+    # Base values
+    Rm: float = 8.94  # Motor resistance (Ohm)
+    Km: float = 0.0431  # Motor back-emf constant
+    Jm: float = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
+    bm: float = 3e-4  # Viscous damping coefficient (Nm/rad/s)
+    DA: float = 3e-4  # Damping coefficient of pendulum arm (Nm/rad/s)
+    DL: float = 5e-4  # Damping coefficient of pendulum link (Nm/rad/s)
+    mA: float = 0.053  # Weight of pendulum arm (kg)
+    mL: float = 0.024  # Weight of pendulum link (kg)
+    LA: float = 0.086  # Length of pendulum arm (m)
+    LL: float = 0.128  # Length of pendulum link (m)
+    JA: float = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
+    JL: float = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
+    g: float = 9.81  # Gravity constant (m/s^2)
+
+    # Derived parameters (will be computed when randomized)
+    half_mL_LL_g: float = 0.0
+    half_mL_LL_LA: float = 0.0
+    quarter_mL_LL_squared: float = 0.0
+    Mp_g_Lp: float = 0.0
+    Jp: float = 0.0
+
+    def randomize(self, randomization_factor=0.1):
+        """
+        Randomize the physical parameters within a given factor range.
+
+        Args:
+            randomization_factor (float): Maximum percentage variation (0.1 = ±10%)
+
+        Returns:
+            SystemParameters: Self with randomized values
+        """
+
+        # Function to randomize a parameter within the given factor
+        def rand_param(value):
+            return value * (1.0 + np.random.uniform(-randomization_factor, randomization_factor))
+
+        # Randomize each parameter
+        self.Rm = rand_param(8.94)
+        self.Km = rand_param(0.0431)
+        self.Jm = rand_param(6e-5)
+        self.bm = rand_param(3e-4)
+        self.DA = rand_param(3e-4)
+        self.DL = rand_param(5e-4)
+        self.mA = rand_param(0.053)
+        self.mL = rand_param(0.024)
+        self.LA = rand_param(0.086)
+        self.LL = rand_param(0.128)
+        self.JA = rand_param(5.72e-5)
+        self.JL = rand_param(1.31e-4)
+
+        # Optional: Randomize gravity slightly (simulates different mounting angles)
+        self.g = rand_param(9.81)
+
+        # Update derived parameters
+        self.update_derived_parameters()
+
+        return self
+
+    def update_derived_parameters(self):
+        """Update the derived parameters based on the current physical parameters"""
+        self.half_mL_LL_g = 0.5 * self.mL * self.LL * self.g
+        self.half_mL_LL_LA = 0.5 * self.mL * self.LL * self.LA
+        self.quarter_mL_LL_squared = 0.25 * self.mL * self.LL ** 2
+        self.Mp_g_Lp = self.mL * self.g * self.LL
+        self.Jp = (1 / 3) * self.mL * self.LL ** 2  # Pendulum moment of inertia
+
+
+# Modify the PendulumEnv class to use randomized parameters
 class PendulumEnv:
-    def __init__(self, dt=0.02, max_steps=750):  # 15 seconds at 50Hz
+    def __init__(self, dt=0.02, max_steps=750, delay_steps=5, randomization_factor=0.1):
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
         self.state = None
 
+        # Delay mechanism
+        self.delay_steps = delay_steps
+        self.observation_buffer = deque(maxlen=delay_steps + 1)
+
+        # System parameters with randomization
+        self.randomization_factor = randomization_factor
+        self.params = SystemParameters()
+
+        # External limits
+        self.max_voltage = 10.0
+        self.THETA_MIN = -2.2
+        self.THETA_MAX = 2.2
+
     def reset(self, random_init=True):
-        # Initialize with small random variations if requested
+        # Randomize system parameters for this episode
+        self.params.randomize(self.randomization_factor)
+
+        # Initialize state with small random variations if requested
         if random_init:
             self.state = np.array([
                 np.random.uniform(-0.1, 0.1),  # theta
@@ -156,36 +245,48 @@ class PendulumEnv:
             self.state = np.array([0.0, 0.1, 0.0, 0.0])  # Default initial state
 
         self.step_count = 0
-        return self._get_observation()
 
-    def _get_observation(self):
-        # Normalize the state for RL
-        theta, alpha, theta_dot, alpha_dot = self.state
+        # Clear and initialize the observation buffer
+        observation = self._get_observation_from_state(self.state)
+        self.observation_buffer.clear()
+        for _ in range(self.delay_steps + 1):
+            self.observation_buffer.append(observation)
 
-        # Normalize angles to [-π, π] for the observation
-        alpha_norm = normalize_angle(alpha + np.pi)  # Normalized relative to upright
+        # Return the delayed observation
+        return self.observation_buffer[0]
 
-        # Create observation vector with sin/cos values for angles to avoid discontinuities
+    def _get_observation_from_state(self, state):
+        # Same as before
+        theta, alpha, theta_dot, alpha_dot = state
+        alpha_norm = normalize_angle(alpha + np.pi)
+
         obs = np.array([
             np.sin(theta), np.cos(theta),
             np.sin(alpha_norm), np.cos(alpha_norm),
-            theta_dot / 10.0,  # Scale velocities to roughly [-1, 1]
+            theta_dot / 10.0,
             alpha_dot / 10.0
         ])
 
         return obs
 
+    def _get_observation(self):
+        return self.observation_buffer[0]
+
     def step(self, action):
         # Convert normalized action [-1, 1] to voltage
-        voltage = float(action) * max_voltage
+        voltage = float(action) * self.max_voltage
 
-        # RK4 integration step
+        # RK4 integration step with randomized parameters
         self.state = self._rk4_step(self.state, voltage)
 
         # Enforce limits
-        self.state = enforce_theta_limits(self.state)
+        self.state = self._enforce_theta_limits(self.state)
 
-        # Get reward
+        # Add current observation to buffer
+        current_obs = self._get_observation_from_state(self.state)
+        self.observation_buffer.append(current_obs)
+
+        # Get reward based on true state
         reward = self._compute_reward()
 
         # Check if done
@@ -194,27 +295,94 @@ class PendulumEnv:
 
         return self._get_observation(), reward, done, {}
 
+    def _enforce_theta_limits(self, state):
+        """Enforce hard limits on theta angle and velocity"""
+        theta, alpha, theta_dot, alpha_dot = state
+
+        # Apply hard limit on theta
+        if theta > self.THETA_MAX:
+            theta = self.THETA_MAX
+            # If hitting upper limit with positive velocity, stop the motion
+            if theta_dot > 0:
+                theta_dot = 0.0
+        elif theta < self.THETA_MIN:
+            theta = self.THETA_MIN
+            # If hitting lower limit with negative velocity, stop the motion
+            if theta_dot < 0:
+                theta_dot = 0.0
+
+        return np.array([theta, alpha, theta_dot, alpha_dot])
+
+    def _dynamics_step(self, state, t, vm):
+        """Ultra-optimized dynamics calculation with theta limits and randomized parameters"""
+        theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
+        p = self.params  # Get the current randomized parameters
+
+        # Check theta limits - implement hard stops
+        if (theta_m >= self.THETA_MAX and theta_m_dot > 0) or (theta_m <= self.THETA_MIN and theta_m_dot < 0):
+            theta_m_dot = 0.0  # Stop the arm motion at the limits
+
+        # Apply dead zone and calculate motor torque
+        if -0.2 <= vm <= 0.2:
+            vm = 0.0
+
+        # Motor torque calculation with randomized params
+        im = (vm - p.Km * theta_m_dot) / p.Rm
+        Tm = p.Km * im
+
+        # Equations of motion coefficients from Eq. (9) in paper
+        # For theta_m equation with randomized parameters:
+        M11 = p.mL * p.LA ** 2 + p.quarter_mL_LL_squared - p.quarter_mL_LL_squared * np.cos(theta_L) ** 2 + p.JA
+        M12 = -p.half_mL_LL_LA * np.cos(theta_L)
+        C1 = 0.5 * p.mL * p.LL ** 2 * np.sin(theta_L) * np.cos(theta_L) * theta_m_dot * theta_L_dot
+        C2 = p.half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
+
+        # For theta_L equation with randomized parameters:
+        M21 = p.half_mL_LL_LA * np.cos(theta_L)
+        M22 = p.JL + p.quarter_mL_LL_squared
+        C3 = -p.quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
+        G = p.half_mL_LL_g * np.sin(theta_L)
+
+        # Calculate determinant for matrix inversion
+        det_M = M11 * M22 - M12 * M21
+
+        # Handle near-singular matrix
+        if abs(det_M) < 1e-10:
+            theta_m_ddot = 0
+            theta_L_ddot = 0
+        else:
+            # Right-hand side of equations
+            RHS1 = Tm - C1 - C2 - p.DA * theta_m_dot
+            RHS2 = -G - p.DL * theta_L_dot - C3
+
+            # Solve for accelerations
+            theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
+            theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
+
+        return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
+
     def _rk4_step(self, state, vm):
         """4th-order Runge-Kutta integrator step"""
         # Apply limits to initial state
-        state = enforce_theta_limits(state)
+        state = self._enforce_theta_limits(state)
 
-        k1 = dynamics_step(state, 0, vm)
-        state_k2 = enforce_theta_limits(state + 0.5 * self.dt * k1)
-        k2 = dynamics_step(state_k2, 0, vm)
+        k1 = self._dynamics_step(state, 0, vm)
+        state_k2 = self._enforce_theta_limits(state + 0.5 * self.dt * k1)
+        k2 = self._dynamics_step(state_k2, 0, vm)
 
-        state_k3 = enforce_theta_limits(state + 0.5 * self.dt * k2)
-        k3 = dynamics_step(state_k3, 0, vm)
+        state_k3 = self._enforce_theta_limits(state + 0.5 * self.dt * k2)
+        k3 = self._dynamics_step(state_k3, 0, vm)
 
-        state_k4 = enforce_theta_limits(state + self.dt * k3)
-        k4 = dynamics_step(state_k4, 0, vm)
+        state_k4 = self._enforce_theta_limits(state + self.dt * k3)
+        k4 = self._dynamics_step(state_k4, 0, vm)
 
         new_state = state + (self.dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        return enforce_theta_limits(new_state)
+        return self._enforce_theta_limits(new_state)
 
     def _compute_reward(self):
         theta, alpha, theta_dot, alpha_dot = self.state
         alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
+        p = self.params
 
         # Component 1: Reward for pendulum being close to upright
         upright_reward = np.cos(alpha_norm)  # 1 when upright, -1 when downward
@@ -232,12 +400,12 @@ class PendulumEnv:
 
         # Component 5: Penalty for hitting limits
         limit_penalty = 0.0
-        if abs(theta - THETA_MAX) < 0.01 or abs(theta - THETA_MIN) < 0.01:
+        if abs(theta - self.THETA_MAX) < 0.01 or abs(theta - self.THETA_MIN) < 0.01:
             limit_penalty = -10.0
 
         # Component 6: Energy management reward
-        E = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2  # Current energy
-        E_ref = Mp_g_Lp  # Energy at upright position (target energy)
+        E = p.Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * p.Jp * alpha_dot ** 2  # Current energy
+        E_ref = p.Mp_g_Lp  # Energy at upright position (target energy)
         E_diff = abs(E - E_ref)  # Difference from optimal energy
         # Reward for being close to the optimal energy (inverted Gaussian)
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
@@ -483,19 +651,20 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def train():
-    print("Starting SAC training for inverted pendulum control...")
+# Modify the train function to use the randomized environment
+def train(randomization_factor=0.1, delay_steps=5):
+    print(f"Starting SAC training with domain randomization (factor: {randomization_factor}) and input delay ({delay_steps} steps)...")
 
-    # Environment setup
-    env = PendulumEnv()
+    # Environment setup with randomization
+    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
 
     # Hyperparameters
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
-    max_episodes = 1000
+    max_episodes = 1500  # Increase episodes for more robust learning with randomization
     max_steps = 750
-    batch_size = 256
-    replay_buffer_size = 100000
+    batch_size = 256*32
+    replay_buffer_size = 200000  # Larger buffer for more diverse experiences
     updates_per_step = 1
 
     # Initialize agent
@@ -508,15 +677,11 @@ def train():
     episode_rewards = []
     avg_rewards = []
 
-    # For visualization - store episode data
-    states_history = []
-    actions_history = []
-
     # Training loop
     start_time = time()
 
     for episode in range(max_episodes):
-        state = env.reset()
+        state = env.reset()  # This will randomize parameters for each episode
         episode_reward = 0
 
         # If we're going to plot this episode, prepare to collect state data
@@ -524,6 +689,16 @@ def train():
         if plot_this_episode:
             episode_states = []
             episode_actions = []
+            # Store the randomized parameters for this episode
+            episode_params = {
+                'Rm': env.params.Rm,
+                'Km': env.params.Km,
+                'mA': env.params.mA,
+                'mL': env.params.mL,
+                'LA': env.params.LA,
+                'LL': env.params.LL,
+                'g': env.params.g,
+            }
 
         for step in range(max_steps):
             action = agent.select_action(state)
@@ -558,10 +733,10 @@ def train():
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
-                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward)
+                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward, episode_params)
 
         # Early stopping if well trained
-        if avg_reward > 5000 and episode > 100:
+        if avg_reward > 5000 and episode > 200:  # Higher threshold for robust policy
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
@@ -569,8 +744,8 @@ def train():
     print(f"Training completed in {training_time:.2f} seconds!")
 
     # Save trained model
-    torch.save(agent.actor.state_dict(), "sac_pendulum_actor.pth")
-    torch.save(agent.critic.state_dict(), "sac_pendulum_critic.pth")
+    torch.save(agent.actor.state_dict(), f"sac_pendulum_actor_random{int(randomization_factor*100)}_delay{delay_steps}.pth")
+    torch.save(agent.critic.state_dict(), f"sac_pendulum_critic_random{int(randomization_factor*100)}_delay{delay_steps}.pth")
 
     # Plot training progress
     plt.figure(figsize=(10, 5))
@@ -578,17 +753,18 @@ def train():
     plt.plot(avg_rewards, label='100-Episode Moving Average')
     plt.xlabel('Episodes')
     plt.ylabel('Reward')
-    plt.title('SAC Training for Inverted Pendulum')
+    plt.title(f'SAC Training with Domain Randomization ({randomization_factor*100}% variation) and {delay_steps*env.dt*1000}ms delay')
     plt.legend()
     plt.grid(True)
-    plt.savefig("sac_training_progress.png")
+    plt.savefig(f"sac_training_random{int(randomization_factor*100)}_delay{delay_steps}.png")
     plt.show()
 
     return agent
 
 
-def plot_training_episode(episode, states_history, actions_history, dt, episode_reward):
-    """Plot the pendulum state evolution for a training episode"""
+# Update plot_training_episode to show randomized parameters
+def plot_training_episode(episode, states_history, actions_history, dt, episode_reward, params=None):
+    """Plot the pendulum state evolution for a training episode with randomized parameters"""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
     actions_history = np.array(actions_history)
@@ -618,15 +794,23 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
             num_upright_points += 1
 
     # Plot results
-    plt.figure(figsize=(12, 9))
+    plt.figure(figsize=(12, 10))  # Make it a bit taller for parameter display
 
     # Plot arm angle
     plt.subplot(3, 1, 1)
     plt.plot(t, thetas, 'b-')
-    plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
-    plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
+    plt.axhline(y=2.2, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
+    plt.axhline(y=-2.2, color='r', linestyle='--', alpha=0.7)
     plt.ylabel('Arm angle (rad)')
-    plt.title(f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+
+    # Add randomized parameters to title if provided
+    if params:
+        param_text = f"Randomized: Rm={params['Rm']:.2f}, Km={params['Km']:.4f}, mL={params['mL']:.4f}, LL={params['LL']:.4f}"
+        plt.title(
+            f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{param_text}')
+    else:
+        plt.title(f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+
     plt.legend()
     plt.grid(True)
 
@@ -641,137 +825,139 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
 
     # Plot control actions
     plt.subplot(3, 1, 3)
-    plt.plot(t, actions_history * max_voltage, 'r-')  # Scale back to actual voltage
+    plt.plot(t, actions_history * 10.0, 'r-')  # Scale back to actual voltage
     plt.xlabel('Time (s)')
     plt.ylabel('Control voltage (V)')
-    plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
+    plt.ylim([-11, 11])
     plt.grid(True)
 
     plt.tight_layout()
-    plt.savefig(f"training_episode_{episode}.png")
-    #plt.close()  # Close the figure to avoid memory issues
+
+    # Include randomization info in filename if available
+    if params:
+        plt.savefig(f"training_episode_{episode}_random.png")
+    else:
+        plt.savefig(f"training_episode_{episode}.png")
 
 
-def evaluate(agent, num_episodes=5, render=True):
-    """Evaluate the trained agent's performance"""
-    env = PendulumEnv()
+# Function to evaluate across a range of randomized environments
+def evaluate_robustness(agent, num_episodes=10, randomization_levels=[0.0, 0.05, 0.1, 0.2], delay_steps=5):
+    """Evaluate the trained agent's performance across different randomization levels"""
+    results = {}
 
-    for episode in range(num_episodes):
-        state = env.reset(random_init=False)  # Start from standard position
-        total_reward = 0
+    for rand_level in randomization_levels:
+        print(f"\nEvaluating with {rand_level * 100}% parameter randomization...")
+        env = PendulumEnv(randomization_factor=rand_level, delay_steps=delay_steps)
 
-        # Store episode data for plotting
-        states_history = []
-        actions_history = []
+        episode_rewards = []
+        balanced_times = []
 
-        for step in range(env.max_steps):
-            # Select action
-            action = agent.select_action(state, evaluate=True)
+        for episode in range(num_episodes):
+            state = env.reset(random_init=True)  # Random init to test robustness
+            total_reward = 0
+            balanced_time = 0
 
-            # Step environment
-            next_state, reward, done, _ = env.step(action)
+            states_history = []
 
-            # Store data
-            states_history.append(env.state.copy())  # Store raw state
-            actions_history.append(action)
+            for step in range(env.max_steps):
+                action = agent.select_action(state, evaluate=True)
+                next_state, reward, done, _ = env.step(action)
 
-            total_reward += reward
-            state = next_state
+                # Track balancing performance
+                states_history.append(env.state.copy())
 
-            if done:
-                break
-
-        print(f"Episode {episode + 1}: Total Reward = {total_reward:.2f}")
-
-        if render:
-            # Convert history to numpy arrays
-            states_history = np.array(states_history)
-            actions_history = np.array(actions_history)
-
-            # Extract components
-            thetas = states_history[:, 0]
-            alphas = states_history[:, 1]
-            theta_dots = states_history[:, 2]
-            alpha_dots = states_history[:, 3]
-
-            # Normalize alpha for visualization
-            alpha_normalized = np.zeros(len(alphas))
-            for i in range(len(alphas)):
-                alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
-
-            # Generate time array
-            t = np.arange(len(states_history)) * env.dt
-
-            # Count performance metrics
-            balanced_time = 0.0
-            num_upright_points = 0
-
-            for i in range(len(alpha_normalized)):
-                # Check if pendulum is close to upright
-                if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
+                # Count balanced frames
+                alpha_norm = normalize_angle(env.state[1] + np.pi)
+                if abs(alpha_norm) < 0.17:  # ~10 degrees
                     balanced_time += env.dt
-                    num_upright_points += 1
 
-            # Plot results
-            plt.figure(figsize=(14, 12))
+                total_reward += reward
+                state = next_state
 
-            # Plot arm angle
-            plt.subplot(4, 1, 1)
-            plt.plot(t, thetas, 'b-')
-            plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
-            plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
-            plt.ylabel('Arm angle (rad)')
-            plt.title(f'SAC Inverted Pendulum Control - Episode {episode + 1}')
-            plt.legend()
-            plt.grid(True)
+                if done:
+                    break
 
-            # Plot pendulum angle
-            plt.subplot(4, 1, 2)
-            plt.plot(t, alpha_normalized, 'g-')
-            plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
-            plt.ylabel('Pendulum angle (rad)')
-            plt.grid(True)
+            episode_rewards.append(total_reward)
+            balanced_times.append(balanced_time)
 
-            # Plot motor voltage (actions)
-            plt.subplot(4, 1, 3)
-            plt.plot(t, actions_history * max_voltage, 'r-')  # Scale back to actual voltage
-            plt.ylabel('Control voltage (V)')
-            plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
-            plt.grid(True)
+            print(f"  Episode {episode + 1}: Reward = {total_reward:.2f}, Balanced = {balanced_time:.2f}s")
 
-            # Plot angular velocities
-            plt.subplot(4, 1, 4)
-            plt.plot(t, theta_dots, 'b-', label='Arm velocity')
-            plt.plot(t, alpha_dots, 'g-', label='Pendulum velocity')
-            plt.xlabel('Time (s)')
-            plt.ylabel('Angular velocity (rad/s)')
-            plt.legend()
-            plt.grid(True)
+            # Plot the last episode for each randomization level
+            if episode == num_episodes - 1:
+                states_history = np.array(states_history)
+                alphas = states_history[:, 1]
+                alpha_normalized = np.zeros(len(alphas))
+                for i in range(len(alphas)):
+                    alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
 
-            plt.tight_layout()
-            plt.savefig(f"sac_evaluation_episode_{episode + 1}.png")
-            plt.show()
+                plt.figure(figsize=(10, 6))
+                t = np.arange(len(states_history)) * env.dt
+                plt.plot(t, alpha_normalized, label=f'{rand_level * 100}% randomization')
+                plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+                plt.axhline(y=0.17, color='r', linestyle=':', alpha=0.3)
+                plt.axhline(y=-0.17, color='r', linestyle=':', alpha=0.3)
+                plt.title(f'Pendulum Angle with {rand_level * 100}% Parameter Randomization')
+                plt.xlabel('Time (s)')
+                plt.ylabel('Pendulum angle (rad)')
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(f"robustness_test_{int(rand_level * 100)}pct.png")
+                plt.close()
 
-            print(f"Time spent balanced: {balanced_time:.2f} seconds")
-            print(f"Data points with pendulum upright: {num_upright_points}")
-            print(f"Max arm angle: {np.max(np.abs(thetas)):.2f} rad")
-            print(f"Max pendulum angular velocity: {np.max(np.abs(alpha_dots)):.2f} rad/s")
-            final_angle_deg = abs(alpha_normalized[-1]) * 180 / np.pi
-            print(
-                f"Final pendulum angle from vertical: {abs(alpha_normalized[-1]):.2f} rad ({final_angle_deg:.1f} degrees)")
-            print("-" * 50)
+        # Store results
+        results[rand_level] = {
+            'mean_reward': np.mean(episode_rewards),
+            'std_reward': np.std(episode_rewards),
+            'mean_balanced_time': np.mean(balanced_times),
+            'std_balanced_time': np.std(balanced_times)
+        }
+
+    # Plot summary of robustness results
+    plt.figure(figsize=(12, 6))
+
+    # Convert randomization levels to percentages for plotting
+    x_labels = [f"{r * 100}%" for r in randomization_levels]
+
+    # Plot rewards
+    plt.subplot(1, 2, 1)
+    means = [results[r]['mean_reward'] for r in randomization_levels]
+    stds = [results[r]['std_reward'] for r in randomization_levels]
+    plt.bar(x_labels, means, yerr=stds, capsize=10)
+    plt.title('Reward vs. Parameter Randomization')
+    plt.xlabel('Randomization Level')
+    plt.ylabel('Average Reward')
+    plt.grid(True, alpha=0.3)
+
+    # Plot balanced times
+    plt.subplot(1, 2, 2)
+    means = [results[r]['mean_balanced_time'] for r in randomization_levels]
+    stds = [results[r]['std_balanced_time'] for r in randomization_levels]
+    plt.bar(x_labels, means, yerr=stds, capsize=10)
+    plt.title('Balancing Time vs. Parameter Randomization')
+    plt.xlabel('Randomization Level')
+    plt.ylabel('Average Time Balanced (s)')
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("robustness_summary.png")
+    plt.show()
+
+    return results
 
 
 if __name__ == "__main__":
     print("TorchRL Inverted Pendulum Training and Evaluation")
     print("=" * 50)
 
-    # Train agent
-    agent = train()
+    # Train with 10% parameter randomization and 5-step input delay
+    agent = train(randomization_factor=0.1, delay_steps=5)
 
-    # Evaluate trained agent
+    # Evaluate robustness across different randomization levels
     print("\nEvaluating trained agent...")
-    evaluate(agent, num_episodes=3)
+    results = evaluate_robustness(agent,
+                                  randomization_levels=[0.0, 0.05, 0.1, 0.15, 0.2],
+                                  delay_steps=5)
+
 
     print("=" * 50)
     print("PROGRAM EXECUTION COMPLETE")
