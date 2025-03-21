@@ -663,7 +663,7 @@ def train(randomization_factor=0.1, delay_steps=5):
     action_dim = 1  # Motor voltage (normalized)
     max_episodes = 1500  # Increase episodes for more robust learning with randomization
     max_steps = 750
-    batch_size = 256*32
+    batch_size = 256 * 32
     replay_buffer_size = 200000  # Larger buffer for more diverse experiences
     updates_per_step = 1
 
@@ -945,19 +945,513 @@ def evaluate_robustness(agent, num_episodes=10, randomization_levels=[0.0, 0.05,
     return results
 
 
+def load_model(actor_path, critic_path=None, state_dim=6, action_dim=1, hidden_dim=256):
+    """
+    Load a pre-trained SAC model from saved state dictionaries.
+
+    Args:
+        actor_path (str): Path to the saved actor model state dict
+        critic_path (str, optional): Path to the saved critic model state dict
+        state_dim (int): Dimension of the state space
+        action_dim (int): Dimension of the action space
+        hidden_dim (int): Hidden dimension size of the networks
+
+    Returns:
+        SACAgent: Loaded agent with the pre-trained weights
+    """
+    print(f"Loading pre-trained model from {actor_path}")
+
+    # Initialize a new agent
+    agent = SACAgent(state_dim, action_dim, hidden_dim)
+
+    # Load actor state dict
+    agent.actor.load_state_dict(torch.load(actor_path))
+    agent.actor.eval()  # Set to evaluation mode
+
+    # Load critic if provided
+    if critic_path:
+        agent.critic.load_state_dict(torch.load(critic_path))
+        agent.critic.eval()
+
+        # Copy critic weights to target critic
+        for target_param, param in zip(agent.critic_target.parameters(), agent.critic.parameters()):
+            target_param.data.copy_(param.data)
+
+    print("Model loaded successfully!")
+    return agent
+
+
+def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5, num_episodes=5):
+    """
+    Run a loaded model in the pendulum environment and evaluate its performance.
+    Simplified version without animations, focusing only on plots.
+
+    Args:
+        model_path (str): Path to the saved actor model
+        randomization_factor (float): Amount of parameter randomization
+        delay_steps (int): Number of timesteps to delay observations
+        num_episodes (int): Number of episodes to run
+
+    Returns:
+        dict: Performance statistics
+    """
+    # Create environment with specified parameters
+    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
+
+    # Load the agent
+    agent = load_model(model_path)
+
+    # Performance metrics
+    performance = {
+        'rewards': [],
+        'balanced_times': [],
+        'params_used': []
+    }
+
+    # Run episodes
+    for episode in range(num_episodes):
+        # Reset environment (which randomizes parameters)
+        state = env.reset(random_init=True)
+        total_reward = 0
+
+        # Store episode data
+        states_history = []
+        actions_history = []
+
+        # Remember parameters for this episode
+        performance['params_used'].append({
+            'Rm': env.params.Rm,
+            'Km': env.params.Km,
+            'mA': env.params.mA,
+            'mL': env.params.mL,
+            'LA': env.params.LA,
+            'LL': env.params.LL,
+            'g': env.params.g
+        })
+
+        for step in range(env.max_steps):
+            # Get action from model
+            action = agent.select_action(state, evaluate=True)
+
+            # Cast to float explicitly to avoid the deprecation warning
+            if isinstance(action, np.ndarray):
+                action_value = float(action.item())
+            else:
+                action_value = float(action)
+
+            # Take step in environment
+            next_state, reward, done, _ = env.step(action_value)
+
+            # Record data
+            states_history.append(env.state.copy())
+            actions_history.append(action_value)
+
+            # Update metrics
+            total_reward += reward
+            state = next_state
+
+            if done:
+                break
+
+        # Calculate balancing performance
+        balanced_time = 0
+        for state in states_history:
+            alpha_norm = normalize_angle(state[1] + np.pi)
+            if abs(alpha_norm) < 0.17:  # ~10 degrees from vertical
+                balanced_time += env.dt
+
+        # Store performance metrics
+        performance['rewards'].append(total_reward)
+        performance['balanced_times'].append(balanced_time)
+
+        # Print results
+        print(f"Episode {episode + 1}: Reward = {total_reward:.2f}, Balanced = {balanced_time:.2f}s")
+
+        # Plot the episode
+        states_array = np.array(states_history)
+        actions_array = np.array(actions_history)
+
+        # Create visualization
+        plot_episode(episode, states_array, actions_array, env.dt,
+                     total_reward, balanced_time, env.params,
+                     prefix="model_run", randomized=True)
+
+    # Plot summary statistics
+    if num_episodes > 1:
+        plt.figure(figsize=(12, 5))
+
+        plt.subplot(1, 2, 1)
+        plt.bar(range(1, num_episodes + 1), performance['rewards'])
+        plt.axhline(y=np.mean(performance['rewards']), color='r', linestyle='--',
+                    label=f'Mean: {np.mean(performance["rewards"]):.2f}')
+        plt.xlabel('Episode')
+        plt.ylabel('Total Reward')
+        plt.title('Reward per Episode')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.bar(range(1, num_episodes + 1), performance['balanced_times'])
+        plt.axhline(y=np.mean(performance['balanced_times']), color='r', linestyle='--',
+                    label=f'Mean: {np.mean(performance["balanced_times"]):.2f}s')
+        plt.xlabel('Episode')
+        plt.ylabel('Time Balanced (s)')
+        plt.title('Balancing Performance')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig("model_performance_summary.png")
+        plt.show()
+
+    return performance
+
+
+def plot_episode(episode, states_history, actions_history, dt, episode_reward,
+                 balanced_time, params=None, prefix="episode", randomized=False):
+    """
+    Plot the pendulum state evolution for an episode
+
+    Args:
+        episode (int): Episode number
+        states_history (numpy.ndarray): Array of state histories
+        actions_history (numpy.ndarray): Array of actions
+        dt (float): Timestep size
+        episode_reward (float): Total episode reward
+        balanced_time (float): Time spent balanced
+        params (SystemParameters, optional): Randomized parameters if available
+        prefix (str): Prefix for the saved file
+        randomized (bool): Whether parameters are randomized
+    """
+    # Extract components
+    thetas = states_history[:, 0]
+    alphas = states_history[:, 1]
+    theta_dots = states_history[:, 2]
+    alpha_dots = states_history[:, 3]
+
+    # Normalize alpha for visualization
+    alpha_normalized = np.zeros(len(alphas))
+    for i in range(len(alphas)):
+        alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
+
+    # Generate time array
+    t = np.arange(len(states_history)) * dt
+
+    # Plot results
+    plt.figure(figsize=(12, 10))
+
+    # Plot arm angle
+    plt.subplot(4, 1, 1)
+    plt.plot(t, thetas, 'b-')
+    plt.axhline(y=2.2, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
+    plt.axhline(y=-2.2, color='r', linestyle='--', alpha=0.7)
+    plt.ylabel('Arm angle (rad)')
+
+    # Add randomized parameters to title if provided
+    if randomized and params:
+        param_text = f"Randomized: Rm={params.Rm:.2f}, Km={params.Km:.4f}, mL={params.mL:.4f}, LL={params.LL:.4f}, g={params.g:.2f}"
+        plt.title(
+            f'{prefix.capitalize()} {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{param_text}')
+    else:
+        plt.title(
+            f'{prefix.capitalize()} {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+
+    plt.legend()
+    plt.grid(True)
+
+    # Plot pendulum angle
+    plt.subplot(4, 1, 2)
+    plt.plot(t, alpha_normalized, 'g-')
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
+    plt.axhline(y=0.17, color='r', linestyle=':', alpha=0.5)  # Upper balanced threshold
+    plt.axhline(y=-0.17, color='r', linestyle=':', alpha=0.5)  # Lower balanced threshold
+    plt.ylabel('Pendulum angle (rad)')
+    plt.grid(True)
+
+    # Plot pendulum angular velocity
+    plt.subplot(4, 1, 3)
+    plt.plot(t, alpha_dots, 'g-')
+    plt.ylabel('Pendulum velocity (rad/s)')
+    plt.grid(True)
+
+    # Plot control actions
+    plt.subplot(4, 1, 4)
+    plt.plot(t, actions_history * 10.0, 'r-')  # Scale back to actual voltage
+    plt.xlabel('Time (s)')
+    plt.ylabel('Control voltage (V)')
+    plt.ylim([-11, 11])
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"{prefix}_{episode + 1}.png")
+    plt.close()
+
+
+def continue_training(actor_path, critic_path=None, randomization_factor=0.1, delay_steps=5,
+                      additional_episodes=500, lr=1e-4):
+    """
+    Continue training a pre-trained SAC model.
+
+    Args:
+        actor_path (str): Path to the saved actor model state dict
+        critic_path (str, optional): Path to the saved critic model state dict
+        randomization_factor (float): Amount of parameter randomization
+        delay_steps (int): Number of timesteps to delay observations
+        additional_episodes (int): Number of additional episodes to train
+        lr (float): Learning rate for continued training (often lower than initial training)
+
+    Returns:
+        SACAgent: The further trained agent
+    """
+    print(f"Continuing training from model: {actor_path}")
+    print(
+        f"Training parameters: randomization={randomization_factor}, delay={delay_steps}, episodes={additional_episodes}")
+
+    # Environment setup with randomization
+    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
+
+    # Hyperparameters
+    state_dim = 6  # Our observation space
+    action_dim = 1  # Motor voltage (normalized)
+    max_steps = 750
+    batch_size = 256 * 32
+    replay_buffer_size = 200000  # Larger buffer for diverse experiences
+    updates_per_step = 1
+
+    # Load the pre-trained agent (with a potentially lower learning rate for fine-tuning)
+    agent = load_model(actor_path, critic_path, state_dim, action_dim)
+
+    # Optionally reduce learning rate for fine-tuning
+    for param_group in agent.actor_optimizer.param_groups:
+        param_group['lr'] = lr
+    for param_group in agent.critic_optimizer.param_groups:
+        param_group['lr'] = lr
+    if agent.automatic_entropy_tuning:
+        for param_group in agent.alpha_optimizer.param_groups:
+            param_group['lr'] = lr
+
+    # Initialize replay buffer
+    replay_buffer = ReplayBuffer(replay_buffer_size)
+
+    # Pre-fill buffer with some experiences to start learning immediately
+    print("Pre-filling replay buffer with initial experiences...")
+    while len(replay_buffer) < batch_size:
+        state = env.reset()
+        for step in range(100):  # Collect some steps
+            action = agent.select_action(state)
+
+            # Cast to float explicitly
+            if isinstance(action, np.ndarray):
+                action_value = float(action.item())
+            else:
+                action_value = float(action)
+
+            next_state, reward, done, _ = env.step(action_value)
+            replay_buffer.push(state, action, reward, next_state, done)
+            state = next_state
+            if done:
+                break
+
+    # Metrics
+    episode_rewards = []
+    avg_rewards = []
+    start_time = time()
+
+    # Training loop
+    for episode in range(additional_episodes):
+        state = env.reset()  # Randomize parameters for this episode
+        episode_reward = 0
+
+        # If we're going to plot this episode, prepare to collect state data
+        plot_this_episode = (episode + 1) % 10 == 0
+        if plot_this_episode:
+            episode_states = []
+            episode_actions = []
+            episode_params = {
+                'Rm': env.params.Rm,
+                'Km': env.params.Km,
+                'mA': env.params.mA,
+                'mL': env.params.mL,
+                'LA': env.params.LA,
+                'LL': env.params.LL,
+                'g': env.params.g,
+            }
+
+        for step in range(max_steps):
+            action = agent.select_action(state)
+
+            # Cast to float explicitly
+            if isinstance(action, np.ndarray):
+                action_value = float(action.item())
+            else:
+                action_value = float(action)
+
+            next_state, reward, done, _ = env.step(action_value)
+
+            # Store transition in replay buffer
+            replay_buffer.push(state, action, reward, next_state, done)
+
+            # If plotting, store the state and action
+            if plot_this_episode:
+                episode_states.append(env.state.copy())
+                episode_actions.append(action_value)
+
+            state = next_state
+            episode_reward += reward
+
+            # Update parameters - note we have enough samples from pre-filling
+            for _ in range(updates_per_step):
+                agent.update_parameters(replay_buffer, batch_size)
+
+            if done:
+                break
+
+        # Log progress
+        episode_rewards.append(episode_reward)
+        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_rewards.append(avg_reward)
+
+        if (episode + 1) % 10 == 0:
+            print(f"Episode {episode + 1}/{additional_episodes} | Reward: {episode_reward:.2f} | Avg: {avg_reward:.2f}")
+
+            # Plot simulation for visual progress tracking
+            if plot_this_episode:
+                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward, episode_params)
+
+        # Early stopping if well trained
+        if avg_reward > 6000 and len(episode_rewards) >= 100:
+            print(f"Environment solved with excellent performance after {episode + 1} episodes!")
+            break
+
+    training_time = time() - start_time
+    print(f"Additional training completed in {training_time:.2f} seconds!")
+
+    # Save continued training model with timestamp
+    timestamp = int(time())
+    torch.save(agent.actor.state_dict(), f"continued_sac_actor_{timestamp}.pth")
+    torch.save(agent.critic.state_dict(), f"continued_sac_critic_{timestamp}.pth")
+
+    # Plot training progress
+    plt.figure(figsize=(10, 5))
+    plt.plot(episode_rewards, label='Episode Reward')
+    plt.plot(avg_rewards, label='Moving Average')
+    plt.xlabel('Episodes')
+    plt.ylabel('Reward')
+    plt.title(f'Continued SAC Training Results')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"continued_training_{timestamp}.png")
+    plt.show()
+
+    return agent
+
+
+# Update the main function to properly handle command line arguments
 if __name__ == "__main__":
     print("TorchRL Inverted Pendulum Training and Evaluation")
     print("=" * 50)
 
-    # Train with 10% parameter randomization and 5-step input delay
-    agent = train(randomization_factor=0.1, delay_steps=5)
+    # Check for command line arguments to determine mode
+    import sys
+    import argparse
 
-    # Evaluate robustness across different randomization levels
-    print("\nEvaluating trained agent...")
-    results = evaluate_robustness(agent,
-                                  randomization_levels=[0.0, 0.05, 0.1, 0.15, 0.2],
-                                  delay_steps=5)
+    # Create an argument parser for better command-line handling
+    parser = argparse.ArgumentParser(description='Pendulum RL Training and Evaluation')
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
+    # Train from scratch
+    train_parser = subparsers.add_parser('train', help='Train a new model from scratch')
+    train_parser.add_argument('--random', type=float, default=0.1, help='Randomization factor (0.0-1.0)')
+    train_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+
+    # Load and evaluate a model
+    load_parser = subparsers.add_parser('load', help='Load and evaluate a pre-trained model')
+    load_parser.add_argument('model_path', help='Path to the saved model file')
+    load_parser.add_argument('--random', type=float, default=0.1, help='Randomization factor for evaluation')
+    load_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+    load_parser.add_argument('--episodes', type=int, default=3, help='Number of episodes to evaluate')
+
+    # Continue training a model
+    continue_parser = subparsers.add_parser('continue', help='Continue training a pre-trained model')
+    continue_parser.add_argument('model_path', help='Path to the saved actor model file')
+    continue_parser.add_argument('--critic', help='Optional path to the saved critic model file')
+    continue_parser.add_argument('--random', type=float, default=0.15, help='Randomization factor for training')
+    continue_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+    continue_parser.add_argument('--episodes', type=int, default=500, help='Number of additional episodes to train')
+    continue_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for continued training')
+    continue_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
+
+    # Support for legacy command-line format
+    if len(sys.argv) > 1 and sys.argv[1].startswith('--'):
+        # Handle the old format (--load, --continue)
+        if sys.argv[1] == '--load':
+            sys.argv[1] = 'load'
+            if len(sys.argv) > 2 and not sys.argv[2].startswith('--'):
+                # Ensure the model_path is properly positioned
+                model_path = sys.argv[2]
+                sys.argv.pop(2)
+                sys.argv.insert(2, model_path)
+        elif sys.argv[1] == '--continue':
+            sys.argv[1] = 'continue'
+            if len(sys.argv) > 2 and not sys.argv[2].startswith('--'):
+                # Ensure the model_path is properly positioned
+                model_path = sys.argv[2]
+                sys.argv.pop(2)
+                sys.argv.insert(2, model_path)
+
+    # Parse arguments
+    args = parser.parse_args()
+
+    # Default to train if no command specified
+    if not args.command:
+        args.command = 'train'
+        args.random = 0.1
+        args.delay = 5
+
+    # Execute the appropriate command
+    if args.command == 'train':
+        print(f"\nTraining new model from scratch...")
+        print(f"Parameters: randomization={args.random}, delay={args.delay}")
+        agent = train(randomization_factor=args.random, delay_steps=args.delay)
+
+        # Evaluate trained agent
+        print("\nEvaluating trained agent...")
+        evaluate_robustness(agent, num_episodes=2,
+                            randomization_levels=[0.0, args.random, args.random * 2],
+                            delay_steps=args.delay)
+
+    elif args.command == 'load':
+        print(f"\nRunning pre-trained model from {args.model_path}...")
+        performance = run_loaded_model(
+            args.model_path,
+            randomization_factor=args.random,
+            delay_steps=args.delay,
+            num_episodes=args.episodes
+        )
+
+        # Print performance statistics
+        avg_reward = np.mean(performance['rewards'])
+        avg_balanced = np.mean(performance['balanced_times'])
+        print(f"Average reward: {avg_reward:.2f}")
+        print(f"Average balancing time: {avg_balanced:.2f}s")
+
+    elif args.command == 'continue':
+        print(f"\nContinuing training from model: {args.model_path}")
+        agent = continue_training(
+            args.model_path,
+            args.critic,
+            randomization_factor=args.random,
+            delay_steps=args.delay,
+            additional_episodes=args.episodes,
+            lr=args.lr
+        )
+
+        # Optionally evaluate the improved agent
+        if args.eval:
+            print("\nEvaluating improved agent...")
+            evaluate_robustness(agent, num_episodes=2,
+                                randomization_levels=[0.0, args.random, args.random * 2],
+                                delay_steps=args.delay)
 
     print("=" * 50)
     print("PROGRAM EXECUTION COMPLETE")
