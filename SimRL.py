@@ -210,7 +210,7 @@ class SystemParameters:
 
 # Modify the PendulumEnv class to use randomized parameters
 class PendulumEnv:
-    def __init__(self, dt=0.01, max_steps=1000, delay_steps=5, delay_range=None, randomization_factor=0.1):
+    def __init__(self, dt=0.0115, max_steps=1000, delay_steps=5, delay_range=None, randomization_factor=0.1):
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
