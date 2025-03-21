@@ -210,15 +210,26 @@ class SystemParameters:
 
 # Modify the PendulumEnv class to use randomized parameters
 class PendulumEnv:
-    def __init__(self, dt=0.02, max_steps=750, delay_steps=5, randomization_factor=0.1):
+    def __init__(self, dt=0.02, max_steps=750, delay_steps=5, delay_range=None, randomization_factor=0.1):
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
         self.state = None
 
-        # Delay mechanism
+        # Delay mechanism with variable delay support
+        self.min_delay = delay_steps
+        self.max_delay = delay_steps
+
+        # If delay_range is provided, use it to set min and max delay
+        if delay_range is not None:
+            if isinstance(delay_range, (list, tuple)) and len(delay_range) == 2:
+                self.min_delay = max(0, delay_range[0])  # Ensure non-negative
+                self.max_delay = max(self.min_delay, delay_range[1])  # Ensure max >= min
+
+        # Current episode's delay will be set during reset
         self.delay_steps = delay_steps
-        self.observation_buffer = deque(maxlen=delay_steps + 1)
+        self.max_buffer_size = self.max_delay + 1  # Buffer size based on maximum possible delay
+        self.observation_buffer = deque(maxlen=self.max_buffer_size)
 
         # System parameters with randomization
         self.randomization_factor = randomization_factor
@@ -229,9 +240,21 @@ class PendulumEnv:
         self.THETA_MIN = -2.2
         self.THETA_MAX = 2.2
 
+        # For tracking the current episode's delay
+        self.current_delay = self.delay_steps
+
     def reset(self, random_init=True):
         # Randomize system parameters for this episode
         self.params.randomize(self.randomization_factor)
+
+        # Randomize the delay if using variable delay
+        if self.min_delay != self.max_delay:
+            self.current_delay = np.random.randint(self.min_delay, self.max_delay + 1)
+        else:
+            self.current_delay = self.delay_steps
+
+        # Debug info about current delay
+        # print(f"Episode using delay of {self.current_delay} steps")
 
         # Initialize state with small random variations if requested
         if random_init:
@@ -249,11 +272,11 @@ class PendulumEnv:
         # Clear and initialize the observation buffer
         observation = self._get_observation_from_state(self.state)
         self.observation_buffer.clear()
-        for _ in range(self.delay_steps + 1):
+        for _ in range(self.max_buffer_size):
             self.observation_buffer.append(observation)
 
         # Return the delayed observation
-        return self.observation_buffer[0]
+        return self._get_observation()
 
     def _get_observation_from_state(self, state):
         # Same as before
@@ -270,7 +293,10 @@ class PendulumEnv:
         return obs
 
     def _get_observation(self):
-        return self.observation_buffer[0]
+        # Return observation with the current episode's delay
+        if len(self.observation_buffer) <= self.current_delay:
+            return self.observation_buffer[0]  # Fallback if buffer isn't filled yet
+        return self.observation_buffer[-(self.current_delay + 1)]  # Get appropriately delayed observation
 
     def step(self, action):
         # Convert normalized action [-1, 1] to voltage
@@ -651,12 +677,32 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# Modify the train function to use the randomized environment
-def train(randomization_factor=0.1, delay_steps=5):
-    print(f"Starting SAC training with domain randomization (factor: {randomization_factor}) and input delay ({delay_steps} steps)...")
 
-    # Environment setup with randomization
-    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
+def train(randomization_factor=0.1, delay_steps=5, delay_range=None):
+    """
+    Train a SAC agent for the pendulum control task.
+
+    Args:
+        randomization_factor (float): Amount of parameter randomization
+        delay_steps (int): Base number of delay steps
+        delay_range (tuple, optional): Range of possible delays (min, max)
+
+    Returns:
+        SACAgent: The trained agent
+    """
+    # Create delay string for display
+    if delay_range:
+        delay_str = f"{delay_range[0]}-{delay_range[1]}"
+    else:
+        delay_str = str(delay_steps)
+
+    print(f"Starting SAC training with domain randomization (factor: {randomization_factor}) "
+          f"and input delay ({delay_str} steps)...")
+
+    # Environment setup with randomization and variable delay
+    env = PendulumEnv(randomization_factor=randomization_factor,
+                      delay_steps=delay_steps,
+                      delay_range=delay_range)
 
     # Hyperparameters
     state_dim = 6  # Our observation space
@@ -757,7 +803,7 @@ def train(randomization_factor=0.1, delay_steps=5):
     plt.legend()
     plt.grid(True)
     plt.savefig(f"sac_training_random{int(randomization_factor*100)}_delay{delay_steps}.png")
-    plt.show()
+    #plt.show()
 
     return agent
 
@@ -841,13 +887,36 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
 
 
 # Function to evaluate across a range of randomized environments
-def evaluate_robustness(agent, num_episodes=10, randomization_levels=[0.0, 0.05, 0.1, 0.2], delay_steps=5):
-    """Evaluate the trained agent's performance across different randomization levels"""
+def evaluate_robustness(agent, num_episodes=10, randomization_levels=[0.0, 0.05, 0.1, 0.2],
+                        delay_steps=5, delay_range=None):
+    """
+    Evaluate the trained agent's performance across different randomization levels.
+
+    Args:
+        agent (SACAgent): The agent to evaluate
+        num_episodes (int): Number of episodes to evaluate per condition
+        randomization_levels (list): List of randomization factors to test
+        delay_steps (int): Base number of delay steps
+        delay_range (tuple, optional): Range of possible delays (min, max)
+
+    Returns:
+        dict: Results dictionary with performance metrics
+    """
+    # Create delay string for display
+    if delay_range:
+        delay_str = f"{delay_range[0]}-{delay_range[1]}"
+    else:
+        delay_str = str(delay_steps)
+
     results = {}
 
     for rand_level in randomization_levels:
-        print(f"\nEvaluating with {rand_level * 100}% parameter randomization...")
-        env = PendulumEnv(randomization_factor=rand_level, delay_steps=delay_steps)
+        print(f"\nEvaluating with {rand_level * 100}% parameter randomization and {delay_str} step delay...")
+
+        # Create environment with current randomization level and variable delay
+        env = PendulumEnv(randomization_factor=rand_level,
+                          delay_steps=delay_steps,
+                          delay_range=delay_range)
 
         episode_rewards = []
         balanced_times = []
@@ -940,7 +1009,7 @@ def evaluate_robustness(agent, num_episodes=10, randomization_levels=[0.0, 0.05,
 
     plt.tight_layout()
     plt.savefig("robustness_summary.png")
-    plt.show()
+    #plt.show()
 
     return results
 
@@ -981,22 +1050,25 @@ def load_model(actor_path, critic_path=None, state_dim=6, action_dim=1, hidden_d
     return agent
 
 
-def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5, num_episodes=5):
+def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5,
+                     delay_range=None, num_episodes=5):
     """
     Run a loaded model in the pendulum environment and evaluate its performance.
-    Simplified version without animations, focusing only on plots.
 
     Args:
         model_path (str): Path to the saved actor model
         randomization_factor (float): Amount of parameter randomization
-        delay_steps (int): Number of timesteps to delay observations
+        delay_steps (int): Base number of delay steps
+        delay_range (tuple, optional): Range of possible delays (min, max)
         num_episodes (int): Number of episodes to run
 
     Returns:
         dict: Performance statistics
     """
-    # Create environment with specified parameters
-    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
+    # Create environment with specified parameters and variable delay
+    env = PendulumEnv(randomization_factor=randomization_factor,
+                      delay_steps=delay_steps,
+                      delay_range=delay_range)
 
     # Load the agent
     agent = load_model(model_path)
@@ -1102,7 +1174,7 @@ def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5, num_ep
 
         plt.tight_layout()
         plt.savefig("model_performance_summary.png")
-        plt.show()
+        #plt.show()
 
     return performance
 
@@ -1187,8 +1259,8 @@ def plot_episode(episode, states_history, actions_history, dt, episode_reward,
     plt.close()
 
 
-def continue_training(actor_path, critic_path=None, randomization_factor=0.1, delay_steps=5,
-                      additional_episodes=500, lr=1e-4):
+def continue_training(actor_path, critic_path=None, randomization_factor=0.1,
+                      delay_steps=5, delay_range=None, additional_episodes=500, lr=1e-4):
     """
     Continue training a pre-trained SAC model.
 
@@ -1196,19 +1268,28 @@ def continue_training(actor_path, critic_path=None, randomization_factor=0.1, de
         actor_path (str): Path to the saved actor model state dict
         critic_path (str, optional): Path to the saved critic model state dict
         randomization_factor (float): Amount of parameter randomization
-        delay_steps (int): Number of timesteps to delay observations
+        delay_steps (int): Base number of delay steps
+        delay_range (tuple, optional): Range of possible delays (min, max)
         additional_episodes (int): Number of additional episodes to train
-        lr (float): Learning rate for continued training (often lower than initial training)
+        lr (float): Learning rate for continued training
 
     Returns:
         SACAgent: The further trained agent
     """
-    print(f"Continuing training from model: {actor_path}")
-    print(
-        f"Training parameters: randomization={randomization_factor}, delay={delay_steps}, episodes={additional_episodes}")
+    # Create delay string for display
+    if delay_range:
+        delay_str = f"{delay_range[0]}-{delay_range[1]}"
+    else:
+        delay_str = str(delay_steps)
 
-    # Environment setup with randomization
-    env = PendulumEnv(randomization_factor=randomization_factor, delay_steps=delay_steps)
+    print(f"Continuing training from model: {actor_path}")
+    print(f"Training parameters: randomization={randomization_factor}, "
+          f"delay={delay_str}, episodes={additional_episodes}")
+
+    # Environment setup with randomization and variable delay
+    env = PendulumEnv(randomization_factor=randomization_factor,
+                      delay_steps=delay_steps,
+                      delay_range=delay_range)
 
     # Hyperparameters
     state_dim = 6  # Our observation space
@@ -1341,7 +1422,7 @@ def continue_training(actor_path, critic_path=None, randomization_factor=0.1, de
     plt.legend()
     plt.grid(True)
     plt.savefig(f"continued_training_{timestamp}.png")
-    plt.show()
+    #plt.show()
 
     return agent
 
@@ -1362,13 +1443,15 @@ if __name__ == "__main__":
     # Train from scratch
     train_parser = subparsers.add_parser('train', help='Train a new model from scratch')
     train_parser.add_argument('--random', type=float, default=0.1, help='Randomization factor (0.0-1.0)')
-    train_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+    train_parser.add_argument('--delay', type=int, default=5, help='Fixed observation delay steps')
+    train_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
 
     # Load and evaluate a model
     load_parser = subparsers.add_parser('load', help='Load and evaluate a pre-trained model')
     load_parser.add_argument('model_path', help='Path to the saved model file')
     load_parser.add_argument('--random', type=float, default=0.1, help='Randomization factor for evaluation')
-    load_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+    load_parser.add_argument('--delay', type=int, default=5, help='Fixed observation delay steps')
+    load_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
     load_parser.add_argument('--episodes', type=int, default=3, help='Number of episodes to evaluate')
 
     # Continue training a model
@@ -1376,7 +1459,8 @@ if __name__ == "__main__":
     continue_parser.add_argument('model_path', help='Path to the saved actor model file')
     continue_parser.add_argument('--critic', help='Optional path to the saved critic model file')
     continue_parser.add_argument('--random', type=float, default=0.15, help='Randomization factor for training')
-    continue_parser.add_argument('--delay', type=int, default=5, help='Observation delay steps')
+    continue_parser.add_argument('--delay', type=int, default=5, help='Fixed observation delay steps')
+    continue_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
     continue_parser.add_argument('--episodes', type=int, default=500, help='Number of additional episodes to train')
     continue_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for continued training')
     continue_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
@@ -1407,18 +1491,37 @@ if __name__ == "__main__":
         args.command = 'train'
         args.random = 0.1
         args.delay = 5
+        args.delay_range = None
+
+    # Parse delay range if provided
+    delay_range = None
+    if hasattr(args, 'delay_range') and args.delay_range:
+        try:
+            min_delay, max_delay = map(int, args.delay_range.split('-'))
+            delay_range = (min_delay, max_delay)
+            print(f"Using variable delay in range {delay_range}")
+        except ValueError:
+            print(f"Warning: Invalid delay range format '{args.delay_range}'. Using fixed delay of {args.delay}.")
 
     # Execute the appropriate command
     if args.command == 'train':
         print(f"\nTraining new model from scratch...")
-        print(f"Parameters: randomization={args.random}, delay={args.delay}")
-        agent = train(randomization_factor=args.random, delay_steps=args.delay)
+        print(f"Parameters: randomization={args.random}, delay={args.delay if not delay_range else delay_range}")
+        agent = train(
+            randomization_factor=args.random,
+            delay_steps=args.delay,
+            delay_range=delay_range
+        )
 
         # Evaluate trained agent
         print("\nEvaluating trained agent...")
-        evaluate_robustness(agent, num_episodes=2,
-                            randomization_levels=[0.0, args.random, args.random * 2],
-                            delay_steps=args.delay)
+        evaluate_robustness(
+            agent,
+            num_episodes=2,
+            randomization_levels=[0.0, args.random, args.random * 2],
+            delay_steps=args.delay,
+            delay_range=delay_range
+        )
 
     elif args.command == 'load':
         print(f"\nRunning pre-trained model from {args.model_path}...")
@@ -1426,6 +1529,7 @@ if __name__ == "__main__":
             args.model_path,
             randomization_factor=args.random,
             delay_steps=args.delay,
+            delay_range=delay_range,
             num_episodes=args.episodes
         )
 
@@ -1442,6 +1546,7 @@ if __name__ == "__main__":
             args.critic,
             randomization_factor=args.random,
             delay_steps=args.delay,
+            delay_range=delay_range,
             additional_episodes=args.episodes,
             lr=args.lr
         )
@@ -1449,9 +1554,13 @@ if __name__ == "__main__":
         # Optionally evaluate the improved agent
         if args.eval:
             print("\nEvaluating improved agent...")
-            evaluate_robustness(agent, num_episodes=2,
-                                randomization_levels=[0.0, args.random, args.random * 2],
-                                delay_steps=args.delay)
+            evaluate_robustness(
+                agent,
+                num_episodes=2,
+                randomization_levels=[0.0, args.random, args.random * 2],
+                delay_steps=args.delay,
+                delay_range=delay_range
+            )
 
     print("=" * 50)
     print("PROGRAM EXECUTION COMPLETE")
