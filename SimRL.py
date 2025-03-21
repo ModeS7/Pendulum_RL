@@ -210,7 +210,7 @@ class SystemParameters:
 
 # Modify the PendulumEnv class to use randomized parameters
 class PendulumEnv:
-    def __init__(self, dt=0.02, max_steps=750, delay_steps=5, delay_range=None, randomization_factor=0.1):
+    def __init__(self, dt=0.01, max_steps=1000, delay_steps=5, delay_range=None, randomization_factor=0.1):
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
@@ -708,7 +708,7 @@ def train(randomization_factor=0.1, delay_steps=5, delay_range=None):
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
     max_episodes = 1500  # Increase episodes for more robust learning with randomization
-    max_steps = 750
+    max_steps = 1000
     batch_size = 256 * 32
     replay_buffer_size = 200000  # Larger buffer for more diverse experiences
     updates_per_step = 1
@@ -1052,16 +1052,18 @@ def load_model(actor_path, critic_path=None, state_dim=6, action_dim=1, hidden_d
     """
     print(f"Loading pre-trained model from {actor_path}")
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Initialize a new agent
     agent = SACAgent(state_dim, action_dim, hidden_dim)
 
     # Load actor state dict
-    agent.actor.load_state_dict(torch.load(actor_path))
+    agent.actor.load_state_dict(torch.load(actor_path, map_location=device))
     agent.actor.eval()  # Set to evaluation mode
 
     # Load critic if provided
     if critic_path:
-        agent.critic.load_state_dict(torch.load(critic_path))
+        agent.critic.load_state_dict(torch.load(critic_path, map_location=device))
         agent.critic.eval()
 
         # Copy critic weights to target critic
@@ -1316,7 +1318,7 @@ def continue_training(actor_path, critic_path=None, randomization_factor=0.1,
     # Hyperparameters
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
-    max_steps = 750
+    max_steps = 100
     batch_size = 256 * 32
     replay_buffer_size = 200000  # Larger buffer for diverse experiences
     updates_per_step = 1
