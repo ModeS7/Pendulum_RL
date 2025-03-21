@@ -426,7 +426,7 @@ class PendulumEnv:
 
         # Component 5: Penalty for hitting limits
         limit_penalty = 0.0
-        if abs(theta - self.THETA_MAX) < 0.01 or abs(theta - self.THETA_MIN) < 0.01:
+        if (abs(theta - self.THETA_MAX) < 0.02 or abs(theta - self.THETA_MIN) < 0.02):
             limit_penalty = -10.0
 
         # Component 6: Energy management reward
@@ -436,7 +436,7 @@ class PendulumEnv:
         # Reward for being close to the optimal energy (inverted Gaussian)
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
-        return upright_reward + bonus + pos_penalty + limit_penalty + energy_reward
+        return upright_reward + bonus + limit_penalty + energy_reward
 
 
 # Actor (Policy) Network
@@ -779,7 +779,8 @@ def train(randomization_factor=0.1, delay_steps=5, delay_range=None):
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
-                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward, episode_params)
+                plot_training_episode(episode, episode_states, episode_actions, env.dt,
+                                      episode_reward, episode_params, delay_steps, env)
 
         # Early stopping if well trained
         if avg_reward > 5000 and episode > 200:  # Higher threshold for robust policy
@@ -809,8 +810,21 @@ def train(randomization_factor=0.1, delay_steps=5, delay_range=None):
 
 
 # Update plot_training_episode to show randomized parameters
-def plot_training_episode(episode, states_history, actions_history, dt, episode_reward, params=None):
-    """Plot the pendulum state evolution for a training episode with randomized parameters"""
+def plot_training_episode(episode, states_history, actions_history, dt, episode_reward, params=None, delay_steps=None,
+                          env=None):
+    """
+    Plot the pendulum state evolution for a training episode with randomized parameters and delay info
+
+    Args:
+        episode (int): Episode number
+        states_history (numpy.ndarray): Array of state histories
+        actions_history (numpy.ndarray): Array of actions
+        dt (float): Timestep size
+        episode_reward (float): Total episode reward
+        params (dict, optional): Randomized physical parameters if available
+        delay_steps (int, optional): Fixed delay steps (if not using variable delay)
+        env (PendulumEnv, optional): Environment object to extract current delay info
+    """
     # Convert history to numpy arrays
     states_history = np.array(states_history)
     actions_history = np.array(actions_history)
@@ -842,6 +856,13 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
     # Plot results
     plt.figure(figsize=(12, 10))  # Make it a bit taller for parameter display
 
+    # Get delay information
+    delay_info = ""
+    if env is not None and hasattr(env, 'current_delay'):
+        delay_info = f"Delay: {env.current_delay} steps ({env.current_delay * dt * 1000:.1f}ms), "
+    elif delay_steps is not None:
+        delay_info = f"Delay: {delay_steps} steps ({delay_steps * dt * 1000:.1f}ms), "
+
     # Plot arm angle
     plt.subplot(3, 1, 1)
     plt.plot(t, thetas, 'b-')
@@ -851,11 +872,12 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
 
     # Add randomized parameters to title if provided
     if params:
-        param_text = f"Randomized: Rm={params['Rm']:.2f}, Km={params['Km']:.4f}, mL={params['mL']:.4f}, LL={params['LL']:.4f}"
+        param_text = f"{delay_info}Rm={params['Rm']:.2f}, Km={params['Km']:.4f}, mL={params['mL']:.4f}, LL={params['LL']:.4f}"
         plt.title(
             f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{param_text}')
     else:
-        plt.title(f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+        plt.title(
+            f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{delay_info}')
 
     plt.legend()
     plt.grid(True)
@@ -1051,24 +1073,14 @@ def load_model(actor_path, critic_path=None, state_dim=6, action_dim=1, hidden_d
 
 
 def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5,
-                     delay_range=None, num_episodes=5):
+                    delay_range=None, num_episodes=5):
     """
     Run a loaded model in the pendulum environment and evaluate its performance.
-
-    Args:
-        model_path (str): Path to the saved actor model
-        randomization_factor (float): Amount of parameter randomization
-        delay_steps (int): Base number of delay steps
-        delay_range (tuple, optional): Range of possible delays (min, max)
-        num_episodes (int): Number of episodes to run
-
-    Returns:
-        dict: Performance statistics
     """
-    # Create environment with specified parameters and variable delay
+    # Environment setup as before
     env = PendulumEnv(randomization_factor=randomization_factor,
-                      delay_steps=delay_steps,
-                      delay_range=delay_range)
+                     delay_steps=delay_steps,
+                     delay_range=delay_range)
 
     # Load the agent
     agent = load_model(model_path)
@@ -1146,7 +1158,8 @@ def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5,
         # Create visualization
         plot_episode(episode, states_array, actions_array, env.dt,
                      total_reward, balanced_time, env.params,
-                     prefix="model_run", randomized=True)
+                     prefix="model_run", randomized=True,
+                     delay_steps=delay_steps, env=env)
 
     # Plot summary statistics
     if num_episodes > 1:
@@ -1180,7 +1193,7 @@ def run_loaded_model(model_path, randomization_factor=0.1, delay_steps=5,
 
 
 def plot_episode(episode, states_history, actions_history, dt, episode_reward,
-                 balanced_time, params=None, prefix="episode", randomized=False):
+                 balanced_time, params=None, prefix="episode", randomized=False, delay_steps=None, env=None):
     """
     Plot the pendulum state evolution for an episode
 
@@ -1194,6 +1207,8 @@ def plot_episode(episode, states_history, actions_history, dt, episode_reward,
         params (SystemParameters, optional): Randomized parameters if available
         prefix (str): Prefix for the saved file
         randomized (bool): Whether parameters are randomized
+        delay_steps (int, optional): Fixed delay steps (if not using variable delay)
+        env (PendulumEnv, optional): Environment object to extract current delay info
     """
     # Extract components
     thetas = states_history[:, 0]
@@ -1209,6 +1224,13 @@ def plot_episode(episode, states_history, actions_history, dt, episode_reward,
     # Generate time array
     t = np.arange(len(states_history)) * dt
 
+    # Get delay information
+    delay_info = ""
+    if env is not None and hasattr(env, 'current_delay'):
+        delay_info = f"Delay: {env.current_delay} steps ({env.current_delay * dt * 1000:.1f}ms), "
+    elif delay_steps is not None:
+        delay_info = f"Delay: {delay_steps} steps ({delay_steps * dt * 1000:.1f}ms), "
+
     # Plot results
     plt.figure(figsize=(12, 10))
 
@@ -1221,12 +1243,12 @@ def plot_episode(episode, states_history, actions_history, dt, episode_reward,
 
     # Add randomized parameters to title if provided
     if randomized and params:
-        param_text = f"Randomized: Rm={params.Rm:.2f}, Km={params.Km:.4f}, mL={params.mL:.4f}, LL={params.LL:.4f}, g={params.g:.2f}"
+        param_text = f"{delay_info}Rm={params.Rm:.2f}, Km={params.Km:.4f}, mL={params.mL:.4f}, LL={params.LL:.4f}"
         plt.title(
             f'{prefix.capitalize()} {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{param_text}')
     else:
         plt.title(
-            f'{prefix.capitalize()} {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+            f'{prefix.capitalize()} {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s\n{delay_info}')
 
     plt.legend()
     plt.grid(True)
@@ -1260,7 +1282,7 @@ def plot_episode(episode, states_history, actions_history, dt, episode_reward,
 
 
 def continue_training(actor_path, critic_path=None, randomization_factor=0.1,
-                      delay_steps=5, delay_range=None, additional_episodes=500, lr=1e-4):
+                     delay_steps=5, delay_range=None, additional_episodes=500, lr=1e-4):
     """
     Continue training a pre-trained SAC model.
 
@@ -1397,7 +1419,9 @@ def continue_training(actor_path, critic_path=None, randomization_factor=0.1,
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
-                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward, episode_params)
+                plot_training_episode(episode, episode_states, episode_actions,
+                                      env.dt, episode_reward, episode_params,
+                                      delay_steps, env)
 
         # Early stopping if well trained
         if avg_reward > 6000 and len(episode_rewards) >= 100:
