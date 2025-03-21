@@ -32,8 +32,8 @@ Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
 max_voltage = 10.0  # Maximum motor voltage
-THETA_MIN = -2.2 # Minimum arm angle (radians)
-THETA_MAX = 2.2  # Maximum arm angle (radians)
+THETA_MIN = -2.0  # Minimum arm angle (radians)
+THETA_MAX = 2.0  # Maximum arm angle (radians)
 
 
 
