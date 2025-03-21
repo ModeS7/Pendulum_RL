@@ -130,7 +130,7 @@ class SACController:
         start_time = time.time()
         max_theta = -float('inf')
 
-        while time.time() - start_time < 2.0:
+        while time.time() - start_time < 3.5:
             self.qube.setMotorVoltage(1.5)
             self.qube.update()
             current_theta = np.radians(self.qube.getMotorAngle())
@@ -215,6 +215,7 @@ class SACController:
                 if dt > 0:
                     alpha_prev = self.history['pendulum_angle'][-1]
                     alpha_dot = (alpha - alpha_prev) / dt
+                    print(dt)
                 else:
                     alpha_dot = 0.0
             else:
@@ -240,7 +241,7 @@ class SACController:
         current_time = time.time() - self.start_time
         self.history['time'].append(current_time)
         self.history['motor_angle'].append(theta)
-        self.history['pendulum_angle'].append(alpha)
+        self.history['pendulum_angle'].append(alpha_norm)
 
         # For the first call, we haven't applied voltage yet
         if 'last_voltage' in self.__dict__:
@@ -392,7 +393,7 @@ class SACController:
 
 def main():
     # Path to the pretrained model
-    model_path = "sacpen5.pth"  # Update with your model path
+    model_path = "sacpen7.pth"  # Update with your model path
 
     # Create the controller
     controller = SACController(model_path)
