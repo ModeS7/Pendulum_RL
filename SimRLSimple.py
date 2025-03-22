@@ -559,6 +559,9 @@ def train():
             # Plot simulation for visual progress tracking
             if plot_this_episode:
                 plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward)
+                # Save trained model
+                timestamp = int(time())
+                torch.save(agent.actor.state_dict(), f"{episode}_actor_{timestamp}.pth")
 
         # Early stopping if well trained
         if avg_reward > 5000 and episode > 100:
