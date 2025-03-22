@@ -583,7 +583,8 @@ def train():
     plt.legend()
     plt.grid(True)
     plt.savefig("sac_training_progress.png")
-    plt.show()
+    #plt.show()
+    plt.close()
 
     return agent
 
@@ -650,7 +651,7 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
 
     plt.tight_layout()
     plt.savefig(f"training_episode_{episode}.png")
-    #plt.close()  # Close the figure to avoid memory issues
+    plt.close()  # Close the figure to avoid memory issues
 
 
 def evaluate(agent, num_episodes=5, render=True):
@@ -751,7 +752,8 @@ def evaluate(agent, num_episodes=5, render=True):
 
             plt.tight_layout()
             plt.savefig(f"sac_evaluation_episode_{episode + 1}.png")
-            plt.show()
+            #plt.show()
+            plt.close()
 
             print(f"Time spent balanced: {balanced_time:.2f} seconds")
             print(f"Data points with pendulum upright: {num_upright_points}")
