@@ -6,6 +6,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import os
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from collections import deque
+import threading
 from pendulum_kalman_filter import PendulumKalmanFilter  # Save the previous code as this file
 
 # Update with your COM port
@@ -160,6 +164,25 @@ class QUBEControllerWithRL:
         self.use_kalman = True  # Default to using Kalman filter
         self.prev_pendulum_angle_rad = 0
         self.prev_time = time.time()
+
+        # Initialize filtered state with zeros
+        self.filtered_state = np.zeros(4)
+
+        # Data collection for plotting
+        self.max_data_points = 1000  # Store last 10 seconds at 100Hz
+        self.time_history = deque(maxlen=self.max_data_points)
+        self.raw_theta_history = deque(maxlen=self.max_data_points)
+        self.raw_alpha_history = deque(maxlen=self.max_data_points)
+        self.model_theta_history = deque(maxlen=self.max_data_points)
+        self.model_alpha_history = deque(maxlen=self.max_data_points)
+        self.filtered_theta_history = deque(maxlen=self.max_data_points)
+        self.filtered_alpha_history = deque(maxlen=self.max_data_points)
+        self.voltage_history = deque(maxlen=self.max_data_points)
+        self.is_recording = False
+        self.record_start_time = 0
+
+        # Model state for comparison
+        self.model_state = np.zeros(4)
 
         # Initialize the RL model
         self.initialize_rl_model()
@@ -316,6 +339,24 @@ class QUBEControllerWithRL:
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
 
+        # Data collection and plotting controls
+        plot_frame = Frame(self.master, padx=10, pady=10)
+        plot_frame.pack()
+
+        self.record_btn = Button(plot_frame, text="Start Recording Data",
+                                 command=self.toggle_recording, width=20)
+        self.record_btn.grid(row=0, column=0, padx=5, pady=5)
+
+        self.plot_btn = Button(plot_frame, text="Plot Data",
+                               command=self.plot_data, width=20,
+                               state=tk.DISABLED)
+        self.plot_btn.grid(row=0, column=1, padx=5, pady=5)
+
+        self.save_data_btn = Button(plot_frame, text="Save Data to CSV",
+                                    command=self.save_data, width=20,
+                                    state=tk.DISABLED)
+        self.save_data_btn.grid(row=0, column=2, padx=5, pady=5)
+
     def toggle_kalman(self):
         """Toggle Kalman filter on/off"""
         self.use_kalman = bool(self.kalman_var.get())
@@ -432,7 +473,7 @@ class QUBEControllerWithRL:
     def update_position_control(self):
         """Update position control"""
         # Get current angle (either filtered or raw)
-        if self.use_kalman:
+        if self.use_kalman and hasattr(self, 'filtered_state'):
             current_angle = np.degrees(self.filtered_state[0]) + 136.0
         else:
             current_angle = self.qube.getMotorAngle() + 136.0
@@ -498,6 +539,11 @@ class QUBEControllerWithRL:
             motor_velocity,
             pendulum_velocity
         ])
+
+        # Update model prediction (simulation)
+        if hasattr(self, 'model_state'):
+            # Use same dynamics as in training
+            self.model_state = simulation_model(self.model_state, self.motor_voltage)
 
         if self.use_kalman:
             # Use Kalman filter for state estimation
@@ -571,6 +617,151 @@ class QUBEControllerWithRL:
 
         self.status_label.config(text="Motor stopped")
 
+    def toggle_recording(self):
+        """Toggle data recording for comparison plots"""
+        if not self.is_recording:
+            # Start recording
+            self.is_recording = True
+            self.record_btn.config(text="Stop Recording")
+            self.record_start_time = time.time()
+
+            # Clear previous data
+            self.time_history.clear()
+            self.raw_theta_history.clear()
+            self.raw_alpha_history.clear()
+            self.model_theta_history.clear()
+            self.model_alpha_history.clear()
+            self.filtered_theta_history.clear()
+            self.filtered_alpha_history.clear()
+            self.voltage_history.clear()
+
+            # Reset model state to match current real state
+            motor_angle_rad = np.radians(self.qube.getMotorAngle() + 136.0)
+            pendulum_angle_rad = np.radians(self.qube.getPendulumAngle())
+            motor_velocity = self.qube.getMotorRPM() * (2 * np.pi / 60)
+            pendulum_velocity = self.get_pendulum_velocity()
+
+            self.model_state = np.array([
+                motor_angle_rad,
+                pendulum_angle_rad,
+                motor_velocity,
+                pendulum_velocity
+            ])
+
+            self.status_label.config(text="Recording data...")
+
+            # Set recording LED to yellow
+            self.r_slider.set(999)
+            self.g_slider.set(999)
+            self.b_slider.set(0)
+
+        else:
+            # Stop recording
+            self.is_recording = False
+            self.record_btn.config(text="Start Recording Data")
+
+            # Enable plot button if we have data
+            if len(self.time_history) > 0:
+                self.plot_btn.config(state=tk.NORMAL)
+                self.save_data_btn.config(state=tk.NORMAL)
+
+            self.status_label.config(text=f"Recording stopped. {len(self.time_history)} data points collected.")
+
+            # Set LED back to default (blue)
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
+
+    def save_data(self):
+        """Save recorded data to CSV file"""
+        if len(self.time_history) == 0:
+            return
+
+        try:
+            filename = filedialog.asksaveasfilename(
+                initialdir=os.getcwd(),
+                title="Save Data As CSV",
+                defaultextension=".csv",
+                filetypes=(("CSV files", "*.csv"), ("All files", "*.*"))
+            )
+
+            if filename:
+                with open(filename, 'w') as f:
+                    # Write header
+                    f.write("time,raw_theta,raw_alpha,model_theta,model_alpha,filtered_theta,filtered_alpha,voltage\n")
+
+                    # Write data
+                    for i in range(len(self.time_history)):
+                        f.write(
+                            f"{self.time_history[i]:.3f},{self.raw_theta_history[i]:.6f},{self.raw_alpha_history[i]:.6f},"
+                            f"{self.model_theta_history[i]:.6f},{self.model_alpha_history[i]:.6f},"
+                            f"{self.filtered_theta_history[i]:.6f},{self.filtered_alpha_history[i]:.6f},"
+                            f"{self.voltage_history[i]:.6f}\n")
+
+                self.status_label.config(text=f"Data saved to {os.path.basename(filename)}")
+        except Exception as e:
+            self.status_label.config(text=f"Error saving data: {str(e)}")
+
+    def plot_data(self):
+        """Plot the recorded data"""
+        if len(self.time_history) == 0:
+            return
+
+        # Create a new popup window for plots
+        plot_window = tk.Toplevel(self.master)
+        plot_window.title("System vs Model Comparison")
+        plot_window.geometry("1000x800")
+
+        # Convert deques to lists for plotting
+        times = list(self.time_history)
+        raw_theta = list(self.raw_theta_history)
+        raw_alpha = list(self.raw_alpha_history)
+        model_theta = list(self.model_theta_history)
+        model_alpha = list(self.model_alpha_history)
+        filtered_theta = list(self.filtered_theta_history)
+        filtered_alpha = list(self.filtered_alpha_history)
+        voltages = list(self.voltage_history)
+
+        # Create figure with subplots
+        fig = plt.Figure(figsize=(10, 8))
+
+        # Motor angle plot
+        ax1 = fig.add_subplot(311)
+        ax1.plot(times, raw_theta, 'b-', label='Real System')
+        ax1.plot(times, model_theta, 'r--', label='Model Prediction')
+        ax1.plot(times, filtered_theta, 'g-', label='Kalman Filter')
+        ax1.set_ylabel('Motor Angle (rad)')
+        ax1.set_title('Motor Angle Comparison')
+        ax1.legend()
+        ax1.grid(True)
+
+        # Pendulum angle plot
+        ax2 = fig.add_subplot(312)
+        ax2.plot(times, raw_alpha, 'b-', label='Real System')
+        ax2.plot(times, model_alpha, 'r--', label='Model Prediction')
+        ax2.plot(times, filtered_alpha, 'g-', label='Kalman Filter')
+        ax2.set_ylabel('Pendulum Angle (rad)')
+        ax2.set_title('Pendulum Angle Comparison')
+        ax2.legend()
+        ax2.grid(True)
+
+        # Voltage plot
+        ax3 = fig.add_subplot(313)
+        ax3.plot(times, voltages, 'k-')
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Voltage (V)')
+        ax3.set_title('Control Voltage')
+        ax3.grid(True)
+
+        # Add canvas to window
+        canvas = FigureCanvasTkAgg(fig, master=plot_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Add close button
+        close_btn = Button(plot_window, text="Close", command=plot_window.destroy)
+        close_btn.pack(pady=10)
+
     def update_gui(self):
         """Update the GUI and control the hardware"""
         # Update automatic control modes if active
@@ -592,11 +783,16 @@ class QUBEControllerWithRL:
         pendulum_angle_deg = self.qube.getPendulumAngle()
 
         # Convert to radians for normalized angle calculation
+        motor_angle_rad = np.radians(motor_angle_deg)
         pendulum_angle_rad = np.radians(pendulum_angle_deg)
         pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)  # For display
 
+        # Get velocities
+        motor_velocity = self.qube.getMotorRPM() * (2 * np.pi / 60)  # RPM to rad/s
+        pendulum_velocity = self.get_pendulum_velocity()
+
         # Show filtered angles if Kalman is active
-        if hasattr(self, 'filtered_state') and self.use_kalman:
+        if self.use_kalman:
             filtered_motor_deg = np.degrees(self.filtered_state[0]) + 136.0
             filtered_pendulum_deg = np.degrees(self.filtered_state[1])
             filtered_pendulum_norm = normalize_angle(self.filtered_state[1] + np.pi)
@@ -616,6 +812,28 @@ class QUBEControllerWithRL:
 
         if self.rl_model:
             self.model_label.config(text=f"Using: {os.path.basename(self.rl_model)}")
+
+        # Record data if in recording mode
+        if self.is_recording:
+            current_time = time.time() - self.record_start_time
+
+            # Raw sensor data
+            self.time_history.append(current_time)
+            self.raw_theta_history.append(motor_angle_rad)
+            self.raw_alpha_history.append(pendulum_angle_rad)
+            self.voltage_history.append(self.motor_voltage)
+
+            # Model predictions
+            if hasattr(self, 'model_state'):
+                self.model_theta_history.append(self.model_state[0])
+                self.model_alpha_history.append(self.model_state[1])
+            else:
+                self.model_theta_history.append(0)
+                self.model_alpha_history.append(0)
+
+            # Filtered data
+            self.filtered_theta_history.append(self.filtered_state[0])
+            self.filtered_alpha_history.append(self.filtered_state[1])
 
 
 def main():
