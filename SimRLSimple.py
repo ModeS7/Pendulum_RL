@@ -564,7 +564,7 @@ def train():
                 torch.save(agent.actor.state_dict(), f"{episode}_actor_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 5000 and episode > 100:
+        if avg_reward > 5000 and episode > 50:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
