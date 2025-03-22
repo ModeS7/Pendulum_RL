@@ -300,14 +300,13 @@ class PendulumEnv:
         k1 = self._dynamics_step(state, 0, vm)
         state_k2 = enforce_theta_limits(state + 0.5 * dt * k1, self.THETA_MIN, self.THETA_MAX)
         k2 = self._dynamics_step(state_k2, 0, vm)
-
         state_k3 = enforce_theta_limits(state + 0.5 * dt * k2, self.THETA_MIN, self.THETA_MAX)
         k3 = self._dynamics_step(state_k3, 0, vm)
-
         state_k4 = enforce_theta_limits(state + dt * k3, self.THETA_MIN, self.THETA_MAX)
         k4 = self._dynamics_step(state_k4, 0, vm)
 
         new_state = state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
         return enforce_theta_limits(new_state, self.THETA_MIN, self.THETA_MAX)
 
     def _compute_reward(self):
@@ -337,7 +336,7 @@ class PendulumEnv:
         E_diff = abs(E - E_ref)  # Difference from optimal energy
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
-        return upright_reward + velocity_penalty + pos_penalty + bonus + limit_penalty + energy_reward
+        return upright_reward +  bonus + limit_penalty + energy_reward
 
 
 # ============= Neural Network Models =============
