@@ -336,7 +336,7 @@ class PendulumEnv:
         E_diff = abs(E - E_ref)  # Difference from optimal energy
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
-        return upright_reward +  bonus + limit_penalty + energy_reward
+        return upright_reward + bonus + limit_penalty + energy_reward
 
 
 # ============= Neural Network Models =============
