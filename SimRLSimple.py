@@ -137,7 +137,7 @@ def dynamics_step(state, t, vm):
 
 # Simulation environment for RL
 class PendulumEnv:
-    def __init__(self, dt=0.0115, max_steps=800):  # 15 seconds at 50Hz
+    def __init__(self, dt=0.0115, max_steps=1300):  # 15 seconds at 50Hz
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
@@ -493,7 +493,7 @@ def train():
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
     max_episodes = 100
-    max_steps = 800
+    max_steps = 1300
     batch_size = 256
     replay_buffer_size = 100000
     updates_per_step = 1

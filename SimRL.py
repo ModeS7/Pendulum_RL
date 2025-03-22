@@ -126,7 +126,7 @@ class SystemParameters:
 
 # ============= Pendulum Environment =============
 class PendulumEnv:
-    def __init__(self, dt=0.0115, max_steps=1000, delay_steps=5, delay_range=None,
+    def __init__(self, dt=0.0115, max_steps=1300, delay_steps=5, delay_range=None,
                  randomization_factor=0.1, dt_randomization_factor=0.0):
         # Initialize parameters
         self.max_steps = max_steps
@@ -666,7 +666,7 @@ def plot_episode(episode, states, actions, dt, reward, balanced_time=None, param
 
 # ============= Training and Evaluation Functions =============
 def train_or_continue(env, agent=None, model_path=None, critic_path=None, episodes=1000,
-                      batch_size=8192, replay_buffer_size=200000, max_steps=1000, lr=3e-4):
+                      batch_size=8192, replay_buffer_size=100000, max_steps=1300, lr=3e-4):
     """Unified training function that handles both new training and continuing from a checkpoint"""
     is_continuing = agent is not None or model_path is not None
 
