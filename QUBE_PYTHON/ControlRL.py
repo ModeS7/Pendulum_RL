@@ -1,416 +1,284 @@
-import numpy as np
-import torch
-import time
+import tkinter as tk
+from tkinter import Button, Label, Frame, Scale, Entry
 from QUBE import QUBE
-import matplotlib.pyplot as plt
-from collections import deque
+import time
 
-# Define the COM port (from your control.py)
-COM_PORT = "COM10"  # Update this to match your system
-
-# Constants similar to training environment
-THETA_MIN = -2.2  # Minimum arm angle (radians)
-THETA_MAX = 2.2  # Maximum arm angle (radians)
+# Update with your COM port
+COM_PORT = "COM10"
 
 
-class SACController:
-    def __init__(self, model_path, state_dim=6, action_dim=1, hidden_dim=256):
-        """
-        Initialize the SAC controller for the real QUBE system
+class SimpleCornerController:
+    def __init__(self, master, qube):
+        self.master = master
+        self.qube = qube
+        master.title("QUBE Controller - Corner as Zero")
 
-        Args:
-            model_path (str): Path to the pretrained actor model
-            state_dim (int): Dimension of state space
-            action_dim (int): Dimension of action space
-            hidden_dim (int): Hidden dimension of the network
-        """
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
+        # Control state
+        self.motor_voltage = 0.0
+        self.target_position = 0.0
+        self.calibrating = False
+        self.moving_to_position = False
 
-        # Initialize the QUBE hardware interface
-        self.qube = QUBE(COM_PORT, 115200)
+        # Create GUI elements
+        self.create_gui()
 
-        # Create observation buffer to match delay in training
-        self.delay_steps = 5  # Should match what was used in training
-        self.observation_buffer = deque(maxlen=self.delay_steps + 1)
+    def create_gui(self):
+        # Main control frame
+        control_frame = Frame(self.master, padx=10, pady=10)
+        control_frame.pack()
 
-        # Load the pretrained model
-        self.actor = self._load_actor(model_path, state_dim, action_dim, hidden_dim)
+        # Calibrate button
+        self.calibrate_btn = Button(control_frame, text="Calibrate (Set Corner as Zero)",
+                                    command=self.calibrate,
+                                    width=25, height=2)
+        self.calibrate_btn.grid(row=0, column=0, padx=5, pady=5)
 
-        # Record historical data for plotting
-        self.history = {
-            'time': [],
-            'motor_angle': [],
-            'pendulum_angle': [],
-            'motor_voltage': [],
-            'motor_rpm': []
-        }
-        self.start_time = time.time()
+        # Move to position input and button
+        position_frame = Frame(control_frame)
+        position_frame.grid(row=1, column=0, pady=10)
 
-    def normalize_angle(self, angle):
-        """Normalize angle to [-π, π]"""
-        angle = angle % (2 * np.pi)
-        if angle > np.pi:
-            angle -= 2 * np.pi
-        return angle
+        Label(position_frame, text="Target Position (degrees):").grid(row=0, column=0, padx=5)
+        self.position_entry = Entry(position_frame, width=10)
+        self.position_entry.grid(row=0, column=1, padx=5)
+        self.position_entry.insert(0, "0.0")
 
-    def _load_actor(self, model_path, state_dim, action_dim, hidden_dim):
-        """
-        Load the pretrained actor model
+        self.move_btn = Button(position_frame, text="Move to Position",
+                               command=self.start_move_to_position, width=15)
+        self.move_btn.grid(row=0, column=2, padx=5)
 
-        Args:
-            model_path (str): Path to the saved model
-            state_dim (int): Dimension of state space
-            action_dim (int): Dimension of action space
-            hidden_dim (int): Hidden dimension size
+        # Stop button
+        self.stop_btn = Button(control_frame, text="STOP MOTOR",
+                               command=self.stop_motor,
+                               width=20, height=2,
+                               bg="red", fg="white")
+        self.stop_btn.grid(row=2, column=0, pady=10)
 
-        Returns:
-            nn.Module: Loaded actor model
-        """
-        print(f"Loading model from {model_path}")
+        # Manual voltage control
+        self.voltage_slider = Scale(
+            control_frame,
+            from_=-3,
+            to=3,
+            orient=tk.HORIZONTAL,
+            label="Manual Voltage",
+            length=400,
+            resolution=0.1,
+            command=self.set_manual_voltage
+        )
+        self.voltage_slider.set(0)
+        self.voltage_slider.grid(row=3, column=0, padx=5, pady=10)
 
-        # Define Actor network (same structure as in training)
-        class Actor(torch.nn.Module):
-            def __init__(self, state_dim, action_dim, hidden_dim=256):
-                super(Actor, self).__init__()
+        # Status display
+        status_frame = Frame(self.master, padx=10, pady=10)
+        status_frame.pack()
 
-                self.network = torch.nn.Sequential(
-                    torch.nn.Linear(state_dim, hidden_dim),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(hidden_dim, hidden_dim),
-                    torch.nn.ReLU()
-                )
+        Label(status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W)
+        self.status_label = Label(status_frame, text="Ready - Please calibrate", width=40)
+        self.status_label.grid(row=0, column=1, sticky=tk.W)
 
-                # Mean and log std for continuous action
-                self.mean = torch.nn.Linear(hidden_dim, action_dim)
-                self.log_std = torch.nn.Linear(hidden_dim, action_dim)
+        Label(status_frame, text="Motor Angle:").grid(row=1, column=0, sticky=tk.W)
+        self.angle_label = Label(status_frame, text="0.0°")
+        self.angle_label.grid(row=1, column=1, sticky=tk.W)
 
-            def forward(self, state):
-                features = self.network(state)
+        Label(status_frame, text="Pendulum Angle:").grid(row=2, column=0, sticky=tk.W)
+        self.pendulum_label = Label(status_frame, text="0.0°")
+        self.pendulum_label.grid(row=2, column=1, sticky=tk.W)
 
-                # Get mean and constrain it to [-1, 1]
-                action_mean = torch.tanh(self.mean(features))
+        Label(status_frame, text="Motor RPM:").grid(row=3, column=0, sticky=tk.W)
+        self.rpm_label = Label(status_frame, text="0.0")
+        self.rpm_label.grid(row=3, column=1, sticky=tk.W)
 
-                # Get log standard deviation and clamp it
-                action_log_std = self.log_std(features)
-                action_log_std = torch.clamp(action_log_std, -20, 2)
+        Label(status_frame, text="Current Voltage:").grid(row=4, column=0, sticky=tk.W)
+        self.voltage_label = Label(status_frame, text="0.0 V")
+        self.voltage_label.grid(row=4, column=1, sticky=tk.W)
 
-                return action_mean, action_log_std
+        # RGB Control
+        rgb_frame = Frame(self.master, padx=10, pady=10)
+        rgb_frame.pack()
 
-        # Create new model instance
-        actor = Actor(state_dim, action_dim, hidden_dim).to(self.device)
+        self.r_slider = Scale(rgb_frame, from_=999, to=0, label="Red")
+        self.r_slider.grid(row=0, column=0, padx=5)
 
-        # Load the state dict
-        actor.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.g_slider = Scale(rgb_frame, from_=999, to=0, label="Green")
+        self.g_slider.grid(row=0, column=1, padx=5)
 
-        # Set to evaluation mode
-        actor.eval()
+        self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
+        self.b_slider.grid(row=0, column=2, padx=5)
 
-        print("Model loaded successfully!")
-        return actor
+    def set_manual_voltage(self, value):
+        """Set manual voltage from slider"""
+        self.motor_voltage = float(value)
+        # Reset any automatic control modes
+        self.calibrating = False
+        self.moving_to_position = False
 
-    def calibrate_system(self):
-        """
-        Calibrate the system by applying constant voltage to find edge limit
-        and then position the arm at 2.3 rad from center
-        """
-        print("Starting system calibration...")
+    def calibrate(self):
+        """Simple calibration - move to corner and set as zero"""
+        self.calibrating = True
+        self.moving_to_position = False
+        self.voltage_slider.set(0)  # Reset slider
 
-        # Reset encoders
-        self.qube.resetMotorEncoder()
-        self.qube.resetPendulumEncoder()
-        self.qube.update()
-        time.sleep(0.1)
+        # Set calibration start time
+        self.calibration_start_time = time.time()
+        self.status_label.config(text="Calibrating - Finding corner...")
 
-        # Set RGB to indicate calibration mode
-        self.qube.setRGB(0, 999, 0)  # Green
+        # Set yellow LED during calibration
+        self.r_slider.set(999)
+        self.g_slider.set(999)
+        self.b_slider.set(0)
 
-        # Phase 1: Apply 2.5V constant for 2 seconds to find edge limit
-        print("Applying 2.5V for 2 seconds to find edge limit...")
-        start_time = time.time()
-        max_theta = -float('inf')
+    def update_calibration(self):
+        """Update calibration process"""
+        elapsed = time.time() - self.calibration_start_time
 
-        while time.time() - start_time < 3.5:
-            self.qube.setMotorVoltage(1.5)
-            self.qube.update()
-            current_theta = np.radians(self.qube.getMotorAngle())
-            max_theta = max(max_theta, current_theta)
-            time.sleep(0.01)
-
-        # Stop the motor
-        self.qube.setMotorVoltage(0.0)
-        self.qube.update()
-
-        print(f"Edge limit found at approximately {max_theta:.4f} radians")
-
-        # Set THETA_MAX based on measurement with safety margin
-        effective_theta_max = max_theta * 0.95  # 5% safety margin
-        print(f"Setting effective THETA_MAX to {effective_theta_max:.4f} radians")
-
-        # Phase 2: Position the arm at 2.3 rad from center
-        target_position = 2.3  # radians
-        print(f"Positioning arm at {target_position} radians from center...")
-
-        # Simple proportional control to position the arm
-        max_iterations = 100
-        iteration = 0
-        position_error = 1.0  # Initial error
-
-        while abs(position_error) > 0.05 and iteration < max_iterations:
-            # Get current position
-            current_position = np.radians(self.qube.getMotorAngle())
-
-            # Calculate error
-            position_error = target_position - current_position
-
-            # Simple P control
-            voltage = np.clip(position_error * 5.0, -10.0, 10.0)
-
-            # Apply voltage
-            self.qube.setMotorVoltage(voltage)
-            self.qube.update()
-
-            iteration += 1
-            time.sleep(0.02)
-
-        # Stop the motor at the desired position
-        self.qube.setMotorVoltage(0.0)
-        self.qube.update()
-
-        final_position = np.radians(self.qube.getMotorAngle())
-        print(f"Arm positioned at {final_position:.4f} radians (target: {target_position})")
-
-        # Set RGB to indicate ready state
-        self.qube.setRGB(0, 0, 999)  # Blue
-        time.sleep(0.5)
-
-        return final_position
-
-    def get_observation(self):
-        """
-        Get the current observation from the QUBE system and format it
-        like the training environment
-
-        Returns:
-            numpy.ndarray: Observation vector for the RL model
-        """
-        # Update the hardware
-        self.qube.update()
-
-        # Get motor and pendulum angles in radians
-        theta = np.radians(self.qube.getMotorAngle())
-        alpha = np.radians(self.qube.getPendulumAngle())
-
-        # Get velocities (filtered to reduce noise)
-        try:
-            theta_dot = np.radians(self.qube.getMotorRPM()) * (2 * np.pi / 60)  # Convert RPM to rad/s
-        except:
-            theta_dot = 0.0  # Fallback if reading fails
-
-        try:
-            # Estimate pendulum velocity using simple differentiation (will be noisy)
-            # In a real implementation, you'd want a better filter here
-            if len(self.history['pendulum_angle']) > 1:
-                dt = self.history['time'][-1] - self.history['time'][-2]
-                if dt > 0:
-                    alpha_prev = self.history['pendulum_angle'][-1]
-                    alpha_dot = (alpha - alpha_prev) / dt
-                    print(dt)
-                else:
-                    alpha_dot = 0.0
-            else:
-                alpha_dot = 0.0
-        except:
-            alpha_dot = 0.0
-
-        # Normalize the pendulum angle for upright reference
-        alpha_norm = self.normalize_angle(alpha + np.pi)
-
-        # Format observation to match training environment
-        obs = np.array([
-            np.sin(theta), np.cos(theta),
-            np.sin(alpha_norm), np.cos(alpha_norm),
-            theta_dot / 10.0,  # Same scaling as in training
-            alpha_dot / 10.0  # Same scaling as in training
-        ])
-
-        # Store current observation in the buffer
-        self.observation_buffer.append(obs)
-
-        # Add to history for plotting
-        current_time = time.time() - self.start_time
-        self.history['time'].append(current_time)
-        self.history['motor_angle'].append(theta)
-        self.history['pendulum_angle'].append(alpha_norm)
-
-        # For the first call, we haven't applied voltage yet
-        if 'last_voltage' in self.__dict__:
-            self.history['motor_voltage'].append(self.last_voltage)
+        if elapsed < 3.0:
+            # Apply voltage to move to corner
+            self.motor_voltage = 1.5
+            self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
         else:
-            self.history['motor_voltage'].append(0.0)
+            # At corner - set as zero
+            self.motor_voltage = 0.0
 
-        try:
-            self.history['motor_rpm'].append(self.qube.getMotorRPM())
-        except:
-            self.history['motor_rpm'].append(0.0)
+            # Reset encoders at the corner position
+            self.qube.resetMotorEncoder()
+            self.qube.resetPendulumEncoder()
 
-        # Return delayed observation to match training environment
-        if len(self.observation_buffer) <= self.delay_steps:
-            return self.observation_buffer[0]
-        return self.observation_buffer[-(self.delay_steps + 1)]
+            # Set blue LED to indicate ready
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
 
-    def select_action(self, state):
-        """
-        Get action from the pretrained model
+            # End calibration
+            self.calibrating = False
+            self.status_label.config(text="Calibration complete - Corner is now zero")
 
-        Args:
-            state (numpy.ndarray): Current state observation
+    def start_move_to_position(self):
+        """Start moving to target position"""
+        if not self.calibrating:
+            try:
+                # Get target position from entry field
+                self.target_position = float(self.position_entry.get())
 
-        Returns:
-            float: Action value (-1 to 1) for motor voltage
-        """
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-            action_mean, _ = self.actor(state_tensor)
-            return action_mean.cpu().numpy()[0][0]  # Return scalar action
+                self.moving_to_position = True
+                self.voltage_slider.set(0)  # Reset slider
+                self.status_label.config(text=f"Moving to {self.target_position:.1f}°...")
 
-    def run_controller(self, max_duration=30.0, target_balance_duration=10.0):
-        """
-        Run the controller on the real system
+                # Set green LED during movement
+                self.r_slider.set(0)
+                self.g_slider.set(999)
+                self.b_slider.set(0)
+            except ValueError:
+                self.status_label.config(text="Invalid position value")
 
-        Args:
-            max_duration (float): Maximum run time in seconds
-            target_balance_duration (float): Target duration to balance the pendulum
+    def update_position_control(self):
+        """Update position control"""
+        # Get current angle
+        current_angle = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
 
-        Returns:
-            bool: True if successfully balanced for target duration
-        """
-        print("Starting controller. Press Ctrl+C to stop...")
+        # Calculate position error (difference from target)
+        position_error = self.target_position - current_angle
 
-        # Reset encoders and prepare system
-        self.qube.resetPendulumEncoder()  # Reset only pendulum, keep motor position
-        self.qube.update()
+        # Check if we're close enough
+        if abs(position_error) < 0.5:
+            # We've reached the target
+            self.moving_to_position = False
+            self.motor_voltage = 0.0
 
-        # Clear the observation buffer
-        self.observation_buffer.clear()
+            # Set blue LED when done
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
 
-        # Clear history
-        for key in self.history:
-            self.history[key] = []
-
-        # Reset start time
-        self.start_time = time.time()
-
-        # Main control loop
-        balanced_start_time = None
-        balanced_duration = 0.0
-        max_voltage = 10.0  # Maximum voltage allowed
-
-        try:
-            while time.time() - self.start_time < max_duration:
-                # Get observation
-                state = self.get_observation()
-
-                # Select action using the model
-                action = self.select_action(state)
-
-                # Convert normalized action (-1, 1) to voltage
-                voltage = float(action) * max_voltage
-
-                # Apply voltage to the motor
-                self.qube.setMotorVoltage(voltage)
-                self.last_voltage = voltage  # Save for history
-
-                # Track balancing - pendulum is near upright when sin(alpha_norm) is near 0 and cos(alpha_norm) is near 1
-                pendulum_upright = abs(state[2]) < 0.3 and state[3] > 0.95  # sin close to 0, cos close to 1
-
-                # Update balanced duration tracking
-                if pendulum_upright:
-                    if balanced_start_time is None:
-                        balanced_start_time = time.time()
-                        self.qube.setRGB(0, 999, 0)  # Green when balancing
-                    balanced_duration = time.time() - balanced_start_time
-                    print(f"\rBalancing: {balanced_duration:.1f}s / {target_balance_duration:.1f}s", end="")
-
-                    # Check if balanced for target duration
-                    if balanced_duration >= target_balance_duration:
-                        print(f"\nSuccess! Balanced for {balanced_duration:.1f} seconds")
-                        break
-                else:
-                    balanced_start_time = None
-                    balanced_duration = 0.0
-                    self.qube.setRGB(999, 0, 0)  # Red when not balanced
-
-                # Brief sleep for timing
-                time.sleep(0.01)
-
-        except KeyboardInterrupt:
-            print("\nController interrupted by user")
-        finally:
-            # Stop the motor
-            self.qube.setMotorVoltage(0.0)
-            self.qube.setRGB(0, 0, 0)
-            self.qube.update()
-
-        # Return success status
-        return balanced_duration >= target_balance_duration
-
-    def plot_results(self):
-        """Plot the results of the controller run"""
-        if len(self.history['time']) == 0:
-            print("No data to plot")
+            self.status_label.config(text="Position reached")
             return
 
-        plt.figure(figsize=(12, 10))
+        # Simple proportional control
+        kp = 0.02  # Low gain
+        self.motor_voltage = kp * position_error
 
-        # Plot motor angle
-        plt.subplot(3, 1, 1)
-        plt.plot(self.history['time'], self.history['motor_angle'], 'b-')
-        plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
-        plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
-        plt.ylabel('Motor angle (rad)')
-        plt.title('Real System Performance')
-        plt.grid(True)
+        # Limit voltage for safety
+        self.motor_voltage = max(-1.0, min(1.0, self.motor_voltage))
 
-        # Plot pendulum angle
-        plt.subplot(3, 1, 2)
-        plt.plot(self.history['time'], self.history['pendulum_angle'], 'g-')
-        plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-        plt.ylabel('Pendulum angle (rad)')
-        plt.grid(True)
+    def stop_motor(self):
+        """Stop the motor"""
+        self.calibrating = False
+        self.moving_to_position = False
+        self.motor_voltage = 0.0
+        self.voltage_slider.set(0)
 
-        # Plot motor voltage
-        plt.subplot(3, 1, 3)
-        plt.plot(self.history['time'], self.history['motor_voltage'], 'r-')
-        plt.ylabel('Motor voltage (V)')
-        plt.xlabel('Time (s)')
-        plt.grid(True)
+        # Set blue LED when stopped
+        self.r_slider.set(0)
+        self.g_slider.set(0)
+        self.b_slider.set(999)
 
-        plt.tight_layout()
-        plt.savefig("real_system_performance.png")
-        plt.show()
+        self.status_label.config(text="Motor stopped")
+
+    def update_gui(self):
+        """Update the GUI and control the hardware - called continuously"""
+        # Update automatic control modes if active
+        if self.calibrating:
+            self.update_calibration()
+        elif self.moving_to_position:
+            self.update_position_control()
+
+        # Apply the current motor voltage - THIS IS CRITICAL TO DO ON EVERY LOOP!
+        self.qube.setMotorVoltage(self.motor_voltage)
+
+        # Apply RGB values
+        self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
+
+        # Update display information
+        motor_angle = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
+        pendulum_angle = self.qube.getPendulumAngle()
+        rpm = self.qube.getMotorRPM()
+
+        self.angle_label.config(text=f"{motor_angle:.1f}°")
+        self.pendulum_label.config(text=f"{pendulum_angle:.1f}°")
+        self.rpm_label.config(text=f"{rpm:.1f}")
+        self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
 
 
 def main():
-    # Path to the pretrained model
-    model_path = "sacpen7.pth"  # Update with your model path
+    print("Starting QUBE Controller...")
+    print("Will set corner position as zero")
 
-    # Create the controller
-    controller = SACController(model_path)
+    try:
+        # Initialize QUBE
+        qube = QUBE(COM_PORT, 115200)
 
-    # Calibrate the system
-    initial_position = controller.calibrate_system()
+        # Initial reset
+        qube.resetMotorEncoder()
+        qube.resetPendulumEncoder()
+        qube.setMotorVoltage(0.0)
+        qube.setRGB(0, 0, 999)  # Blue LED to start
+        qube.update()
 
-    # Run the controller
-    success = controller.run_controller(max_duration=60, target_balance_duration=10)
+        # Create GUI
+        root = tk.Tk()
+        app = SimpleCornerController(root, qube)
 
-    # Plot results
-    controller.plot_results()
+        # Main loop
+        while True:
+            qube.update()
+            app.update_gui()
+            root.update()
+            time.sleep(0.01)
 
-    if success:
-        print("Controller successfully balanced the pendulum!")
-    else:
-        print("Controller did not achieve target balance duration.")
+    except tk.TclError:
+        # Window closed
+        pass
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C
+        pass
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    finally:
+        # Final stop attempt
+        try:
+            qube.setMotorVoltage(0.0)
+            qube.update()
+            print("Motor stopped")
+        except:
+            pass
 
 
 if __name__ == "__main__":
