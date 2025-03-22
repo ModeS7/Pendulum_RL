@@ -137,7 +137,7 @@ def dynamics_step(state, t, vm):
 
 # Simulation environment for RL
 class PendulumEnv:
-    def __init__(self, dt=0.0115, max_steps=1300):  # 15 seconds at 50Hz
+    def __init__(self, dt=0.0115, max_steps=800):  # 15 seconds at 50Hz
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
@@ -242,7 +242,7 @@ class PendulumEnv:
         # Reward for being close to the optimal energy (inverted Gaussian)
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
-        return upright_reward + bonus + pos_penalty + limit_penalty + energy_reward
+        return upright_reward + bonus + limit_penalty + energy_reward
 
 
 # Actor (Policy) Network
@@ -492,8 +492,8 @@ def train():
     # Hyperparameters
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
-    max_episodes = 1000
-    max_steps = 750
+    max_episodes = 100
+    max_steps = 800
     batch_size = 256
     replay_buffer_size = 100000
     updates_per_step = 1
@@ -569,8 +569,9 @@ def train():
     print(f"Training completed in {training_time:.2f} seconds!")
 
     # Save trained model
-    torch.save(agent.actor.state_dict(), "sac_pendulum_actor.pth")
-    torch.save(agent.critic.state_dict(), "sac_pendulum_critic.pth")
+    timestamp = int(time())
+    torch.save(agent.actor.state_dict(), f"actor_{timestamp}.pth")
+    torch.save(agent.critic.state_dict(), f"critic_{timestamp}.pth")
 
     # Plot training progress
     plt.figure(figsize=(10, 5))
