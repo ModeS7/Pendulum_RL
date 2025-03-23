@@ -58,35 +58,13 @@ def compute_reward(state, voltage_change=0.0, params=None):
     # COMPONENT 6: Energy management reward
     E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2
     E_ref = p.Mp_g_Lp
-    E_diff = E_ref - E
-    energy_reward = 2.5 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
+    energy_reward = -0.15 * abs(E_ref - E)
 
     # COMPONENT 7: Stronger penalty for fast voltage changes
     voltage_change_penalty = -0.01 * voltage_change ** 2
 
 
-    """upright_reward = np.cos(alpha_norm)  # 1 when upright, -1 when downward
 
-    # Component 2: Penalty for high velocities
-    velocity_penalty = -0.01 * (theta_dot ** 2 + alpha_dot ** 2)
-
-    # Component 3: Penalty for arm position away from center
-    pos_penalty = -0.1 * theta ** 2
-
-    # Component 4: Extra reward for being very close to upright and stable
-    bonus = 5.0 if abs(alpha_norm) < 0.2 and abs(alpha_dot) < 1.0 else 0.0
-
-    # Component 5: Penalty for hitting limits
-    limit_penalty = -40.0 if (abs(theta - p.THETA_MAX) < 0.1 or abs(theta - p.THETA_MIN) < 0.1) else 0.0
-
-    # Component 6: Energy management reward
-    E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2  # Current energy
-    E_ref = p.Mp_g_Lp  # Energy at upright position (target energy)
-    E_diff = abs(E - E_ref)  # Difference from optimal energy
-    energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
-
-    # Component 7: NEW - Penalty for fast voltage changes
-    voltage_change_penalty = -0.01 * voltage_change ** 2"""
 
     # Individual components
     components = {

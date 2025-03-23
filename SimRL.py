@@ -315,7 +315,7 @@ class PendulumEnv:
 
         # COMPONENT 3: Smooth penalty for arm position away from center
         # Again using tanh for smooth bounded penalties
-        pos_penalty = -0.5 * np.tanh(theta ** 2 / 2.0)
+        pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
 
         # COMPONENT 4: Smoother bonus for being close to upright position
         # Instead of a hard cutoff, use a continuous Gaussian-like function
@@ -336,10 +336,9 @@ class PendulumEnv:
 
         # COMPONENT 6: Energy management reward
         # This component is already quite smooth, just adjust scaling
-        E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2
-        E_ref = p.Mp_g_Lp
-        E_diff = abs(E - E_ref)
-        energy_reward = 2.5 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
+        energy_reward = -0.15 * abs(p.Mp_g_Lp * (np.cos(alpha_norm))
+                            + 0.5 * p.Jp * alpha_dot ** 2
+                            - p.Mp_g_Lp)
 
         # COMPONENT 7: Stronger penalty for fast voltage changes
         # Increase coefficient to discourage rapid control changes
@@ -349,7 +348,7 @@ class PendulumEnv:
         reward = (
                 upright_reward
                 #+ velocity_penalty
-                + pos_penalty
+                #+ pos_penalty
                 + bonus
                 + limit_penalty
                 + energy_reward
