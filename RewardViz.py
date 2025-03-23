@@ -58,7 +58,7 @@ def compute_reward(state, voltage_change=0.0, params=None):
     # COMPONENT 6: Energy management reward
     E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2
     E_ref = p.Mp_g_Lp
-    energy_reward = -0.15 * abs(E_ref - E)
+    energy_reward = 2 - 0.15 * abs(E_ref - E)
 
     # COMPONENT 7: Stronger penalty for fast voltage changes
     voltage_change_penalty = -0.01 * voltage_change ** 2

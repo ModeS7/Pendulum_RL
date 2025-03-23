@@ -336,7 +336,7 @@ class PendulumEnv:
 
         # COMPONENT 6: Energy management reward
         # This component is already quite smooth, just adjust scaling
-        energy_reward = -0.15 * abs(p.Mp_g_Lp * (np.cos(alpha_norm))
+        energy_reward = 2 - 0.15 * abs(p.Mp_g_Lp * (np.cos(alpha_norm))
                             + 0.5 * p.Jp * alpha_dot ** 2
                             - p.Mp_g_Lp)
 
