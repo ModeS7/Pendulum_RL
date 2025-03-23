@@ -75,6 +75,11 @@ class SystemParameters:
     Mp_g_Lp: float = 0.0
     Jp: float = 0.0
 
+    # Additional precomputed values for optimization
+    mL_LL_squared: float = 0.0
+    LA_squared: float = 0.0
+    LA_LL: float = 0.0
+
     def randomize(self, randomization_factor=0.1, dt_randomization_factor=0.0):
         """Randomize physical parameters and timestep"""
         # Reset current dt
@@ -123,6 +128,11 @@ class SystemParameters:
         self.Mp_g_Lp = self.mL * self.g * self.LL
         self.Jp = (1 / 3) * self.mL * self.LL ** 2  # Pendulum moment of inertia
 
+        # Additional precomputed values for optimization
+        self.mL_LL_squared = self.mL * self.LL ** 2
+        self.LA_squared = self.LA ** 2
+        self.LA_LL = self.LA * self.LL
+
 
 # ============= Pendulum Environment =============
 class PendulumEnv:
@@ -158,11 +168,18 @@ class PendulumEnv:
         self.params = SystemParameters()
         self.params.dt = dt  # Set the base dt in parameters
 
+        # Add a variable to track previous voltage
+        self.previous_voltage = 0.0
+
+        # Pre-allocate arrays for optimization
+        self._temp_state = np.zeros(4)
+
     def reset(self, random_init=True):
         # Reset state tracking
         self.elapsed_time = 0.0
         self.dt_history = []
         self.step_count = 0
+        self.previous_voltage = 0.0
 
         # Randomize system parameters for this episode
         self.params.randomize(self.randomization_factor, 0.0)  # Don't randomize dt during reset
@@ -228,6 +245,10 @@ class PendulumEnv:
         else:
             voltage = float(action) * self.max_voltage
 
+        # Calculate voltage change for reward function
+        voltage_change = voltage - self.previous_voltage
+        self.previous_voltage = voltage  # Update for next step
+
         # RK4 integration with current dt
         self.state = self._rk4_step(self.state, voltage, dt)
 
@@ -240,7 +261,7 @@ class PendulumEnv:
         self.time_buffer.append(self.elapsed_time)
 
         # Get reward
-        reward = self._compute_reward()
+        reward = self._compute_reward(voltage_change)
 
         # Check if done
         self.step_count += 1
@@ -250,48 +271,16 @@ class PendulumEnv:
 
     def _dynamics_step(self, state, t, vm):
         """Calculate system dynamics with randomized parameters"""
-        theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
-        p = self.params  # Get the current randomized parameters
+        # Pack parameters for numba function
+        p = self.params
+        params = np.array([
+            p.Rm, p.Km, p.DA, p.half_mL_LL_g, p.half_mL_LL_LA,
+            p.quarter_mL_LL_squared, p.Mp_g_Lp, p.mA, p.LA_squared,
+            p.mL_LL_squared, p.JA, p.JL, p.DL
+        ], dtype=np.float64)
 
-        # Check theta limits - implement hard stops
-        if (theta_m >= self.THETA_MAX and theta_m_dot > 0) or (theta_m <= self.THETA_MIN and theta_m_dot < 0):
-            theta_m_dot = 0.0  # Stop the arm motion at the limits
-
-        # Apply dead zone
-        if -0.2 <= vm <= 0.2:
-            vm = 0.0
-
-        # Motor torque calculation with randomized params
-        im = (vm - p.Km * theta_m_dot) / p.Rm
-        Tm = p.Km * im
-
-        # Equations of motion coefficients
-        M11 = p.mL * p.LA ** 2 + p.quarter_mL_LL_squared - p.quarter_mL_LL_squared * np.cos(theta_L) ** 2 + p.JA
-        M12 = -p.half_mL_LL_LA * np.cos(theta_L)
-        C1 = 0.5 * p.mL * p.LL ** 2 * np.sin(theta_L) * np.cos(theta_L) * theta_m_dot * theta_L_dot
-        C2 = p.half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
-
-        M21 = p.half_mL_LL_LA * np.cos(theta_L)
-        M22 = p.JL + p.quarter_mL_LL_squared
-        C3 = -p.quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
-        G = p.half_mL_LL_g * np.sin(theta_L)
-
-        # Calculate determinant for matrix inversion
-        det_M = M11 * M22 - M12 * M21
-
-        # Handle near-singular matrix
-        if abs(det_M) < 1e-10:
-            theta_m_ddot, theta_L_ddot = 0, 0
-        else:
-            # Right-hand side of equations
-            RHS1 = Tm - C1 - C2 - p.DA * theta_m_dot
-            RHS2 = -G - p.DL * theta_L_dot - C3
-
-            # Solve for accelerations
-            theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
-            theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
-
-        return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
+        # Call the numba-optimized function
+        return dynamics_numba(state, t, vm, params, self.THETA_MAX, self.THETA_MIN)
 
     def _rk4_step(self, state, vm, dt):
         """4th-order Runge-Kutta integrator step with specified dt"""
@@ -309,35 +298,126 @@ class PendulumEnv:
 
         return enforce_theta_limits(new_state, self.THETA_MIN, self.THETA_MAX)
 
-    def _compute_reward(self):
-        """Calculate reward based on current state"""
+    def _compute_reward(self, voltage_change=0.0):
+        """Calculate reward based on current state with smoother transitions"""
         theta, alpha, theta_dot, alpha_dot = self.state
         alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
         p = self.params
 
-        # Component 1: Reward for pendulum being close to upright
-        upright_reward = np.cos(alpha_norm)  # 1 when upright, -1 when downward
+        # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
+        # Uses cosine which is a naturally smooth function
+        upright_reward = 2.0 * np.cos(alpha_norm)
 
-        # Component 2: Penalty for high velocities
-        velocity_penalty = -0.01 * (theta_dot ** 2 + alpha_dot ** 2)
+        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
+        # Use tanh to create a smoother penalty that doesn't grow excessively large
+        velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0  # Normalize velocities
+        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
 
-        # Component 3: Penalty for arm position away from center
-        pos_penalty = -0.01 * theta ** 2
+        # COMPONENT 3: Smooth penalty for arm position away from center
+        # Again using tanh for smooth bounded penalties
+        pos_penalty = -0.5 * np.tanh(theta ** 2 / 2.0)
 
-        # Component 4: Extra reward for being very close to upright and stable
-        bonus = 5.0 if abs(alpha_norm) < 0.2 and abs(alpha_dot) < 1.0 else 0.0
+        # COMPONENT 4: Smoother bonus for being close to upright position
+        # Instead of a hard cutoff, use a continuous Gaussian-like function
+        upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
+        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
 
-        # Component 5: Penalty for hitting limits
-        limit_penalty = -10.0 if (abs(theta - self.THETA_MAX) < 0.02 or abs(theta - self.THETA_MIN) < 0.02) else 0.0
+        # COMPONENT 5: Smoother penalty for approaching limits
+        # Create a continuous penalty that increases as the arm approaches limits
+        # Map the distance to limits to a 0-1 range, with 1 being at the limit
+        theta_max_dist = np.clip(1.0 - abs(theta - self.THETA_MAX) / 0.5, 0, 1)
+        theta_min_dist = np.clip(1.0 - abs(theta - self.THETA_MIN) / 0.5, 0, 1)
+        limit_distance = max(theta_max_dist, theta_min_dist)
 
-        # Component 6: Energy management reward
-        E = p.Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * p.Jp * alpha_dot ** 2  # Current energy
-        E_ref = p.Mp_g_Lp  # Energy at upright position (target energy)
-        E_diff = abs(E - E_ref)  # Difference from optimal energy
-        energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
+        # Apply a nonlinear function to create gradually increasing penalty
+        # The penalty grows more rapidly as the arm gets very close to limits
+        limit_penalty = -10.0 * limit_distance ** 3
 
-        return upright_reward + bonus + limit_penalty + energy_reward
+        # COMPONENT 6: Energy management reward
+        # This component is already quite smooth, just adjust scaling
+        E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2
+        E_ref = p.Mp_g_Lp
+        E_diff = abs(E - E_ref)
+        energy_reward = 2.5 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
+        # COMPONENT 7: Stronger penalty for fast voltage changes
+        # Increase coefficient to discourage rapid control changes
+        voltage_change_penalty = -0.01 * voltage_change ** 2
+
+        # Combine all components
+        reward = (
+                upright_reward
+                #+ velocity_penalty
+                + pos_penalty
+                + bonus
+                + limit_penalty
+                + energy_reward
+                #+ voltage_change_penalty
+        )
+
+        return reward
+
+@nb.njit(fastmath=True, cache=True)
+def dynamics_numba(state, t, vm, params, THETA_MAX, THETA_MIN):
+    """Numba-optimized calculation of system dynamics"""
+    theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
+
+    # Check theta limits - implement hard stops
+    if (theta_m >= THETA_MAX and theta_m_dot > 0) or (theta_m <= THETA_MIN and theta_m_dot < 0):
+        theta_m_dot = 0.0  # Stop the arm motion at the limits
+
+    # Apply dead zone
+    if -0.2 <= vm <= 0.2:
+        vm = 0.0
+
+    # Motor torque calculation with randomized params
+    im = (vm - params[1] * theta_m_dot) / params[0]  # params[0]=Rm, params[1]=Km
+    Tm = params[1] * im
+
+    # Use precomputed values for optimization
+    sin_theta_L = np.sin(theta_L)
+    cos_theta_L = np.cos(theta_L)
+
+    # Equations of motion coefficients using precomputed values
+    M11 = params[7] * params[8] + params[5] - params[5] * cos_theta_L ** 2 + params[
+        10]  # mL*LA^2 + quarter_mL_LL_squared - quarter_mL_LL_squared*cos^2 + JA
+    M12 = -params[4] * cos_theta_L  # -half_mL_LL_LA * cos
+    C1 = params[
+             5] * sin_theta_L * cos_theta_L * theta_m_dot * theta_L_dot  # 0.5*mL*LL^2 * sin*cos * theta_m_dot*theta_L_dot
+    C2 = params[4] * sin_theta_L * theta_L_dot ** 2  # half_mL_LL_LA * sin * theta_L_dot^2
+
+    M21 = params[4] * cos_theta_L  # half_mL_LL_LA * cos
+    M22 = params[11] + params[5]  # JL + quarter_mL_LL_squared
+    C3 = -params[5] * cos_theta_L * sin_theta_L * theta_m_dot ** 2  # -quarter_mL_LL_squared * cos*sin * theta_m_dot^2
+    G = params[3] * sin_theta_L  # half_mL_LL_g * sin
+
+    # Calculate determinant for matrix inversion
+    det_M = M11 * M22 - M12 * M21
+
+    # Handle near-singular matrix
+    if abs(det_M) < 1e-10:
+        theta_m_ddot, theta_L_ddot = 0, 0
+    else:
+        # Right-hand side of equations
+        RHS1 = Tm - C1 - C2 - params[2] * theta_m_dot  # Tm - C1 - C2 - DA*theta_m_dot
+        RHS2 = -G - params[12] * theta_L_dot - C3  # -G - DL*theta_L_dot - C3
+
+        # Solve for accelerations
+        theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
+        theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
+
+    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
+
+@nb.njit(fastmath=True, cache=True)
+def calculate_balanced_time(states, dt):
+    """Calculate time spent with pendulum balanced"""
+    balanced_time = 0.0
+    for i in range(len(states)):
+        alpha_norm = normalize_angle(states[i, 1] + np.pi)
+        if abs(alpha_norm) < 0.17:  # ~10 degrees from vertical
+            balanced_time += dt
+    return balanced_time
 
 # ============= Neural Network Models =============
 class Actor(nn.Module):
@@ -455,7 +535,7 @@ class SACAgent:
             hidden_dim=256,
             lr=3e-4,
             gamma=0.99,
-            tau=0.005,
+            tau=0.001,
             alpha=0.2,
             automatic_entropy_tuning=True
     ):
@@ -472,6 +552,9 @@ class SACAgent:
         # Copy parameters to target network
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
+
+        # Save original state dicts before JIT compilation in case we need to restore
+        self._original_critic_state_dict = self.critic.state_dict()
 
         # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
@@ -492,6 +575,27 @@ class SACAgent:
 
         if automatic_entropy_tuning:
             self.log_alpha = self.log_alpha.to(self.device)
+
+        # JIT compile only the critic networks - Actor needs the sample method which doesn't work well with JIT
+        try:
+            # Don't JIT compile the actor since we need access to its sample method
+            # self.actor = torch.jit.script(self.actor)
+
+            # Only JIT compile the critics which are used in a more straightforward way
+            self.critic = torch.jit.script(self.critic)
+            self.critic_target = torch.jit.script(self.critic_target)
+            print("Successfully compiled critic networks with torch.jit")
+        except Exception as e:
+            print(f"Could not JIT compile networks: {e}")
+            # Restore original networks if compilation failed
+            self.critic = Critic(state_dim, action_dim, hidden_dim).to(self.device)
+            self.critic_target = Critic(state_dim, action_dim, hidden_dim).to(self.device)
+
+            # If we're loading from a checkpoint, we need to reload the state dict
+            if hasattr(self, '_original_critic_state_dict'):
+                self.critic.load_state_dict(self._original_critic_state_dict)
+                for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                    target_param.data.copy_(param.data)
 
     def select_action(self, state, evaluate=False):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -545,6 +649,7 @@ class SACAgent:
         # Optimize critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         # Update actor
@@ -558,6 +663,7 @@ class SACAgent:
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
         # Update automatic entropy tuning parameter
@@ -570,9 +676,10 @@ class SACAgent:
 
             self.alpha = self.log_alpha.exp()
 
-        # Soft update target networks
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        # Soft update target networks - use in-place operations for efficiency
+        with torch.no_grad():
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.mul_(1 - self.tau).add_(param.data, alpha=self.tau)
 
         return {
             'critic_loss': critic_loss.item(),
@@ -581,9 +688,9 @@ class SACAgent:
 
 
 # ============= Visualization Functions =============
-def plot_episode(episode, states, actions, dt, reward, balanced_time=None, params=None,
-                 prefix="episode", delay_steps=None, env=None, randomized=False):
-    """Generic plotting function for episode visualization"""
+def plot_episode(episode, states, actions, dt, total_reward, balanced_time=None, params=None,
+                 prefix="episode", delay_steps=None, env=None, randomized=False, rewards=None):
+    """Generic plotting function for episode visualization with reward subplot"""
     # Extract components
     thetas = states[:, 0]
     alphas = states[:, 1]
@@ -611,11 +718,14 @@ def plot_episode(episode, states, actions, dt, reward, balanced_time=None, param
     elif delay_steps is not None:
         delay_info = f"Delay: {delay_steps} steps ({delay_steps * current_dt * 1000:.1f}ms), "
 
+    # Determine number of subplots (5 if rewards are provided, 4 otherwise)
+    num_subplots = 5 if rewards is not None else 4
+
     # Plot results
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=(12, 12 if rewards is not None else 10))
 
     # Plot arm angle
-    plt.subplot(4, 1, 1)
+    plt.subplot(num_subplots, 1, 1)
     plt.plot(t, thetas, 'b-')
     plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
     plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
@@ -628,16 +738,16 @@ def plot_episode(episode, states, actions, dt, reward, balanced_time=None, param
         else:  # It's a dict
             param_text = f"{delay_info}Rm={params['Rm']:.2f}, Km={params['Km']:.4f}, mL={params['mL']:.4f}, LL={params['LL']:.4f}"
         bal_text = f" | Balanced: {balanced_time:.2f}s" if balanced_time is not None else ""
-        plt.title(f'{prefix.capitalize()} {episode + 1} | Reward: {reward:.2f}{bal_text}\n{param_text}')
+        plt.title(f'{prefix.capitalize()} {episode + 1} | Reward: {total_reward:.2f}{bal_text}\n{param_text}')
     else:
         bal_text = f" | Balanced: {balanced_time:.2f}s" if balanced_time is not None else ""
-        plt.title(f'{prefix.capitalize()} {episode + 1} | Reward: {reward:.2f}{bal_text}\n{delay_info}')
+        plt.title(f'{prefix.capitalize()} {episode + 1} | Reward: {total_reward:.2f}{bal_text}\n{delay_info}')
 
     plt.legend()
     plt.grid(True)
 
     # Plot pendulum angle
-    plt.subplot(4, 1, 2)
+    plt.subplot(num_subplots, 1, 2)
     plt.plot(t, alpha_normalized, 'g-')
     plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
     plt.axhline(y=0.17, color='r', linestyle=':', alpha=0.5)  # Upper balanced threshold
@@ -646,13 +756,28 @@ def plot_episode(episode, states, actions, dt, reward, balanced_time=None, param
     plt.grid(True)
 
     # Plot pendulum angular velocity
-    plt.subplot(4, 1, 3)
+    plt.subplot(num_subplots, 1, 3)
     plt.plot(t, alpha_dots, 'g-')
     plt.ylabel('Pendulum velocity (rad/s)')
     plt.grid(True)
 
+    # Plot rewards if provided
+    if rewards is not None:
+        plt.subplot(num_subplots, 1, 4)
+        plt.plot(t[:len(rewards)], rewards, 'm-')
+        plt.ylabel('Reward')
+        plt.grid(True)
+
+        # Add cumulative reward line
+        cum_rewards = np.cumsum(rewards)
+        ax2 = plt.twinx()
+        ax2.plot(t[:len(rewards)], cum_rewards, 'c--', alpha=0.7)
+        ax2.set_ylabel('Cumulative reward', color='c')
+        ax2.tick_params(axis='y', labelcolor='c')
+
     # Plot control actions
-    plt.subplot(4, 1, 4)
+    plot_index = 5 if rewards is not None else 4
+    plt.subplot(num_subplots, 1, plot_index)
     plt.plot(t, actions * MAX_VOLTAGE, 'r-')  # Scale to actual voltage
     plt.xlabel('Time (s)')
     plt.ylabel('Control voltage (V)')
@@ -725,16 +850,22 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
                 if done:
                     break
 
+    # Set up progress tracking with tqdm
+    pbar = tqdm(range(episodes), desc="Training")
+
+    # Allocate arrays for episode data collection (to avoid repeated allocations)
+    episode_states_buffer = np.zeros((max_steps, 4))
+    episode_actions_buffer = np.zeros(max_steps)
+    episode_rewards_buffer = np.zeros(max_steps)  # New buffer for rewards
+
     # Training loop
-    for episode in range(episodes):
+    for episode in pbar:
         state = env.reset()  # Randomize parameters for this episode
         episode_reward = 0
 
         # If we're going to plot this episode, prepare to collect state data
         plot_this_episode = (episode + 1) % 10 == 0
-        if plot_this_episode:
-            episode_states = []
-            episode_actions = []
+        states_count = 0
 
         for step in range(max_steps):
             action = agent.select_action(state)
@@ -743,10 +874,12 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
             # Store transition in replay buffer
             replay_buffer.push(state, action, reward, next_state, done)
 
-            # If plotting, store the state and action
+            # If plotting, store the state, action, and reward
             if plot_this_episode:
-                episode_states.append(env.state.copy())
-                episode_actions.append(action)
+                episode_states_buffer[states_count] = env.state.copy()
+                episode_actions_buffer[states_count] = action
+                episode_rewards_buffer[states_count] = reward  # Store per-step reward
+                states_count += 1
 
             state = next_state
             episode_reward += reward
@@ -763,16 +896,18 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
         avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
         avg_rewards.append(avg_reward)
 
-        if (episode + 1) % 10 == 0:
-            print(f"Episode {episode + 1}/{episodes} | Reward: {episode_reward:.2f} | Avg: {avg_reward:.2f}")
+        # Update progress bar
+        pbar.set_postfix({'reward': f"{episode_reward:.2f}", 'avg': f"{avg_reward:.2f}"})
 
+        if (episode + 1) % 10 == 0:
             # Plot episode for visual progress tracking
+            print(f"Episode {episode + 1} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f}")
             if plot_this_episode:
-                balanced_time = calculate_balanced_time(np.array(episode_states), env.base_dt)
+                balanced_time = calculate_balanced_time(episode_states_buffer[:states_count], env.base_dt)
                 plot_episode(
                     episode,
-                    np.array(episode_states),
-                    np.array(episode_actions),
+                    episode_states_buffer[:states_count],
+                    episode_actions_buffer[:states_count],
                     env.base_dt,
                     episode_reward,
                     balanced_time,
@@ -780,13 +915,19 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
                     prefix="training",
                     randomized=True,
                     delay_steps=env.delay_steps,
-                    env=env
+                    env=env,
+                    rewards=episode_rewards_buffer[:states_count]  # Pass the collected rewards
                 )
 
         # Early stopping if well trained
-        if avg_reward > 5000 and episode > 200:  # Higher threshold for robust policy
+        """if avg_reward > 5000 and episode > 50:  # Higher threshold for robust policy
             print(f"Environment solved in {episode + 1} episodes!")
-            break
+            break"""
+
+        if (episode + 1) % 100 == 0:
+            # Save model periodically
+            timestamp = int(time())
+            torch.save(agent.actor.state_dict(), f"{episode}_actor_{timestamp}.pth")
 
     training_time = time() - start_time
     print(f"Training completed in {training_time:.2f} seconds!")
@@ -838,16 +979,7 @@ def load_model(model_path, critic_path=None, state_dim=6, action_dim=1, hidden_d
     return agent
 
 
-def calculate_balanced_time(states, dt):
-    """Calculate time spent with pendulum balanced"""
-    balanced_time = 0.0
-    for state in states:
-        alpha_norm = normalize_angle(state[1] + np.pi)
-        if abs(alpha_norm) < 0.17:  # ~10 degrees from vertical
-            balanced_time += dt
-    return balanced_time
-
-
+@nb.njit(fastmath=True, cache=True)
 def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
     """Evaluate an agent's performance in an environment"""
     performance = {
@@ -856,14 +988,15 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
         'params_used': [] if hasattr(env, 'params') else None
     }
 
+    # Pre-allocate arrays for episode data
+    states_history = np.zeros((env.max_steps, 4))
+    actions_history = np.zeros(env.max_steps)
+    rewards_history = np.zeros(env.max_steps)  # New array for rewards
+
     for episode in range(num_episodes):
         # Reset environment
         state = env.reset(random_init=True)
         total_reward = 0
-
-        # Store episode data
-        states_history = []
-        actions_history = []
 
         # Remember parameters for this episode if using randomization
         if hasattr(env, 'params'):
@@ -877,6 +1010,9 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
                 'g': env.params.g
             })
 
+        # Reset state counter
+        states_count = 0
+
         for step in range(env.max_steps):
             # Get deterministic action
             action = agent.select_action(state, evaluate=True)
@@ -885,8 +1021,10 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
             next_state, reward, done, _ = env.step(action)
 
             # Record data
-            states_history.append(env.state.copy())
-            actions_history.append(action)
+            states_history[states_count] = env.state.copy()
+            actions_history[states_count] = action
+            rewards_history[states_count] = reward  # Store per-step reward
+            states_count += 1
 
             # Update metrics
             total_reward += reward
@@ -896,7 +1034,7 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
                 break
 
         # Calculate balancing performance
-        balanced_time = calculate_balanced_time(np.array(states_history), env.base_dt)
+        balanced_time = calculate_balanced_time(states_history[:states_count], env.base_dt)
 
         # Store performance metrics
         performance['rewards'].append(total_reward)
@@ -908,8 +1046,8 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
         # Create visualization
         plot_episode(
             episode,
-            np.array(states_history),
-            np.array(actions_history),
+            states_history[:states_count],
+            actions_history[:states_count],
             env.base_dt,
             total_reward,
             balanced_time,
@@ -917,7 +1055,8 @@ def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
             prefix=prefix,
             randomized=hasattr(env, 'randomization_factor') and env.randomization_factor > 0,
             delay_steps=env.delay_steps if hasattr(env, 'delay_steps') else None,
-            env=env
+            env=env,
+            rewards=rewards_history[:states_count]  # Pass the collected rewards
         )
 
     # Create summary plot if multiple episodes
