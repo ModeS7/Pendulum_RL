@@ -47,6 +47,11 @@ def compute_reward(state, voltage_change=0.0, params=None):
     stability_factor = np.exp(-1.0 * alpha_dot ** 2)
     bonus = 3.0 * upright_closeness * stability_factor
 
+    # COMPONENT 4.5: Smoother cost for being close to downright position
+    upright_closeness = np.exp(-10.0 * alpha ** 2)
+    stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+    bonus += -1.5 * upright_closeness * stability_factor
+
     # COMPONENT 5: Smoother penalty for approaching limits
     THETA_MAX = p.THETA_MAX
     THETA_MIN = p.THETA_MIN
