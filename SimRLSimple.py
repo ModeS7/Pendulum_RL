@@ -216,34 +216,60 @@ class PendulumEnv:
         theta, alpha, theta_dot, alpha_dot = self.state
         alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
 
-        # Component 1: Reward for pendulum being close to upright
-        upright_reward = np.cos(alpha_norm)  # 1 when upright, -1 when downward
+        # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
+        # Uses cosine which is a naturally smooth function
+        upright_reward = 2.0 * np.cos(alpha_norm)
 
-        # Component 2: Penalty for high velocities
-        velocity_penalty = -0.01 * (theta_dot ** 2 + alpha_dot ** 2)
+        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
+        # Use tanh to create a smoother penalty that doesn't grow excessively large
+        velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0  # Normalize velocities
+        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
 
-        # Component 3: Penalty for arm position away from center
-        pos_penalty = -0.01 * theta ** 2
+        # COMPONENT 3: Smooth penalty for arm position away from center
+        # Again using tanh for smooth bounded penalties
+        pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
 
-        # Component 4: Extra reward for being very close to upright and stable
-        bonus = 0.0
-        if abs(alpha_norm) < 0.2 and abs(alpha_dot) < 1.0:
-            bonus = 5.0
+        # COMPONENT 4: Smoother bonus for being close to upright position
+        upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
+        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
 
-        # Component 5: Penalty for hitting limits
-        limit_penalty = 0.0
-        if abs(theta - THETA_MAX) < 0.01 or abs(theta - THETA_MIN) < 0.01:
-            limit_penalty = -10.0
+        # COMPONENT 4.5: Smoother cost for being close to downright position
+        # For new convention, downright is at π
+        downright_alpha = normalize_angle(alpha - np.pi)
+        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
 
-        # Component 6: Energy management reward
-        E = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2  # Current energy
-        E_ref = Mp_g_Lp  # Energy at upright position (target energy)
-        E_diff = abs(E - E_ref)  # Difference from optimal energy
-        # Reward for being close to the optimal energy (inverted Gaussian)
-        energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
+        # COMPONENT 5: Smoother penalty for approaching limits
+        # Create a continuous penalty that increases as the arm approaches limits
+        # Map the distance to limits to a 0-1 range, with 1 being at the limit
+        theta_max_dist = np.clip(1.0 - abs(theta - THETA_MAX) / 0.5, 0, 1)
+        theta_min_dist = np.clip(1.0 - abs(theta - THETA_MIN) / 0.5, 0, 1)
+        limit_distance = max(theta_max_dist, theta_min_dist)
 
-        return upright_reward + bonus + limit_penalty + energy_reward
+        # Apply a nonlinear function to create gradually increasing penalty
+        # The penalty grows more rapidly as the arm gets very close to limits
+        limit_penalty = -10.0 * limit_distance ** 3
 
+        # COMPONENT 6: Energy management reward
+        # This component is already quite smooth, just adjust scaling
+        energy_reward = 2 - 0.15 * abs(Mp_g_Lp * (np.cos(alpha_norm))
+                                       + 0.5 * Jp * alpha_dot ** 2
+                                       - Mp_g_Lp)
+
+
+        # Combine all components
+        reward = (
+                upright_reward
+                # + velocity_penalty
+                + pos_penalty
+                + bonus
+                + limit_penalty
+                + energy_reward
+        )
+
+        return reward
 
 # Actor (Policy) Network
 class Actor(nn.Module):
