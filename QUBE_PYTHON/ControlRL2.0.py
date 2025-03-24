@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import Button, Label, Frame, Scale, Entry, filedialog, IntVar, Checkbutton
+from tkinter import Button, Label, Frame, Scale, Entry, filedialog, IntVar, Checkbutton, StringVar, OptionMenu, \
+    messagebox
 from QUBE import QUBE
 import time
 import numpy as np
@@ -10,6 +11,7 @@ from torch.distributions import Normal
 import os
 import matplotlib.pyplot as plt
 from datetime import datetime
+import threading
 
 # Update with your COM port
 COM_PORT = "COM10"
@@ -125,9 +127,24 @@ class ReplayBuffer:
         self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            return None
         batch = np.random.choice(len(self.buffer), batch_size, replace=False)
         states, actions, rewards, next_states, dones = map(np.array, zip(*[self.buffer[i] for i in batch]))
         return states, actions, rewards, next_states, dones
+
+    def save_to_file(self, filename):
+        """Save buffer to file for later use"""
+        np.save(filename, self.buffer)
+        print(f"Saved {len(self.buffer)} transitions to {filename}")
+
+    def load_from_file(self, filename):
+        """Load buffer from file"""
+        if os.path.exists(filename):
+            data = np.load(filename, allow_pickle=True)
+            self.buffer = list(data)
+            self.position = len(self.buffer) % self.capacity
+            print(f"Loaded {len(self.buffer)} transitions from {filename}")
 
     def __len__(self):
         return len(self.buffer)
@@ -204,11 +221,12 @@ class SACAgent:
                 return action.cpu().numpy()[0]
 
     def update_parameters(self, memory, batch_size=256):
-        if len(memory) < batch_size:
+        # Sample batch from memory
+        batch = memory.sample(batch_size)
+        if batch is None:
             return None
 
-        # Sample batch from memory
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = batch
 
         state_batch = torch.FloatTensor(state_batch).to(self.device)
         action_batch = torch.FloatTensor(action_batch).to(self.device)
@@ -285,6 +303,7 @@ class SACAgent:
     def save(self, filename):
         torch.save(self.actor.state_dict(), filename + "_actor.pth")
         torch.save(self.critic.state_dict(), filename + "_critic.pth")
+        print(f"Model saved to {filename}_actor.pth and {filename}_critic.pth")
 
     def load_actor(self, filename):
         self.actor.load_state_dict(torch.load(filename, map_location=self.device))
@@ -297,7 +316,7 @@ class QUBEControllerWithRLTraining:
     def __init__(self, master, qube):
         self.master = master
         self.qube = qube
-        master.title("QUBE Controller with RL Training")
+        master.title("QUBE Controller with RL Training (Enhanced)")
 
         # Control state
         self.motor_voltage = 0.0
@@ -308,6 +327,11 @@ class QUBEControllerWithRLTraining:
         self.moving_to_position = False
         self.rl_model = None
         self.max_voltage = 10.0
+        self.auto_reset = False
+        self.last_update_time = time.time()
+        self.recording = False
+        self.record_buffer = []
+        self.emergency_stopped = False  # Flag to track if emergency stop occurred
 
         # State tracking
         self.prev_state = None
@@ -319,6 +343,7 @@ class QUBEControllerWithRLTraining:
         self.current_episode = 0
         self.balanced_time = 0.0
         self.episode_start_time = None
+        self.consecutive_bad_states = 0  # Counter for consecutive bad states
 
         # Episode statistics
         self.episode_rewards = []
@@ -332,33 +357,75 @@ class QUBEControllerWithRLTraining:
         self.state_dim = 6  # Our observation space
         self.action_dim = 1  # Motor voltage (normalized)
         self.agent = SACAgent(self.state_dim, self.action_dim)
-        self.replay_buffer = ReplayBuffer(100000)  # 100k capacity
+        self.replay_buffer = ReplayBuffer(1000000)  # 1M capacity for more stable learning
 
         # Training settings
-        self.batch_size = 256
+        self.batch_size = 256*32  # Increased batch size
         self.updates_per_step = 1
-        self.exploration_prob = 0.2  # Probability of exploration
-        self.train_every_n_steps = 10  # Update model every n steps
-        self.save_policy_every_n_episodes = 5  # Save policy every n episodes
-        self.max_episode_steps = 1300  # Maximum steps per episode (15s at ~86Hz)
+        self.exploration_prob = 0.2  # Initial exploration rate
+        self.train_every_n_steps = 10
+        self.save_policy_every_n_episodes = 5
+        self.max_episode_steps = 1300  # Extended maximum episode length (around 30s at 86Hz)
+        self.warmup_steps = 200  # Warmup steps before enabling termination conditions
+        self.consecutive_limit = 50  # Number of consecutive bad states to end episode
+        self.termination_angle = 3.0  # ~170 degrees from upright (almost completely fallen)
+        self.min_steps_between_episodes = 100  # Min steps before starting new episode
+        self.learning_rate = 3e-4  # Learning rate for the agent
+        self.auto_reset_time = 15.0  # Time in seconds before auto-reset when balanced
+        self.max_motor_angle = 200.0  # Maximum motor angle in degrees before stopping
+
+        # Settings for different difficulty levels
+        self.difficulty_presets = {
+            'Easy': {
+                'exploration': 0.4,
+                'termination_angle': 3.0,
+                'consecutive_limit': 60,
+                'min_steps_between_episodes': 150,
+                'warmup_steps': 250,
+                'max_motor_angle': 130.0
+            },
+            'Medium': {
+                'exploration': 0.2,
+                'termination_angle': 2.8,
+                'consecutive_limit': 40,
+                'min_steps_between_episodes': 100,
+                'warmup_steps': 200,
+                'max_motor_angle': 130.0
+            },
+            'Hard': {
+                'exploration': 0.1,
+                'termination_angle': 2.6,
+                'consecutive_limit': 30,
+                'min_steps_between_episodes': 50,
+                'warmup_steps': 100,
+                'max_motor_angle': 130.0
+            }
+        }
 
         # Create GUI elements
         self.create_gui()
 
     def create_gui(self):
-        # Main control frame
-        control_frame = Frame(self.master, padx=10, pady=10)
-        control_frame.pack()
+        # Main frame with better spacing
+        main_frame = Frame(self.master)
+        main_frame.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+
+        # Control frame
+        control_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        control_frame.pack(fill=tk.X)
 
         # Calibrate button
-        self.calibrate_btn = Button(control_frame, text="Calibrate (Set Corner as Zero)",
+        calibrate_frame = Frame(control_frame)
+        calibrate_frame.grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+
+        self.calibrate_btn = Button(calibrate_frame, text="Calibrate (Set Corner as Zero)",
                                     command=self.calibrate,
                                     width=25, height=2)
-        self.calibrate_btn.grid(row=0, column=0, padx=5, pady=5)
+        self.calibrate_btn.pack(side=tk.LEFT, padx=5)
 
-        # RL Model buttons
+        # RL Control frame
         rl_frame = Frame(control_frame)
-        rl_frame.grid(row=1, column=0, pady=10)
+        rl_frame.grid(row=1, column=0, pady=10, sticky=tk.W)
 
         self.load_model_btn = Button(rl_frame, text="Load RL Model",
                                      command=self.load_rl_model,
@@ -370,145 +437,456 @@ class QUBEControllerWithRLTraining:
                                      width=15, state=tk.DISABLED)
         self.rl_control_btn.grid(row=0, column=1, padx=5)
 
-        # RL Training controls
-        training_frame = Frame(control_frame)
-        training_frame.grid(row=2, column=0, pady=10)
+        # RL Training frame with reorganized controls
+        training_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        training_frame.pack(fill=tk.X, pady=5)
+
+        # Training header
+        Label(training_frame, text="Training Controls", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        # Training enable checkbox
+        training_ctrl_frame = Frame(training_frame)
+        training_ctrl_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
 
         self.training_var = IntVar()
-        self.training_check = Checkbutton(training_frame, text="Enable Training",
+        self.training_check = Checkbutton(training_ctrl_frame, text="Enable Training",
                                           variable=self.training_var,
                                           command=self.toggle_training)
-        self.training_check.grid(row=0, column=0, padx=5)
+        self.training_check.grid(row=0, column=0, padx=5, sticky=tk.W)
 
-        Label(training_frame, text="Exploration:").grid(row=0, column=1, padx=5)
-        self.exploration_slider = Scale(training_frame, from_=0, to=100,
-                                        orient=tk.HORIZONTAL, length=200,
+        # Auto-reset checkbox
+        self.auto_reset_var = IntVar()
+        self.auto_reset_check = Checkbutton(training_ctrl_frame, text="Auto-Reset When Balanced",
+                                            variable=self.auto_reset_var,
+                                            command=self.toggle_auto_reset)
+        self.auto_reset_check.grid(row=0, column=1, padx=15, sticky=tk.W)
+
+        # Difficulty level selection
+        difficulty_frame = Frame(training_frame)
+        difficulty_frame.grid(row=2, column=0, sticky=tk.W, pady=5)
+
+        Label(difficulty_frame, text="Difficulty:").grid(row=0, column=0, padx=5, sticky=tk.W)
+        self.difficulty_var = StringVar()
+        self.difficulty_var.set("Medium")  # Default
+        difficulty_options = ["Easy", "Medium", "Hard"]
+        difficulty_menu = OptionMenu(difficulty_frame, self.difficulty_var, *difficulty_options,
+                                     command=self.set_difficulty)
+        difficulty_menu.config(width=10)
+        difficulty_menu.grid(row=0, column=1, padx=5, sticky=tk.W)
+
+        # Exploration rate
+        Label(difficulty_frame, text="Exploration:").grid(row=0, column=2, padx=15, sticky=tk.W)
+        self.exploration_slider = Scale(difficulty_frame, from_=0, to=100,
+                                        orient=tk.HORIZONTAL, length=150,
                                         command=self.set_exploration)
         self.exploration_slider.set(int(self.exploration_prob * 100))
-        self.exploration_slider.grid(row=0, column=2, padx=5)
+        self.exploration_slider.grid(row=0, column=3, padx=5, sticky=tk.W)
 
-        save_frame = Frame(training_frame)
-        save_frame.grid(row=1, column=0, columnspan=3, pady=5)
+        # Learning rate
+        lr_frame = Frame(training_frame)
+        lr_frame.grid(row=3, column=0, sticky=tk.W, pady=5)
 
-        self.save_model_btn = Button(save_frame, text="Save Current Model",
+        Label(lr_frame, text="Learning Rate:").grid(row=0, column=0, padx=5, sticky=tk.W)
+        lr_values = ["0.01", "0.005", "0.001", "0.0005", "0.0001", "0.00005"]
+        self.lr_var = StringVar()
+        self.lr_var.set("0.0003")  # Default value matches 3e-4
+        lr_menu = OptionMenu(lr_frame, self.lr_var, *lr_values, command=self.set_learning_rate)
+        lr_menu.config(width=8)
+        lr_menu.grid(row=0, column=1, padx=5, sticky=tk.W)
+
+        # Episode management buttons
+        episode_frame = Frame(training_frame)
+        episode_frame.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        self.save_model_btn = Button(episode_frame, text="Save Model",
                                      command=self.save_model,
-                                     width=20, state=tk.DISABLED)
+                                     width=12, state=tk.DISABLED)
         self.save_model_btn.grid(row=0, column=0, padx=5)
 
-        self.reset_episode_btn = Button(save_frame, text="Reset Episode",
+        self.reset_episode_btn = Button(episode_frame, text="Reset Episode",
                                         command=self.reset_episode,
-                                        width=15, state=tk.DISABLED)
+                                        width=12, state=tk.DISABLED)
         self.reset_episode_btn.grid(row=0, column=1, padx=5)
 
-        # Move to position input and button
-        position_frame = Frame(control_frame)
-        position_frame.grid(row=3, column=0, pady=10)
+        self.save_buffer_btn = Button(episode_frame, text="Save Buffer",
+                                      command=self.save_replay_buffer,
+                                      width=12, state=tk.DISABLED)
+        self.save_buffer_btn.grid(row=0, column=2, padx=5)
 
-        Label(position_frame, text="Target Position (degrees):").grid(row=0, column=0, padx=5)
-        self.position_entry = Entry(position_frame, width=10)
-        self.position_entry.grid(row=0, column=1, padx=5)
+        self.load_buffer_btn = Button(episode_frame, text="Load Buffer",
+                                      command=self.load_replay_buffer,
+                                      width=12)
+        self.load_buffer_btn.grid(row=0, column=3, padx=5)
+
+        # Resume training button (hidden by default)
+        self.resume_frame = Frame(training_frame)
+        self.resume_training_btn = Button(self.resume_frame, text="RESUME TRAINING",
+                                          command=self.resume_training_after_emergency,
+                                          width=20, bg="yellow", fg="black", font=("Arial", 10, "bold"))
+        self.resume_training_btn.pack(pady=5)
+
+        # Advanced settings expandable section
+        self.show_advanced = IntVar()
+        self.advanced_check = Checkbutton(training_frame, text="Show Advanced Settings",
+                                          variable=self.show_advanced,
+                                          command=self.toggle_advanced_settings)
+        self.advanced_check.grid(row=5, column=0, sticky=tk.W, pady=5)
+
+        # Advanced settings frame (initially hidden)
+        self.advanced_frame = Frame(training_frame)
+
+        # Terminal conditions
+        Label(self.advanced_frame, text="Termination Angle (rad):").grid(row=0, column=0, padx=5, sticky=tk.W)
+        self.term_angle_entry = Entry(self.advanced_frame, width=6)
+        self.term_angle_entry.insert(0, str(self.termination_angle))
+        self.term_angle_entry.grid(row=0, column=1, padx=5, sticky=tk.W)
+
+        Label(self.advanced_frame, text="Consecutive Bad States:").grid(row=1, column=0, padx=5, sticky=tk.W)
+        self.consecutive_entry = Entry(self.advanced_frame, width=6)
+        self.consecutive_entry.insert(0, str(self.consecutive_limit))
+        self.consecutive_entry.grid(row=1, column=1, padx=5, sticky=tk.W)
+
+        Label(self.advanced_frame, text="Max Motor Angle (deg):").grid(row=2, column=0, padx=5, sticky=tk.W)
+        self.max_motor_entry = Entry(self.advanced_frame, width=6)
+        self.max_motor_entry.insert(0, str(self.max_motor_angle))
+        self.max_motor_entry.grid(row=2, column=1, padx=5, sticky=tk.W)
+
+        Label(self.advanced_frame, text="Warmup Steps:").grid(row=0, column=2, padx=15, sticky=tk.W)
+        self.warmup_entry = Entry(self.advanced_frame, width=6)
+        self.warmup_entry.insert(0, str(self.warmup_steps))
+        self.warmup_entry.grid(row=0, column=3, padx=5, sticky=tk.W)
+
+        Label(self.advanced_frame, text="Min Steps Between Episodes:").grid(row=1, column=2, padx=15, sticky=tk.W)
+        self.min_steps_entry = Entry(self.advanced_frame, width=6)
+        self.min_steps_entry.insert(0, str(self.min_steps_between_episodes))
+        self.min_steps_entry.grid(row=1, column=3, padx=5, sticky=tk.W)
+
+        Button(self.advanced_frame, text="Apply Settings",
+               command=self.apply_advanced_settings, width=15).grid(
+            row=2, column=0, columnspan=4, pady=10)
+
+        # Arm Position Control frame
+        position_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        position_frame.pack(fill=tk.X, pady=5)
+
+        Label(position_frame, text="Arm Position Control", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        Label(position_frame, text="Target Position (degrees):").grid(row=1, column=0, padx=5, sticky=tk.W)
+        self.position_entry = Entry(position_frame, width=8)
+        self.position_entry.grid(row=1, column=1, padx=5, sticky=tk.W)
         self.position_entry.insert(0, "0.0")
 
         self.move_btn = Button(position_frame, text="Move to Position",
                                command=self.start_move_to_position, width=15)
-        self.move_btn.grid(row=0, column=2, padx=5)
+        self.move_btn.grid(row=1, column=2, padx=5, sticky=tk.W)
 
-        # Stop button
-        self.stop_btn = Button(control_frame, text="STOP MOTOR",
-                               command=self.stop_motor,
-                               width=20, height=2,
-                               bg="red", fg="white")
-        self.stop_btn.grid(row=4, column=0, pady=10)
+        # Add quick position buttons
+        quick_pos_frame = Frame(position_frame)
+        quick_pos_frame.grid(row=2, column=0, columnspan=3, pady=10, sticky=tk.W)
 
-        # Manual voltage control
-        self.voltage_slider = Scale(
-            control_frame,
-            from_=-self.max_voltage,
-            to=self.max_voltage,
-            orient=tk.HORIZONTAL,
-            label="Manual Voltage",
-            length=400,
-            resolution=0.1,
-            command=self.set_manual_voltage
-        )
+        positions = [("0°", "0"), ("45°", "45"), ("90°", "90"), ("-45°", "-45"), ("-90°", "-90")]
+        for i, (label, value) in enumerate(positions):
+            Button(quick_pos_frame, text=label, width=6,
+                   command=lambda v=value: self.quick_set_position(v)).grid(
+                row=0, column=i, padx=5)
+
+        # Manual Voltage Control frame
+        voltage_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        voltage_frame.pack(fill=tk.X, pady=5)
+
+        Label(voltage_frame, text="Manual Voltage Control", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        self.voltage_slider = Scale(voltage_frame, from_=-self.max_voltage, to=self.max_voltage,
+                                    orient=tk.HORIZONTAL, length=400, resolution=0.1,
+                                    command=self.set_manual_voltage)
         self.voltage_slider.set(0)
-        self.voltage_slider.grid(row=5, column=0, padx=5, pady=10)
+        self.voltage_slider.grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+
+        # Emergency stop button
+        self.stop_btn = Button(voltage_frame, text="STOP MOTOR",
+                               command=self.stop_motor,
+                               width=15, height=2,
+                               bg="red", fg="white", font=("Arial", 10, "bold"))
+        self.stop_btn.grid(row=1, column=1, padx=15, pady=5)
+
+        # Recording control
+        record_frame = Frame(main_frame, padx=10, pady=5)
+        record_frame.pack(fill=tk.X, pady=5)
+
+        self.record_btn = Button(record_frame, text="Start Recording",
+                                 command=self.toggle_recording, width=15)
+        self.record_btn.grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+
+        self.record_status = Label(record_frame, text="Not recording", width=20)
+        self.record_status.grid(row=0, column=1, padx=5, sticky=tk.W)
 
         # Status display
-        status_frame = Frame(self.master, padx=10, pady=10)
-        status_frame.pack()
+        status_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        status_frame.pack(fill=tk.X, pady=5)
 
-        Label(status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W)
-        self.status_label = Label(status_frame, text="Ready - Please calibrate", width=40)
-        self.status_label.grid(row=0, column=1, sticky=tk.W)
+        Label(status_frame, text="System Status", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
 
-        Label(status_frame, text="Model:").grid(row=1, column=0, sticky=tk.W)
-        self.model_label = Label(status_frame, text="No model loaded", width=40)
-        self.model_label.grid(row=1, column=1, sticky=tk.W)
+        # Current status
+        Label(status_frame, text="Status:").grid(row=1, column=0, sticky=tk.W)
+        self.status_label = Label(status_frame, text="Ready - Please calibrate", width=40, anchor=tk.W)
+        self.status_label.grid(row=1, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Motor Angle:").grid(row=2, column=0, sticky=tk.W)
-        self.angle_label = Label(status_frame, text="0.0°")
-        self.angle_label.grid(row=2, column=1, sticky=tk.W)
+        # Model info
+        Label(status_frame, text="Model:").grid(row=2, column=0, sticky=tk.W)
+        self.model_label = Label(status_frame, text="No model loaded", width=40, anchor=tk.W)
+        self.model_label.grid(row=2, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Pendulum Angle:").grid(row=3, column=0, sticky=tk.W)
-        self.pendulum_label = Label(status_frame, text="0.0°")
-        self.pendulum_label.grid(row=3, column=1, sticky=tk.W)
+        # Motor angle
+        Label(status_frame, text="Motor Angle:").grid(row=3, column=0, sticky=tk.W)
+        self.angle_label = Label(status_frame, text="0.0°", anchor=tk.W)
+        self.angle_label.grid(row=3, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Motor RPM:").grid(row=4, column=0, sticky=tk.W)
-        self.rpm_label = Label(status_frame, text="0.0")
-        self.rpm_label.grid(row=4, column=1, sticky=tk.W)
+        # Pendulum angle
+        Label(status_frame, text="Pendulum Angle:").grid(row=4, column=0, sticky=tk.W)
+        self.pendulum_label = Label(status_frame, text="0.0°", anchor=tk.W)
+        self.pendulum_label.grid(row=4, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Current Voltage:").grid(row=5, column=0, sticky=tk.W)
-        self.voltage_label = Label(status_frame, text="0.0 V")
-        self.voltage_label.grid(row=5, column=1, sticky=tk.W)
+        # Motor RPM
+        Label(status_frame, text="Motor RPM:").grid(row=5, column=0, sticky=tk.W)
+        self.rpm_label = Label(status_frame, text="0.0", anchor=tk.W)
+        self.rpm_label.grid(row=5, column=1, sticky=tk.W)
 
-        # Training status
-        training_stats_frame = Frame(self.master, padx=10, pady=10)
-        training_stats_frame.pack()
+        # Current voltage
+        Label(status_frame, text="Current Voltage:").grid(row=6, column=0, sticky=tk.W)
+        self.voltage_label = Label(status_frame, text="0.0 V", anchor=tk.W)
+        self.voltage_label.grid(row=6, column=1, sticky=tk.W)
 
-        Label(training_stats_frame, text="Training Status", font=("Arial", 12, "bold")).grid(row=0, column=0,
-                                                                                             columnspan=2, pady=5)
+        # Update rate
+        Label(status_frame, text="Update Rate:").grid(row=7, column=0, sticky=tk.W)
+        self.update_rate_label = Label(status_frame, text="0 Hz", anchor=tk.W)
+        self.update_rate_label.grid(row=7, column=1, sticky=tk.W)
 
-        Label(training_stats_frame, text="Current Episode:").grid(row=1, column=0, sticky=tk.W)
-        self.episode_label = Label(training_stats_frame, text="0")
-        self.episode_label.grid(row=1, column=1, sticky=tk.W)
+        # Training statistics
+        training_stats_frame = Frame(main_frame, padx=10, pady=10, relief=tk.RAISED, borderwidth=1)
+        training_stats_frame.pack(fill=tk.X, pady=5)
 
-        Label(training_stats_frame, text="Episode Steps:").grid(row=2, column=0, sticky=tk.W)
-        self.steps_label = Label(training_stats_frame, text="0")
-        self.steps_label.grid(row=2, column=1, sticky=tk.W)
+        Label(training_stats_frame, text="Training Statistics", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
 
-        Label(training_stats_frame, text="Episode Reward:").grid(row=3, column=0, sticky=tk.W)
-        self.reward_label = Label(training_stats_frame, text="0.0")
-        self.reward_label.grid(row=3, column=1, sticky=tk.W)
+        # Arrange stats in two columns for better space usage
+        col1 = Frame(training_stats_frame)
+        col1.grid(row=1, column=0, padx=10, sticky=tk.W)
 
-        Label(training_stats_frame, text="Time Balanced:").grid(row=4, column=0, sticky=tk.W)
-        self.balanced_label = Label(training_stats_frame, text="0.0 s")
-        self.balanced_label.grid(row=4, column=1, sticky=tk.W)
+        col2 = Frame(training_stats_frame)
+        col2.grid(row=1, column=1, padx=10, sticky=tk.W)
 
-        Label(training_stats_frame, text="Training Updates:").grid(row=5, column=0, sticky=tk.W)
-        self.updates_label = Label(training_stats_frame, text="0")
-        self.updates_label.grid(row=5, column=1, sticky=tk.W)
+        # Column 1 stats
+        Label(col1, text="Current Episode:").grid(row=0, column=0, sticky=tk.W)
+        self.episode_label = Label(col1, text="0", width=10, anchor=tk.W)
+        self.episode_label.grid(row=0, column=1, sticky=tk.W)
 
-        Label(training_stats_frame, text="Actor Loss:").grid(row=6, column=0, sticky=tk.W)
-        self.actor_loss_label = Label(training_stats_frame, text="N/A")
-        self.actor_loss_label.grid(row=6, column=1, sticky=tk.W)
+        Label(col1, text="Episode Steps:").grid(row=1, column=0, sticky=tk.W)
+        self.steps_label = Label(col1, text="0", width=10, anchor=tk.W)
+        self.steps_label.grid(row=1, column=1, sticky=tk.W)
 
-        Label(training_stats_frame, text="Critic Loss:").grid(row=7, column=0, sticky=tk.W)
-        self.critic_loss_label = Label(training_stats_frame, text="N/A")
-        self.critic_loss_label.grid(row=7, column=1, sticky=tk.W)
+        Label(col1, text="Episode Reward:").grid(row=2, column=0, sticky=tk.W)
+        self.reward_label = Label(col1, text="0.0", width=10, anchor=tk.W)
+        self.reward_label.grid(row=2, column=1, sticky=tk.W)
+
+        Label(col1, text="Time Balanced:").grid(row=3, column=0, sticky=tk.W)
+        self.balanced_label = Label(col1, text="0.0 s", width=10, anchor=tk.W)
+        self.balanced_label.grid(row=3, column=1, sticky=tk.W)
+
+        # Column 2 stats
+        Label(col2, text="Training Updates:").grid(row=0, column=0, sticky=tk.W)
+        self.updates_label = Label(col2, text="0", width=10, anchor=tk.W)
+        self.updates_label.grid(row=0, column=1, sticky=tk.W)
+
+        Label(col2, text="Replay Buffer:").grid(row=1, column=0, sticky=tk.W)
+        self.buffer_label = Label(col2, text="0", width=10, anchor=tk.W)
+        self.buffer_label.grid(row=1, column=1, sticky=tk.W)
+
+        Label(col2, text="Actor Loss:").grid(row=2, column=0, sticky=tk.W)
+        self.actor_loss_label = Label(col2, text="N/A", width=10, anchor=tk.W)
+        self.actor_loss_label.grid(row=2, column=1, sticky=tk.W)
+
+        Label(col2, text="Critic Loss:").grid(row=3, column=0, sticky=tk.W)
+        self.critic_loss_label = Label(col2, text="N/A", width=10, anchor=tk.W)
+        self.critic_loss_label.grid(row=3, column=1, sticky=tk.W)
 
         # RGB Control
-        rgb_frame = Frame(self.master, padx=10, pady=10)
-        rgb_frame.pack()
+        rgb_frame = Frame(main_frame, padx=10, pady=10)
+        rgb_frame.pack(fill=tk.X, pady=5)
 
-        self.r_slider = Scale(rgb_frame, from_=999, to=0, label="Red")
-        self.r_slider.grid(row=0, column=0, padx=5)
+        Label(rgb_frame, text="LED Control", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=5)
 
-        self.g_slider = Scale(rgb_frame, from_=999, to=0, label="Green")
-        self.g_slider.grid(row=0, column=1, padx=5)
+        self.r_slider = Scale(rgb_frame, from_=999, to=0, label="Red", length=150)
+        self.r_slider.grid(row=1, column=0, padx=5)
 
-        self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
-        self.b_slider.grid(row=0, column=2, padx=5)
+        self.g_slider = Scale(rgb_frame, from_=999, to=0, label="Green", length=150)
+        self.g_slider.grid(row=1, column=1, padx=5)
+
+        self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue", length=150)
+        self.b_slider.grid(row=1, column=2, padx=5)
+
+        # Set a default color
+        self.r_slider.set(0)
+        self.g_slider.set(0)
+        self.b_slider.set(999)  # Blue by default
+
+        # Apply initial difficulty
+        self.set_difficulty("Medium")
+
+        # Hide resume training button initially
+        self.resume_frame.grid_forget()
+
+    def toggle_advanced_settings(self):
+        """Show or hide advanced settings"""
+        if self.show_advanced.get():
+            self.advanced_frame.grid(row=6, column=0, columnspan=2, pady=10, sticky=tk.W)
+        else:
+            self.advanced_frame.grid_forget()
+
+    def apply_advanced_settings(self):
+        """Apply advanced settings from the input fields"""
+        try:
+            self.termination_angle = float(self.term_angle_entry.get())
+            self.consecutive_limit = int(self.consecutive_entry.get())
+            self.warmup_steps = int(self.warmup_entry.get())
+            self.min_steps_between_episodes = int(self.min_steps_entry.get())
+            self.max_motor_angle = float(self.max_motor_entry.get())
+            self.status_label.config(text=f"Advanced settings applied: Motor limit {self.max_motor_angle}°")
+        except ValueError:
+            self.status_label.config(text="Invalid settings! Enter numbers only.")
+
+    def toggle_auto_reset(self):
+        """Toggle auto reset when balanced"""
+        self.auto_reset = bool(self.auto_reset_var.get())
+        status = "enabled" if self.auto_reset else "disabled"
+        self.status_label.config(text=f"Auto-reset when balanced {status}")
+
+    def toggle_recording(self):
+        """Toggle state recording for debugging or data collection"""
+        self.recording = not self.recording
+
+        if self.recording:
+            self.record_btn.config(text="Stop Recording")
+            self.record_status.config(text="Recording...", fg="red")
+            self.record_buffer = []  # Clear buffer
+        else:
+            self.record_btn.config(text="Start Recording")
+            self.record_status.config(text="Not recording", fg="black")
+
+            # Save recording if we have data
+            if len(self.record_buffer) > 0:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"qube_recording_{timestamp}.npy"
+                np.save(filename, self.record_buffer)
+                self.record_status.config(text=f"Saved to {filename}", fg="green")
+
+    def set_difficulty(self, difficulty):
+        """Apply difficulty preset settings"""
+        if difficulty in self.difficulty_presets:
+            preset = self.difficulty_presets[difficulty]
+
+            self.exploration_prob = preset['exploration']
+            self.exploration_slider.set(int(self.exploration_prob * 100))
+
+            self.termination_angle = preset['termination_angle']
+            self.term_angle_entry.delete(0, tk.END)
+            self.term_angle_entry.insert(0, str(self.termination_angle))
+
+            self.consecutive_limit = preset['consecutive_limit']
+            self.consecutive_entry.delete(0, tk.END)
+            self.consecutive_entry.insert(0, str(self.consecutive_limit))
+
+            self.min_steps_between_episodes = preset['min_steps_between_episodes']
+            self.min_steps_entry.delete(0, tk.END)
+            self.min_steps_entry.insert(0, str(self.min_steps_between_episodes))
+
+            self.warmup_steps = preset['warmup_steps']
+            self.warmup_entry.delete(0, tk.END)
+            self.warmup_entry.insert(0, str(self.warmup_steps))
+
+            # Apply motor angle limit
+            self.max_motor_angle = preset['max_motor_angle']
+
+            self.status_label.config(text=f"Difficulty set to {difficulty}: Motor limit {self.max_motor_angle}°")
+
+    def set_learning_rate(self, lr_str):
+        """Set learning rate from dropdown"""
+        try:
+            lr = float(lr_str)
+            self.learning_rate = lr
+
+            # Update optimizer learning rates if agent exists
+            for param_group in self.agent.actor_optimizer.param_groups:
+                param_group['lr'] = lr
+            for param_group in self.agent.critic_optimizer.param_groups:
+                param_group['lr'] = lr
+
+            self.status_label.config(text=f"Learning rate set to {lr}")
+        except ValueError:
+            self.status_label.config(text="Invalid learning rate")
+
+    def save_replay_buffer(self):
+        """Save the replay buffer to a file"""
+        if len(self.replay_buffer) > 0:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"replay_buffer_{timestamp}.npy"
+            self.replay_buffer.save_to_file(filename)
+            self.status_label.config(text=f"Replay buffer saved to {filename}")
+        else:
+            self.status_label.config(text="Replay buffer is empty")
+
+    def load_replay_buffer(self):
+        """Load a replay buffer from a file"""
+        filename = filedialog.askopenfilename(
+            initialdir=os.getcwd(),
+            title="Select Replay Buffer File",
+            filetypes=(("NumPy Files", "*.npy"), ("All files", "*.*"))
+        )
+
+        if filename:
+            self.replay_buffer.load_from_file(filename)
+            self.buffer_label.config(text=str(len(self.replay_buffer)))
+            self.status_label.config(text=f"Loaded buffer with {len(self.replay_buffer)} transitions")
+
+    def quick_set_position(self, value):
+        """Quickly set a position from the preset buttons"""
+        self.position_entry.delete(0, tk.END)
+        self.position_entry.insert(0, value)
+        self.start_move_to_position()
+
+    def resume_training_after_emergency(self):
+        """Resume training after an emergency stop"""
+        # Confirm the user wants to resume
+        confirmation = tk.messagebox.askquestion("Confirm Resume Training",
+                                                 "Are you sure you want to resume training?\n\n"
+                                                 "Make sure you've checked the hardware and resolved any issues.",
+                                                 icon='warning')
+
+        if confirmation == 'yes':
+            # Hide the resume button
+            self.resume_frame.grid_forget()
+
+            # Reset emergency flag
+            self.emergency_stopped = False
+
+            # Reset the status color
+            self.status_label.config(fg="black")
+
+            # Re-enable training
+            self.training_var.set(1)
+            self.toggle_training()
+
+            # Start RL control
+            self.toggle_rl_control()
+
+            # Reset episode to start fresh
+            self.reset_episode()
+
+            self.status_label.config(text="Training resumed after emergency stop")
 
     def toggle_training(self):
         """Toggle training mode on/off"""
@@ -516,6 +894,7 @@ class QUBEControllerWithRLTraining:
         if self.training_mode:
             self.save_model_btn.config(state=tk.NORMAL)
             self.reset_episode_btn.config(state=tk.NORMAL)
+            self.save_buffer_btn.config(state=tk.NORMAL)
             self.status_label.config(text="RL training mode enabled")
 
             # Reset episode stats
@@ -523,6 +902,7 @@ class QUBEControllerWithRLTraining:
         else:
             self.save_model_btn.config(state=tk.DISABLED)
             self.reset_episode_btn.config(state=tk.DISABLED)
+            self.save_buffer_btn.config(state=tk.DISABLED)
             self.status_label.config(text="RL training mode disabled")
 
     def reset_episode(self):
@@ -534,11 +914,27 @@ class QUBEControllerWithRLTraining:
         self.state_history = []
         self.action_history = []
         self.reward_history = []
+        self.prev_state = None
+        self.prev_action = None
+        self.consecutive_bad_states = 0
 
         # Update UI
         self.steps_label.config(text=str(self.episode_steps))
         self.reward_label.config(text=f"{self.episode_reward:.2f}")
         self.balanced_label.config(text=f"{self.balanced_time:.2f} s")
+        self.buffer_label.config(text=str(len(self.replay_buffer)))
+
+        # Set LED color based on mode
+        if self.rl_mode and self.training_mode:
+            # Purple for training
+            self.r_slider.set(800)
+            self.g_slider.set(0)
+            self.b_slider.set(800)
+        elif self.rl_mode:
+            # Blue for control only
+            self.r_slider.set(500)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
 
         self.status_label.config(text=f"Episode {self.current_episode} started")
 
@@ -653,7 +1049,8 @@ class QUBEControllerWithRLTraining:
                     try:
                         self.agent.load_critic(critic_file)
                         self.status_label.config(text=f"Model and critic loaded")
-                    except:
+                    except Exception as e:
+                        print(f"Error loading critic: {str(e)}")
                         # Not critical if critic fails to load
                         pass
 
@@ -667,6 +1064,7 @@ class QUBEControllerWithRLTraining:
 
             except Exception as e:
                 self.status_label.config(text=f"Error loading model: {str(e)}")
+                print(f"Error details: {str(e)}")
 
     def toggle_rl_control(self):
         """Toggle RL control mode on/off"""
@@ -687,9 +1085,9 @@ class QUBEControllerWithRLTraining:
                 self.b_slider.set(800)
             else:
                 self.status_label.config(text="RL control active")
-                # Set purple LED during RL control
-                self.r_slider.set(500)
-                self.g_slider.set(0)
+                # Set cyan LED during RL control
+                self.r_slider.set(0)
+                self.g_slider.set(500)
                 self.b_slider.set(999)
 
         else:
@@ -773,8 +1171,8 @@ class QUBEControllerWithRLTraining:
         if abs(pendulum_angle_norm) < 0.2 and abs(pendulum_velocity) < 1.0:
             bonus = 5.0
 
-        # Component 5: Penalty for voltage oscillations
-        voltage_penalty = -0.01 * voltage ** 2
+        # Component 5: Penalty for voltage oscillations (reduce voltage swings)
+        voltage_penalty = -0.005 * voltage ** 2
 
         # Component 6: Energy management reward
         Mp_g_Lp = mL * g * LL  # Pendulum mass * gravity * length
@@ -788,8 +1186,13 @@ class QUBEControllerWithRLTraining:
         # Reward for being close to the optimal energy (inverted Gaussian)
         energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
 
+        # Component 7: Penalty for hitting limits
+        limit_penalty = 0.0
+        if abs(motor_angle - 2.2) < 0.05 or abs(motor_angle + 2.2) < 0.05:
+            limit_penalty = -40.0  # Smaller penalty to avoid early episode termination
+
         # Total reward
-        reward = upright_reward + pos_penalty + bonus + energy_reward
+        reward = upright_reward + bonus + energy_reward + limit_penalty
 
         # Check if pendulum is balanced (for tracking balanced time)
         is_balanced = abs(pendulum_angle_norm) < 0.17  # ~10 degrees
@@ -836,12 +1239,29 @@ class QUBEControllerWithRLTraining:
             self.status_label.config(text="Position reached")
             return
 
-        # Simple proportional control
-        kp = 0.02  # Low gain
-        self.motor_voltage = kp * position_error
+        # Simple proportional control with improved gain
+        kp = 0.05  # Increased gain for faster movement
+
+        # Get motor velocity to add damping
+        motor_velocity = self.qube.getMotorRPM() * (2 * np.pi / 60)
+        kd = 0.02  # Damping coefficient
+
+        # PD control
+        self.motor_voltage = kp * position_error - kd * motor_velocity
 
         # Limit voltage for safety
         self.motor_voltage = max(-self.max_voltage, min(self.max_voltage, self.motor_voltage))
+
+    def check_auto_reset(self, pendulum_angle_norm):
+        """Check if the pendulum should be auto-reset after balancing for a while"""
+        if self.auto_reset and self.episode_steps > self.warmup_steps and abs(pendulum_angle_norm) < 0.17:
+            elapsed_time = time.time() - self.episode_start_time
+            if elapsed_time > self.auto_reset_time:
+                self.status_label.config(text="Auto-resetting after successful balance")
+                self.finish_episode()
+                self.reset_episode()
+                return True
+        return False
 
     def update_rl_control(self):
         """Update RL control and training logic"""
@@ -871,6 +1291,16 @@ class QUBEControllerWithRLTraining:
         obs = self.get_state_observation(motor_angle_deg, pendulum_angle_deg,
                                          motor_velocity, pendulum_velocity)
 
+        # Record state if recording is enabled
+        if self.recording:
+            self.record_buffer.append([
+                current_time,
+                motor_angle_deg,
+                pendulum_angle_deg,
+                motor_velocity,
+                pendulum_velocity,
+            ])
+
         # Decide action based on the current policy
         if self.training_mode and np.random.random() < self.exploration_prob:
             # Exploration: take random action
@@ -891,6 +1321,15 @@ class QUBEControllerWithRLTraining:
                 action[0]
             )
 
+            # Compute normalized pendulum angle for termination check
+            pendulum_angle_norm = normalize_angle(current_pendulum_angle_rad + np.pi)
+
+            # Check if the pendulum has fallen too far (should end episode)
+            if abs(pendulum_angle_norm) > self.termination_angle:
+                self.consecutive_bad_states += 1
+            else:
+                self.consecutive_bad_states = 0
+
             # Update balanced time if pendulum is balanced
             if is_balanced:
                 self.balanced_time += current_time - self.prev_time_rl if self.prev_time_rl else 0
@@ -898,19 +1337,46 @@ class QUBEControllerWithRLTraining:
             # Update UI
             self.balanced_label.config(text=f"{self.balanced_time:.2f} s")
 
+            # Check auto-reset condition
+            auto_reset_happened = self.check_auto_reset(pendulum_angle_norm)
+
             # If we have a previous state, store transition
-            if self.prev_state is not None:
-                # Check if episode should end
+            if self.prev_state is not None and not auto_reset_happened:
+                # Check if episode should end, but only after warmup period
                 done = False
 
                 # End if step limit reached
                 if self.episode_steps >= self.max_episode_steps:
                     done = True
+                    print("Episode ended due to step limit")
 
-                # End if pendulum fell beyond recovery
-                pendulum_angle_norm = normalize_angle(current_pendulum_angle_rad + np.pi)
-                if abs(pendulum_angle_norm) > 2.8:  # ~160 degrees from upright
+                # End if pendulum has fallen beyond recovery for consecutive steps
+                # But only apply this after warmup period
+                if self.episode_steps > self.warmup_steps and self.consecutive_bad_states > self.consecutive_limit:
                     done = True
+                    print(
+                        f"Episode ended due to pendulum fall: {abs(pendulum_angle_norm)} rad, {self.consecutive_bad_states} consecutive bad states")
+
+                # End if motor angle exceeds 200 degrees - pendulum is likely off the motor
+                if abs(motor_angle_deg) > 200.0:
+                    done = True
+                    print(
+                        f"Episode ended because motor angle ({motor_angle_deg:.1f}°) exceeds 200° - pendulum arm is likely off motor")
+                    self.motor_voltage = 0.0  # Immediately stop the motor
+
+                    # Also exit training mode entirely
+                    self.status_label.config(
+                        text=f"TRAINING STOPPED: Motor angle ({motor_angle_deg:.1f}°) exceeded 200°")
+                    # Schedule end of RL mode to avoid threading issues
+                    self.master.after(100, self.stop_training_emergency)
+
+                # End if motor angle exceeds safety limit
+                if abs(motor_angle_deg) > self.max_motor_angle:
+                    done = True
+                    print(
+                        f"Episode ended due to excessive motor angle: {motor_angle_deg:.1f}° exceeds limit of {self.max_motor_angle:.1f}°")
+                    # Set motor voltage to 0 immediately for safety
+                    self.motor_voltage = 0.0
 
                 # Store the transition
                 self.replay_buffer.push(
@@ -958,20 +1424,23 @@ class QUBEControllerWithRLTraining:
             self.episode_steps += 1
             self.steps_label.config(text=str(self.episode_steps))
             self.reward_label.config(text=f"{self.episode_reward:.2f}")
+            self.buffer_label.config(text=str(len(self.replay_buffer)))
 
         # Update status message
         pendulum_angle_norm = normalize_angle(current_pendulum_angle_rad + np.pi)
         upright_angle_deg = abs(pendulum_angle_norm) * 180 / np.pi
 
         if self.training_mode:
-            msg = f"RL training active - Episode {self.current_episode}, Step {self.episode_steps}"
+            msg = f"RL training, Episode {self.current_episode}, Step {self.episode_steps}"
+            if self.episode_steps <= self.warmup_steps:
+                msg += f" (Warmup: {self.warmup_steps - self.episode_steps} left)"
             if upright_angle_deg < 30:
                 msg += f" (Near balance: {upright_angle_deg:.1f}°)"
         else:
             if upright_angle_deg < 30:
-                msg = f"RL control active - Near balance ({upright_angle_deg:.1f}° from upright)"
+                msg = f"RL control - Near balance ({upright_angle_deg:.1f}° from upright)"
             else:
-                msg = f"RL control active - Swinging ({upright_angle_deg:.1f}° from upright)"
+                msg = f"RL control - Swinging ({upright_angle_deg:.1f}° from upright)"
 
         self.status_label.config(text=msg)
 
@@ -985,6 +1454,38 @@ class QUBEControllerWithRLTraining:
 
         if self.rl_model:
             self.rl_control_btn.config(text="Start RL Control")
+
+    def stop_training_emergency(self):
+        """Emergency stop for training when motor angle exceeds limits"""
+        # Exit training mode
+        self.training_var.set(0)  # Uncheck the training checkbox
+        self.toggle_training()  # Apply the change
+
+        # Exit RL control mode
+        self.rl_mode = False
+        self.rl_control_btn.config(text="Start RL Control")
+
+        # Set red alert LED
+        self.r_slider.set(999)
+        self.g_slider.set(0)
+        self.b_slider.set(0)
+
+        # Keep motor voltage at 0
+        self.motor_voltage = 0.0
+        self.voltage_slider.set(0)
+
+        # Show alert message
+        self.status_label.config(text="⚠️ EMERGENCY STOP: Training halted due to excessive motor angle", fg="red")
+
+        # Set emergency flag and show resume button
+        self.emergency_stopped = True
+        self.resume_frame.grid(row=5, column=0, columnspan=2, pady=10)
+
+        # Create an alert popup
+        tk.messagebox.showwarning("Training Emergency Stop",
+                                  "Training has been stopped because the motor angle exceeded 200°.\n\n"
+                                  "This usually means the pendulum came off the motor or hit something.\n\n"
+                                  "Please check the hardware before resuming.")
 
     def stop_motor(self):
         """Stop the motor"""
@@ -1011,6 +1512,14 @@ class QUBEControllerWithRLTraining:
 
     def update_gui(self):
         """Update the GUI and control the hardware - called continuously"""
+        # Track update rate
+        current_time = time.time()
+        dt = current_time - self.last_update_time
+        if dt > 0:
+            update_rate = 1.0 / dt
+            self.update_rate_label.config(text=f"{update_rate:.1f} Hz")
+        self.last_update_time = current_time
+
         # Update automatic control modes if active
         if self.calibrating:
             self.update_calibration()
@@ -1035,15 +1544,26 @@ class QUBEControllerWithRLTraining:
 
         rpm = self.qube.getMotorRPM()
 
-        self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
+        # Check if motor angle is getting close to limit (within 20%)
+        angle_warning = abs(motor_angle_deg) > (self.max_motor_angle * 0.8)
+
+        # Update angle display with warning if needed
+        if angle_warning:
+            self.angle_label.config(text=f"{motor_angle_deg:.1f}° !", fg="red")
+        else:
+            self.angle_label.config(text=f"{motor_angle_deg:.1f}°", fg="black")
+
         self.pendulum_label.config(
             text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
         self.rpm_label.config(text=f"{rpm:.1f}")
         self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
 
+        # Force the master widget to update
+        self.master.update_idletasks()
+
 
 def main():
-    print("Starting QUBE Controller with RL Training...")
+    print("Starting QUBE Controller with Enhanced RL Training...")
     print("Will set corner position as zero")
 
     try:
@@ -1063,10 +1583,14 @@ def main():
 
         # Main loop
         while True:
-            qube.update()
-            app.update_gui()
-            root.update()
-            time.sleep(0.01)
+            try:
+                qube.update()
+                app.update_gui()
+                root.update()
+                time.sleep(0.005)  # Shorter sleep for faster update rate
+            except Exception as e:
+                print(f"Error in main loop: {str(e)}")
+                # Continue despite errors to keep the controller running
 
     except tk.TclError:
         # Window closed
