@@ -25,11 +25,12 @@ class Params:
         self.THETA_MIN = -np.pi / 2  # Minimum arm angle
 
 
-# Reward function
+# Reward function - MODIFIED FOR UPRIGHT = 0
 def compute_reward(state, voltage_change=0.0, params=None):
     """Calculate reward based on current state with smoother transitions"""
     theta, alpha, theta_dot, alpha_dot = state
-    alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
+    # No π shift needed since we want α=0 to be upright
+    alpha_norm = normalize_angle(alpha)
     p = params if params else Params()
 
     # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
@@ -48,9 +49,11 @@ def compute_reward(state, voltage_change=0.0, params=None):
     bonus = 3.0 * upright_closeness * stability_factor
 
     # COMPONENT 4.5: Smoother cost for being close to downright position
-    upright_closeness = np.exp(-10.0 * alpha ** 2)
+    # For new convention, downright is at π
+    downright_alpha = normalize_angle(alpha - np.pi)
+    downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
     stability_factor = np.exp(-1.0 * alpha_dot ** 2)
-    bonus += -1.5 * upright_closeness * stability_factor
+    bonus += -3.0 * downright_closeness * stability_factor
 
     # COMPONENT 5: Smoother penalty for approaching limits
     THETA_MAX = p.THETA_MAX
@@ -67,9 +70,6 @@ def compute_reward(state, voltage_change=0.0, params=None):
 
     # COMPONENT 7: Stronger penalty for fast voltage changes
     voltage_change_penalty = -0.01 * voltage_change ** 2
-
-
-
 
     # Individual components
     components = {
@@ -142,6 +142,7 @@ class RewardExplorerGUI:
         self.create_heatmap_tab()
         self.create_surface_plot_tab()
         self.create_component_comparison_tab()
+        self.create_swingup_trajectory_tab()  # Add the new tab
 
         # Bind tab change event
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
@@ -160,6 +161,8 @@ class RewardExplorerGUI:
             self.plot_reward_surface()
         elif tab == "Component Comparison":
             self.plot_component_comparison()
+        elif tab == "Swing-Up Trajectory":
+            self.plot_swingup_trajectory()
 
     def create_interactive_explorer_tab(self):
         # Create main frame for this tab
@@ -395,6 +398,59 @@ class RewardExplorerGUI:
         # Initial plot
         self.plot_component_comparison()
 
+    def create_swingup_trajectory_tab(self):
+        """Create a new tab for visualizing the swing-up trajectory"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Swing-Up Trajectory")
+
+        # Create controls frame
+        control_frame = ttk.Frame(tab)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Add sliders and controls
+        ttk.Label(control_frame, text="Simulation Time (s):").pack(side=tk.LEFT, padx=(10, 5))
+        self.sim_time = tk.DoubleVar(value=5.0)
+        sim_time_slider = ttk.Scale(
+            control_frame,
+            from_=1.0,
+            to=10.0,
+            orient=tk.HORIZONTAL,
+            variable=self.sim_time,
+            length=200
+        )
+        sim_time_slider.pack(side=tk.LEFT, padx=(0, 20))
+
+        ttk.Label(control_frame, text="Initial Velocity:").pack(side=tk.LEFT, padx=(10, 5))
+        self.init_velocity = tk.DoubleVar(value=3.0)
+        velocity_slider = ttk.Scale(
+            control_frame,
+            from_=0.1,
+            to=8.0,
+            orient=tk.HORIZONTAL,
+            variable=self.init_velocity,
+            length=200
+        )
+        velocity_slider.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Run simulation button
+        ttk.Button(
+            control_frame,
+            text="Run Simulation",
+            command=self.plot_swingup_trajectory
+        ).pack(side=tk.LEFT, padx=10)
+
+        # Create matplotlib figure
+        self.swingup_fig = Figure(figsize=(12, 10))
+        self.swingup_canvas = FigureCanvasTkAgg(self.swingup_fig, master=tab)
+        self.swingup_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Add navigation toolbar
+        toolbar = NavigationToolbar2Tk(self.swingup_canvas, tab)
+        toolbar.update()
+
+        # Initial plot
+        self.plot_swingup_trajectory()
+
     def reset_values(self):
         self.theta.set(0.0)
         self.alpha.set(0.0)
@@ -481,11 +537,13 @@ class RewardExplorerGUI:
                              color='blue')
         ax.add_patch(cart)
 
-        # Draw the pendulum
+        # Draw the pendulum - UPDATED FOR NEW CONVENTION
+        # For the convention where α = 0 is up and α = π is down:
         pendulum_x = cart_x
         pendulum_y = 0
+        # Use negative sin for x and negative cos for y to get correct orientation (upright at 0)
         pendulum_end_x = pendulum_x + pendulum_length * np.sin(alpha)
-        pendulum_end_y = pendulum_y + pendulum_length * np.cos(alpha)
+        pendulum_end_y = pendulum_y - pendulum_length * np.cos(alpha)
         ax.plot([pendulum_x, pendulum_end_x], [pendulum_y, pendulum_end_y], 'k-', linewidth=3)
 
         # Draw a circle at the pendulum end
@@ -513,6 +571,10 @@ class RewardExplorerGUI:
         ax.text(0.05, 0.95, f'Total Reward: {total_reward:.2f}', transform=ax.transAxes,
                 fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
 
+        # Add angle convention explanation
+        ax.text(0.05, 0.05, f'α = 0: up, α = π: down', transform=ax.transAxes,
+                fontsize=8, color='gray', verticalalignment='bottom')
+
     def plot_combined_explorer(self, state, components, total_reward):
         # Create subplots
         gs = self.explorer_fig.add_gridspec(1, 2, width_ratios=[1, 1])
@@ -537,7 +599,7 @@ class RewardExplorerGUI:
         ax1.set_xlabel('Value')
         ax1.grid(axis='x', alpha=0.3)
 
-        # Plot state on the right
+        # Plot state on the right - UPDATED ANGLE CONVENTION
         theta, alpha, theta_dot, alpha_dot = state
         cart_width = 0.4
         cart_height = 0.2
@@ -548,10 +610,11 @@ class RewardExplorerGUI:
                              color='blue')
         ax2.add_patch(cart)
 
+        # Draw pendulum with updated angle convention
         pendulum_x = cart_x
         pendulum_y = 0
         pendulum_end_x = pendulum_x + pendulum_length * np.sin(alpha)
-        pendulum_end_y = pendulum_y + pendulum_length * np.cos(alpha)
+        pendulum_end_y = pendulum_y - pendulum_length * np.cos(alpha)
         ax2.plot([pendulum_x, pendulum_end_x], [pendulum_y, pendulum_end_y], 'k-', linewidth=3)
         ax2.plot(pendulum_end_x, pendulum_end_y, 'ro', markersize=10)
 
@@ -573,6 +636,10 @@ class RewardExplorerGUI:
 
         ax2.text(0.05, 0.95, f'Total Reward: {total_reward:.2f}', transform=ax2.transAxes,
                  fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+        # Add angle convention explanation
+        ax2.text(0.05, 0.05, f'α = 0: up, α = π: down', transform=ax2.transAxes,
+                 fontsize=8, color='gray', verticalalignment='bottom')
 
     def plot_reward_vs_alpha(self):
         self.status_var.set("Generating Reward vs Alpha plot...")
@@ -625,9 +692,10 @@ class RewardExplorerGUI:
         ax.plot(alpha_values, voltage_penalties, label='Voltage Change')
         ax.plot(alpha_values, total_rewards, 'k--', linewidth=2, label='Total Reward')
 
-        ax.axvline(x=0, color='r', linestyle='--', alpha=0.3, label='Upright Position')
-        ax.axvline(x=np.pi, color='g', linestyle='--', alpha=0.3, label='Hanging Position')
-        ax.axvline(x=-np.pi, color='g', linestyle='--', alpha=0.3)
+        # Annotate key positions
+        ax.axvline(x=0, color='g', linestyle='--', alpha=0.3, label='Up Position (α=0)')
+        ax.axvline(x=np.pi, color='r', linestyle='--', alpha=0.3, label='Down Position (α=π)')
+        ax.axvline(x=-np.pi, color='r', linestyle='--', alpha=0.3, label='Down Position (α=-π)')
 
         ax.set_title('Reward Components vs Pendulum Angle (alpha)')
         ax.set_xlabel('Pendulum Angle (alpha)')
@@ -676,9 +744,15 @@ class RewardExplorerGUI:
         ax.set_title('Reward Heatmap: Pendulum Angle vs Angular Velocity')
         ax.set_xlabel('Pendulum Angle (alpha)')
         ax.set_ylabel('Pendulum Angular Velocity (alpha_dot)')
-        ax.axvline(x=0, color='k', linestyle='--', alpha=0.3)
+
+        # Add annotations for key positions
+        ax.axvline(x=0, color='w', linestyle='--', alpha=0.5, label='Up Position (α=0)')
+        ax.axvline(x=np.pi, color='k', linestyle='--', alpha=0.3, label='Down Position (α=π)')
+        ax.axvline(x=-np.pi, color='k', linestyle='--', alpha=0.3, label='Down Position (α=-π)')
         ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+
         ax.grid(True, alpha=0.3)
+        ax.legend(loc='lower right')
 
         # Update the figure
         self.heatmap_fig.tight_layout()
@@ -723,6 +797,11 @@ class RewardExplorerGUI:
         ax.set_ylabel('Angular Velocity (alpha_dot)')
         ax.set_zlabel('Reward')
         ax.set_title('3D Reward Surface')
+
+        # Add text annotations for key positions - in 3D space
+        ax.text(-np.pi, 0, np.min(rewards), "Down Position (α=-π)", color='red')
+        ax.text(0, 0, np.min(rewards), "Up Position (α=0)", color='green')
+        ax.text(np.pi, 0, np.min(rewards), "Down Position (α=π)", color='red')
 
         # Update the figure
         self.surface_fig.tight_layout()
@@ -769,7 +848,9 @@ class RewardExplorerGUI:
             axs[i].set_title(component)
             axs[i].set_xlabel('Alpha')
             axs[i].set_ylabel('Alpha Dot')
-            axs[i].axvline(x=0, color='k', linestyle='--', alpha=0.3)
+            axs[i].axvline(x=0, color='w', linestyle='--', alpha=0.3, label='Up')
+            axs[i].axvline(x=np.pi, color='k', linestyle='--', alpha=0.3, label='Down')
+            axs[i].axvline(x=-np.pi, color='k', linestyle='--', alpha=0.3)
             axs[i].axhline(y=0, color='k', linestyle='--', alpha=0.3)
             self.component_fig.colorbar(im, ax=axs[i])
 
@@ -785,7 +866,9 @@ class RewardExplorerGUI:
         axs[7].set_title('Total Reward')
         axs[7].set_xlabel('Alpha')
         axs[7].set_ylabel('Alpha Dot')
-        axs[7].axvline(x=0, color='k', linestyle='--', alpha=0.3)
+        axs[7].axvline(x=0, color='w', linestyle='--', alpha=0.3, label='Up')
+        axs[7].axvline(x=np.pi, color='k', linestyle='--', alpha=0.3, label='Down')
+        axs[7].axvline(x=-np.pi, color='k', linestyle='--', alpha=0.3)
         axs[7].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         self.component_fig.colorbar(im, ax=axs[7])
 
@@ -794,6 +877,161 @@ class RewardExplorerGUI:
         self.component_canvas.draw()
 
         self.status_var.set("Component Comparison plots ready")
+
+    def simulate_pendulum_trajectory(self):
+        """Simulate a trajectory of the pendulum swinging from down to up position
+           with updated angle convention"""
+        # Get simulation time and initial velocity from sliders
+        sim_time = self.sim_time.get()
+        init_velocity = self.init_velocity.get()
+        dt = 0.01
+
+        # Time points
+        time_points = np.arange(0, sim_time, dt)
+
+        # Create a trajectory that swings up from bottom (π) to top (0)
+        # Using a cosine function to create a smooth swing-up
+        # In new convention, π is down and 0 is up
+        alphas = np.pi * np.cos(np.pi * time_points / sim_time)
+
+        # Calculate velocity based on the derivative of position
+        # Scale by the initial velocity parameter
+        alpha_dots = -np.pi ** 2 / sim_time * np.sin(np.pi * time_points / sim_time)
+        alpha_dots = alpha_dots * (init_velocity / np.max(np.abs(alpha_dots)))
+
+        # Arm position and velocity remain at zero
+        thetas = np.zeros_like(time_points)
+        theta_dots = np.zeros_like(time_points)
+
+        # Calculate rewards along the trajectory
+        rewards = []
+        components_dict = {
+            "Upright Reward": [],
+            "Velocity Penalty": [],
+            "Position Penalty": [],
+            "Upright Bonus": [],
+            "Limit Penalty": [],
+            "Energy Reward": [],
+            "Voltage Change": []
+        }
+
+        for i in range(len(time_points)):
+            state = [thetas[i], alphas[i], theta_dots[i], alpha_dots[i]]
+            reward, components = compute_reward(state, 0.0, self.params)
+            rewards.append(reward)
+
+            # Store each component
+            for key in components_dict:
+                components_dict[key].append(components[key])
+
+        return {
+            'time': time_points,
+            'alpha': alphas,
+            'alpha_dot': alpha_dots,
+            'theta': thetas,
+            'theta_dot': theta_dots,
+            'reward': np.array(rewards),
+            'components': components_dict
+        }
+
+    def plot_swingup_trajectory(self):
+        """Plot the reward and pendulum state during swing-up trajectory"""
+        self.status_var.set("Simulating pendulum swing-up trajectory...")
+        self.root.update()
+
+        # Run simulation
+        trajectory = self.simulate_pendulum_trajectory()
+
+        # Clear figure
+        self.swingup_fig.clear()
+
+        # Create 3 subplots: rewards over time, components over time, and pendulum states
+        gs = self.swingup_fig.add_gridspec(3, 1, height_ratios=[1, 1, 1])
+        ax_reward = self.swingup_fig.add_subplot(gs[0])
+        ax_components = self.swingup_fig.add_subplot(gs[1])
+        ax_state = self.swingup_fig.add_subplot(gs[2])
+
+        # Plot total reward over time
+        ax_reward.plot(trajectory['time'], trajectory['reward'], 'b-', linewidth=2)
+        ax_reward.set_title('Total Reward during Swing-Up')
+        ax_reward.set_ylabel('Reward')
+        ax_reward.grid(True)
+
+        # Plot reward components over time
+        components = trajectory['components']
+        ax_components.plot(trajectory['time'], components['Upright Reward'], label='Upright Reward')
+        ax_components.plot(trajectory['time'], components['Upright Bonus'], label='Upright Bonus')
+        ax_components.plot(trajectory['time'], components['Energy Reward'], label='Energy Reward')
+        ax_components.plot(trajectory['time'], components['Velocity Penalty'], label='Velocity')
+        ax_components.set_title('Reward Components during Swing-Up')
+        ax_components.set_ylabel('Component Value')
+        ax_components.legend(loc='upper right', fontsize='small')
+        ax_components.grid(True)
+
+        # Create pendulum visualization at key points
+        num_points = 5
+        indices = np.linspace(0, len(trajectory['time']) - 1, num_points, dtype=int)
+
+        # Set up the axes for pendulum visualization
+        ax_state.set_xlim(-1.5, 5.5)
+        ax_state.set_ylim(-1.5, 1.5)
+        ax_state.set_aspect('equal')
+        ax_state.grid(True)
+        ax_state.set_title('Pendulum States during Swing-Up (α = 1: up, α = -1: down)')
+        ax_state.set_xlabel('Time (s)')
+
+        # Pendulum visualization parameters
+        pendulum_length = 1.0
+        colors = plt.cm.viridis(np.linspace(0, 1, num_points))
+
+        # Draw pendulums at different time points with updated angle convention
+        for i, idx in enumerate(indices):
+            # Get state at this point
+            alpha = trajectory['alpha'][idx] - np.pi  # Convert to new convention
+            alpha_dot = trajectory['alpha_dot'][idx]
+            time = trajectory['time'][idx]
+            reward = trajectory['reward'][idx]
+
+            # Calculate pendulum position with updated angle convention
+            # For convention where 0 is up and π is down:
+            pendulum_x = 0
+            pendulum_y = 0
+            pendulum_end_x = pendulum_x + pendulum_length * np.sin(alpha)
+            pendulum_end_y = pendulum_y - pendulum_length * np.cos(alpha)
+
+            # Plot pendulum
+            ax_state.plot([pendulum_x, pendulum_end_x], [pendulum_y, pendulum_end_y],
+                          color=colors[i], linewidth=2,
+                          label=f't={time:.2f}s, α={alpha:.2f}, R={reward:.2f}')
+
+            # Plot pendulum end as circle
+            ax_state.plot(pendulum_end_x, pendulum_end_y, 'o', color=colors[i], markersize=8)
+
+            # Show velocity vector if significant
+            if abs(alpha_dot) > 0.1:
+                # Scale velocity for visibility
+                vel_scale = 0.2
+                # Show velocity perpendicular to pendulum arm
+                # Calculate the perpendicular direction for angular velocity
+                # For the new convention, α = 0 is up
+                perp_x = np.cos(alpha)
+                perp_y = np.sin(alpha)
+
+                ax_state.arrow(
+                    pendulum_end_x, pendulum_end_y,
+                    vel_scale * alpha_dot * perp_x,
+                    vel_scale * alpha_dot * perp_y,
+                    head_width=0.05, head_length=0.1, fc=colors[i], ec=colors[i]
+                )
+
+        # Add legend to the state plot
+        ax_state.legend(loc='upper right', fontsize='small')
+
+        # Update the figure
+        self.swingup_fig.tight_layout()
+        self.swingup_canvas.draw()
+
+        self.status_var.set("Swing-up trajectory simulation complete")
 
 
 # Main application function
