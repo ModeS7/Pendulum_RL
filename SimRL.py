@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
+from torch.utils.tensorboard import SummaryWriter
+import os
+from datetime import datetime
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numba as nb
@@ -666,6 +669,7 @@ class SACAgent:
         self.actor_optimizer.step()
 
         # Update automatic entropy tuning parameter
+        alpha_loss = None
         if self.automatic_entropy_tuning:
             alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
 
@@ -682,7 +686,9 @@ class SACAgent:
 
         return {
             'critic_loss': critic_loss.item(),
-            'actor_loss': actor_loss.item()
+            'actor_loss': actor_loss.item(),
+            'alpha_loss': alpha_loss.item() if alpha_loss is not None else 0,
+            'alpha': alpha.item() if isinstance(alpha, torch.Tensor) else alpha
         }
 
 
@@ -790,9 +796,18 @@ def plot_episode(episode, states, actions, dt, total_reward, balanced_time=None,
 
 # ============= Training and Evaluation Functions =============
 def train_or_continue(env, agent=None, model_path=None, critic_path=None, episodes=1000,
-                      batch_size=8192, replay_buffer_size=100000, max_steps=1300, lr=3e-4):
+                      batch_size=8192, replay_buffer_size=100000, max_steps=1300, lr=3e-4,
+                      log_dir='runs'):
     """Unified training function that handles both new training and continuing from a checkpoint"""
     is_continuing = agent is not None or model_path is not None
+
+    # Create a unique run name for TensorBoard
+    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    run_name = f"{'continued' if is_continuing else 'new'}_r{env.randomization_factor}_d{env.delay_steps}_{current_time}"
+    tb_log_dir = os.path.join(log_dir, run_name)
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    print(f"TensorBoard logs will be saved to {tb_log_dir}")
+    print(f"To view, run: tensorboard --logdir={log_dir}")
 
     # Starting time
     start_time = time()
@@ -800,6 +815,8 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
     # Initialize metrics
     episode_rewards = []
     avg_rewards = []
+    critic_losses = []  # Track critic losses
+    actor_losses = []  # Track actor losses
 
     # Initialize agent if not provided
     if agent is None:
@@ -852,15 +869,23 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
     # Set up progress tracking with tqdm
     pbar = tqdm(range(episodes), desc="Training")
 
+    # For moving average of losses
+    critic_loss_window = deque(maxlen=100)
+    actor_loss_window = deque(maxlen=100)
+    alpha_values = deque(maxlen=100)  # Track entropy coefficient values
+
     # Allocate arrays for episode data collection (to avoid repeated allocations)
     episode_states_buffer = np.zeros((max_steps, 4))
     episode_actions_buffer = np.zeros(max_steps)
-    episode_rewards_buffer = np.zeros(max_steps)  # New buffer for rewards
+    episode_rewards_buffer = np.zeros(max_steps)  # Buffer for rewards
 
     # Training loop
     for episode in pbar:
         state = env.reset()  # Randomize parameters for this episode
         episode_reward = 0
+        episode_critic_losses = []  # Track losses for this episode
+        episode_actor_losses = []
+        episode_alphas = []  # Track alpha values for this episode
 
         # If we're going to plot this episode, prepare to collect state data
         plot_this_episode = (episode + 1) % 10 == 0
@@ -885,7 +910,22 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
 
             # Update parameters if enough samples
             if len(replay_buffer) > batch_size:
-                agent.update_parameters(replay_buffer, batch_size)
+                loss_info = agent.update_parameters(replay_buffer, batch_size)
+                episode_critic_losses.append(loss_info['critic_loss'])
+                episode_actor_losses.append(loss_info['actor_loss'])
+
+                # Get current alpha value
+                if agent.automatic_entropy_tuning:
+                    current_alpha = agent.log_alpha.exp().item()
+                else:
+                    current_alpha = agent.alpha
+
+                episode_alphas.append(current_alpha)
+
+                # Update moving average for loss tracking
+                critic_loss_window.append(loss_info['critic_loss'])
+                actor_loss_window.append(loss_info['actor_loss'])
+                alpha_values.append(current_alpha)
 
             if done:
                 break
@@ -895,12 +935,54 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
         avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
         avg_rewards.append(avg_reward)
 
-        # Update progress bar
-        pbar.set_postfix({'reward': f"{episode_reward:.2f}", 'avg': f"{avg_reward:.2f}"})
+        # Calculate average losses for this episode
+        if episode_critic_losses:
+            critic_losses.append(np.mean(episode_critic_losses))
+            actor_losses.append(np.mean(episode_actor_losses))
+
+        # Calculate moving averages for display
+        avg_critic_loss = np.mean(critic_loss_window) if critic_loss_window else 0
+        avg_actor_loss = np.mean(actor_loss_window) if actor_loss_window else 0
+        avg_alpha = np.mean(alpha_values) if alpha_values else 0
+
+        # Update progress bar with reward and loss information
+        pbar.set_postfix({
+            'reward': f"{episode_reward:.2f}",
+            'avg_r': f"{avg_reward:.2f}",
+            'critic_loss': f"{avg_critic_loss:.4f}",
+            'actor_loss': f"{avg_actor_loss:.4f}"
+        })
+
+        # Log to TensorBoard
+        writer.add_scalar('Rewards/Episode', episode_reward, episode)
+        writer.add_scalar('Rewards/Average', avg_reward, episode)
+        if episode_critic_losses:
+            writer.add_scalar('Losses/Critic', np.mean(episode_critic_losses), episode)
+            writer.add_scalar('Losses/Actor', np.mean(episode_actor_losses), episode)
+        if episode_alphas:
+            writer.add_scalar('Parameters/Alpha', np.mean(episode_alphas), episode)
+
+        # Also track number of steps per episode
+        writer.add_scalar('Episode/Steps', step + 1, episode)
+
+        # Track learning rates
+        if hasattr(agent, 'actor_optimizer'):
+            writer.add_scalar('Parameters/Actor_LR', agent.actor_optimizer.param_groups[0]['lr'], episode)
+        if hasattr(agent, 'critic_optimizer'):
+            writer.add_scalar('Parameters/Critic_LR', agent.critic_optimizer.param_groups[0]['lr'], episode)
+
+        # Log environment parameters
+        if hasattr(env, 'randomization_factor'):
+            writer.add_scalar('Environment/Randomization', env.randomization_factor, episode)
+        if hasattr(env, 'delay_steps'):
+            writer.add_scalar('Environment/Delay_Steps', env.delay_steps, episode)
+        if hasattr(env, 'current_delay'):
+            writer.add_scalar('Environment/Current_Delay', env.current_delay, episode)
 
         if (episode + 1) % 10 == 0:
             # Plot episode for visual progress tracking
-            print(f"Episode {episode + 1} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f}")
+            print(
+                f"Episode {episode + 1} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
             if plot_this_episode:
                 balanced_time = calculate_balanced_time(episode_states_buffer[:states_count], env.base_dt)
                 plot_episode(
@@ -915,8 +997,11 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
                     randomized=True,
                     delay_steps=env.delay_steps,
                     env=env,
-                    rewards=episode_rewards_buffer[:states_count]  # Pass the collected rewards
+                    rewards=episode_rewards_buffer[:states_count]
                 )
+
+                # Log balance time to TensorBoard
+                writer.add_scalar('Performance/Balance_Time', balanced_time, episode)
 
         # Early stopping if well trained
         """if avg_reward > 5000 and episode > 50:  # Higher threshold for robust policy
@@ -926,7 +1011,41 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
         if (episode + 1) % 100 == 0:
             # Save model periodically
             timestamp = int(time())
-            torch.save(agent.actor.state_dict(), f"{episode}_actor_{timestamp}.pth")
+            model_save_path = f"{episode}_actor_{timestamp}.pth"
+            torch.save(agent.actor.state_dict(), model_save_path)
+            print(f"Saved model checkpoint to {model_save_path}")
+
+            # Add model graph to TensorBoard (only once)
+            if episode == 0 and hasattr(agent, 'actor'):
+                # Create a dummy input
+                dummy_input = torch.zeros((1, 6), dtype=torch.float32).to(agent.device)
+                try:
+                    writer.add_graph(agent.actor, dummy_input)
+                except Exception as e:
+                    print(f"Could not add model graph to TensorBoard: {e}")
+
+            # Also plot the loss curves
+            plt.figure(figsize=(12, 8))
+
+            plt.subplot(2, 1, 1)
+            plt.plot(critic_losses, label='Critic Loss')
+            plt.xlabel('Episodes')
+            plt.ylabel('Critic Loss')
+            plt.title('Training Critic Loss')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+
+            plt.subplot(2, 1, 2)
+            plt.plot(actor_losses, label='Actor Loss')
+            plt.xlabel('Episodes')
+            plt.ylabel('Actor Loss')
+            plt.title('Training Actor Loss')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+
+            plt.tight_layout()
+            plt.savefig(f"losses_{episode + 1}.png")
+            plt.close()
 
     training_time = time() - start_time
     print(f"Training completed in {training_time:.2f} seconds!")
@@ -937,17 +1056,35 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
     torch.save(agent.actor.state_dict(), f"{prefix}_actor_{timestamp}.pth")
     torch.save(agent.critic.state_dict(), f"{prefix}_critic_{timestamp}.pth")
 
-    # Plot training progress
-    plt.figure(figsize=(10, 5))
+    # Plot training progress including rewards and losses
+    plt.figure(figsize=(15, 10))
+
+    # Plot rewards
+    plt.subplot(2, 1, 1)
     plt.plot(episode_rewards, label='Episode Reward')
-    plt.plot(avg_rewards, label='Moving Average')
+    plt.plot(avg_rewards, label='Moving Average Reward')
     plt.xlabel('Episodes')
     plt.ylabel('Reward')
     plt.title(f'{"Continued" if is_continuing else "SAC"} Training Results')
     plt.legend()
     plt.grid(True)
+
+    # Plot losses
+    plt.subplot(2, 1, 2)
+    plt.plot(critic_losses, label='Critic Loss')
+    plt.plot(actor_losses, label='Actor Loss')
+    plt.xlabel('Episodes')
+    plt.ylabel('Loss')
+    plt.title('Training Losses')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
     plt.savefig(f"{prefix}_training_{timestamp}.png")
     plt.close()
+
+    # Close the TensorBoard writer
+    writer.close()
 
     return agent
 
@@ -1167,10 +1304,11 @@ def main():
     train_parser.add_argument('--delay', type=int, default=0, help='Fixed observation delay steps')
     train_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
     train_parser.add_argument('--episodes', type=int, default=500, help='Number of episodes to train')
-    train_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for continued training')
+    train_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for training')
     train_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
     train_parser.add_argument('--dt', type=float, default=0.0115, help='Base timestep in seconds')
     train_parser.add_argument('--dt-random', type=float, default=0.0, help='Randomization factor for timestep')
+    train_parser.add_argument('--log-dir', type=str, default='runs', help='Directory for TensorBoard logs')
 
     # Load and evaluate a model
     load_parser = subparsers.add_parser('load', help='Load and evaluate a pre-trained model')
@@ -1194,6 +1332,7 @@ def main():
     continue_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
     continue_parser.add_argument('--dt', type=float, default=0.0115, help='Base timestep in seconds')
     continue_parser.add_argument('--dt-random', type=float, default=0.0, help='Randomization factor for timestep')
+    continue_parser.add_argument('--log-dir', type=str, default='runs', help='Directory for TensorBoard logs')
 
     args = parser.parse_args()
 
@@ -1228,7 +1367,8 @@ def main():
         agent = train_or_continue(
             env,
             episodes=args.episodes,
-            lr=args.lr
+            lr=args.lr,
+            log_dir=args.log_dir if hasattr(args, 'log_dir') else 'runs'
         )
 
         # Evaluate trained agent
@@ -1275,7 +1415,8 @@ def main():
             model_path=args.model_path,
             critic_path=args.critic,
             episodes=args.episodes,
-            lr=args.lr
+            lr=args.lr,
+            log_dir=args.log_dir if hasattr(args, 'log_dir') else 'runs'
         )
 
         # Optionally evaluate the improved agent
