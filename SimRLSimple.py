@@ -518,7 +518,7 @@ def train():
     # Hyperparameters
     state_dim = 6  # Our observation space
     action_dim = 1  # Motor voltage (normalized)
-    max_episodes = 100
+    max_episodes = 1000
     max_steps = 1300
     batch_size = 256
     replay_buffer_size = 100000
@@ -545,6 +545,11 @@ def train():
         state = env.reset()
         episode_reward = 0
 
+        # Track losses and alpha for this episode
+        critic_losses = []
+        actor_losses = []
+        alpha_values = []
+
         # If we're going to plot this episode, prepare to collect state data
         plot_this_episode = (episode + 1) % 10 == 0
         if plot_this_episode:
@@ -569,7 +574,12 @@ def train():
             # Update if enough samples
             if len(replay_buffer) > batch_size:
                 for _ in range(updates_per_step):
-                    agent.update_parameters(replay_buffer, batch_size)
+                    update_info = agent.update_parameters(replay_buffer, batch_size)
+                    critic_losses.append(update_info['critic_loss'])
+                    actor_losses.append(update_info['actor_loss'])
+                    # Store alpha if using automatic entropy tuning
+                    if agent.automatic_entropy_tuning:
+                        alpha_values.append(agent.alpha.item())
 
             if done:
                 break
@@ -579,15 +589,23 @@ def train():
         avg_reward = np.mean(episode_rewards[-100:])
         avg_rewards.append(avg_reward)
 
+        # Calculate average losses and alpha for this episode
+        avg_critic_loss = np.mean(critic_losses) if critic_losses else 0.0
+        avg_actor_loss = np.mean(actor_losses) if actor_losses else 0.0
+        avg_alpha = np.mean(alpha_values) if alpha_values else 0.0
+
         if (episode + 1) % 10 == 0:
-            print(f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f}")
+            print(
+                f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
                 plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward)
                 # Save trained model
                 timestamp = int(time())
-                torch.save(agent.actor.state_dict(), f"{episode}_actor_{timestamp}.pth")
+
+        if (episode + 1) % 100 == 0:
+            torch.save(agent.actor.state_dict(), f"{episode + 1}_actor_{timestamp}.pth")
 
         # Early stopping if well trained
         if avg_reward > 5000 and episode > 50:
@@ -612,7 +630,7 @@ def train():
     plt.legend()
     plt.grid(True)
     plt.savefig("sac_training_progress.png")
-    #plt.show()
+    # plt.show()
     plt.close()
 
     return agent
