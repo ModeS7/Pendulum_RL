@@ -27,6 +27,7 @@ quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
+voltage_deadzone = 0.2  # Dead zone for motor voltage
 max_voltage = 10.0  # Maximum motor voltage
 THETA_MIN = -2.0  # Minimum arm angle (radians)
 THETA_MAX = 2.0  # Maximum arm angle (radians)
@@ -47,7 +48,7 @@ def clip_value(value, min_value, max_value):
 @nb.njit(fastmath=True, cache=True)
 def apply_voltage_deadzone(vm):
     """Apply motor voltage dead zone"""
-    if -0.2 <= vm <= 0.2:
+    if -voltage_deadzone <= vm <= voltage_deadzone:
         vm = 0.0
     return vm
 
@@ -106,7 +107,7 @@ def dynamics_step(state, t, vm):
     C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
 
     # For theta_L equation:
-    M21 = -half_mL_LL_LA * np.cos(theta_L)
+    M21 = -half_mL_LL_LA * np.cos(theta_L)  # Signe was wrong in the original code
     M22 = JL + quarter_mL_LL_squared
     C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
     G = half_mL_LL_g * np.sin(theta_L)
@@ -167,126 +168,221 @@ def rk4_integration(state0, t_span, dt, voltage_data, time_data):
 
 
 # -------------------- MAIN COMPARISON SCRIPT --------------------
-def main():
-    start_time = time()
-    print("Starting pendulum simulation vs real data comparison...")
+def process_dataset(file_name):
+    """Process a single dataset file and return simulation results and errors"""
+    print(f"\nProcessing dataset: {file_name}")
 
-    # Load real data
-    real_data = pd.read_csv('df3.csv')
+    try:
+        # Load real data
+        real_data = pd.read_csv(file_name)
 
-    # Convert time to seconds from milliseconds and set relative to start time
-    real_data_time = (real_data['time'] - real_data['time'].iloc[0]) / 1000.0
-    real_data_voltage = real_data['voltage'].values
+        # Convert time to seconds from milliseconds and set relative to start time
+        real_data_time = (real_data['time'] - real_data['time'].iloc[0]) / 1000.0
+        real_data_voltage = real_data['voltage'].values
 
-    # Convert angles from degrees to radians for comparison
-    real_data_angle = np.radians(real_data['position'].values)  # Arm angle (theta)
-    real_data_unwrapped_angle = np.radians(real_data['unwrapped_pendulum_angle'].values)  # Pendulum angle (alpha)
+        # Convert angles from degrees to radians for comparison
+        real_data_angle = np.radians(real_data['position'].values)  # Arm angle (theta)
+        real_data_unwrapped_angle = np.radians(real_data['unwrapped_pendulum_angle'].values)  # Pendulum angle (alpha)
 
-    # Calculate derivatives (velocities) from real data
-    dt_real = np.diff(real_data_time)
-    real_data_angle_dot = np.zeros_like(real_data_angle)
-    real_data_angle_dot[1:] = np.diff(real_data_angle) / dt_real
+        # Calculate derivatives (velocities) from real data
+        dt_real = np.diff(real_data_time)
+        real_data_angle_dot = np.zeros_like(real_data_angle)
+        real_data_angle_dot[1:] = np.diff(real_data_angle) / dt_real
 
-    real_data_unwrapped_angle_dot = np.zeros_like(real_data_unwrapped_angle)
-    real_data_unwrapped_angle_dot[1:] = np.diff(real_data_unwrapped_angle) / dt_real
+        real_data_unwrapped_angle_dot = np.zeros_like(real_data_unwrapped_angle)
+        real_data_unwrapped_angle_dot[1:] = np.diff(real_data_unwrapped_angle) / dt_real
 
-    print("Real data loaded successfully.")
-    print(f"Real data time range: {real_data_time.min():.2f}s to {real_data_time.max():.2f}s")
+        print(f"Real data loaded successfully.")
+        print(f"Real data time range: {real_data_time.min():.2f}s to {real_data_time.max():.2f}s")
 
-    # Simulation parameters
-    t_span = (0.0, real_data_time.max())  # Match real data time range
-    dt = 0.001  # 10ms timestep (100Hz) - can be adjusted for accuracy
+        # Simulation parameters
+        t_span = (0.0, real_data_time.max())  # Match real data time range
+        dt = 0.001  # 1ms timestep (1000Hz) - can be adjusted for accuracy
 
-    # Use the initial conditions from real data
-    initial_theta = real_data_angle[0]
-    initial_alpha = real_data_unwrapped_angle[0]
-    initial_theta_dot = real_data_angle_dot[0]
-    initial_alpha_dot = real_data_unwrapped_angle_dot[0]
+        # Use the initial conditions from real data
+        initial_theta = real_data_angle[0]
+        initial_alpha = real_data_unwrapped_angle[0]
+        initial_theta_dot = real_data_angle_dot[0]
+        initial_alpha_dot = real_data_unwrapped_angle_dot[0]
 
-    initial_state = np.array([initial_theta, initial_alpha, initial_theta_dot, initial_alpha_dot])
+        initial_state = np.array([initial_theta, initial_alpha, initial_theta_dot, initial_alpha_dot])
 
-    print("Running simulation with real voltage data...")
-    t_sim, states_sim = rk4_integration(
-        initial_state, t_span, dt, real_data_voltage, real_data_time
-    )
+        print("Running simulation with real voltage data...")
+        t_sim, states_sim = rk4_integration(
+            initial_state, t_span, dt, real_data_voltage, real_data_time
+        )
 
-    # Extract results
-    theta_sim = states_sim[0]  # Arm angle from simulation
-    alpha_sim = states_sim[1]  # Pendulum angle from simulation
+        # Extract results
+        theta_sim = states_sim[0]  # Arm angle from simulation
+        alpha_sim = states_sim[1]  # Pendulum angle from simulation
 
-    # Calculate normalized angles for visualization
-    alpha_normalized_sim = np.zeros(len(alpha_sim))
-    for i in range(len(alpha_sim)):
-        alpha_normalized_sim[i] = alpha_sim[i]
+        # Calculate normalized angles for visualization
+        alpha_normalized_sim = np.zeros(len(alpha_sim))
+        for i in range(len(alpha_sim)):
+            alpha_normalized_sim[i] = alpha_sim[i]
 
-    # Calculate errors between simulation and real data
-    # Interpolate simulation results to match real data time points
-    from scipy.interpolate import interp1d
+        # Calculate errors between simulation and real data
+        # Interpolate simulation results to match real data time points
+        from scipy.interpolate import interp1d
 
-    # Interpolate simulation results
-    theta_interp = interp1d(t_sim, theta_sim, bounds_error=False, fill_value="extrapolate")
-    alpha_interp = interp1d(t_sim, alpha_normalized_sim, bounds_error=False, fill_value="extrapolate")
+        # Interpolate simulation results
+        theta_interp = interp1d(t_sim, theta_sim, bounds_error=False, fill_value="extrapolate")
+        alpha_interp = interp1d(t_sim, alpha_normalized_sim, bounds_error=False, fill_value="extrapolate")
 
-    # Calculate errors at real data time points
-    theta_error = theta_interp(real_data_time) - real_data_angle
-    alpha_error = alpha_interp(real_data_time) - real_data_unwrapped_angle
+        # Calculate errors at real data time points
+        theta_error = theta_interp(real_data_time) - real_data_angle
+        alpha_error = alpha_interp(real_data_time) - real_data_unwrapped_angle
 
-    # Calculate RMSE
-    theta_rmse = np.sqrt(np.mean(theta_error ** 2))
-    alpha_rmse = np.sqrt(np.mean(alpha_error ** 2))
+        # Calculate RMSE
+        theta_rmse = np.sqrt(np.mean(theta_error ** 2))
+        alpha_rmse = np.sqrt(np.mean(alpha_error ** 2))
 
-    print(f"Simulation with real voltage - Theta RMSE: {theta_rmse:.4f} rad, Alpha RMSE: {alpha_rmse:.4f} rad")
+        print(f"Simulation with real voltage - Theta RMSE: {theta_rmse:.4f} rad, Alpha RMSE: {alpha_rmse:.4f} rad")
 
-    # Plot results
-    print("Generating comparison plots...")
+        # Prepare results to return
+        results = {
+            'real_data_time': real_data_time,
+            'real_data_angle': real_data_angle,
+            'real_data_unwrapped_angle': real_data_unwrapped_angle,
+            't_sim': t_sim,
+            'theta_sim': theta_sim,
+            'alpha_normalized_sim': alpha_normalized_sim,
+            'theta_error': theta_error,
+            'alpha_error': alpha_error,
+            'theta_rmse': theta_rmse,
+            'alpha_rmse': alpha_rmse
+        }
+
+        return results
+
+    except Exception as e:
+        print(f"Error processing {file_name}: {str(e)}")
+        return None
+
+
+def create_comparison_plots(results, dataset_name):
+    """Create comparison plots for a dataset"""
+    if results is None:
+        print(f"Skipping plot generation for {dataset_name} due to processing error.")
+        return
+
+    print(f"Generating comparison plots for {dataset_name}...")
     plt.figure(figsize=(16, 16))
 
     # Plot 1: Arm Angle (Theta) Comparison
     plt.subplot(4, 1, 1)
-    plt.plot(real_data_time, real_data_angle, 'k-', linewidth=2, label='Real Data')
-    plt.plot(t_sim, theta_sim, 'r-', linewidth=1.5, label='Simulation')
+    plt.plot(results['real_data_time'], results['real_data_angle'], 'k-', linewidth=2, label='Real Data')
+    plt.plot(results['t_sim'], results['theta_sim'], 'r-', linewidth=1.5, label='Simulation')
     plt.axhline(y=THETA_MAX, color='g', linestyle='-.', alpha=0.5, label='Theta Limits')
     plt.axhline(y=THETA_MIN, color='g', linestyle='-.', alpha=0.5)
     plt.ylabel('Arm angle (rad)')
-    plt.title('Comparison of Arm Angle (Theta)')
+    plt.title(f'Comparison of Arm Angle (Theta) - {dataset_name}')
     plt.legend()
     plt.grid(True)
 
     # Plot 2: Pendulum Angle (Alpha) Comparison
     plt.subplot(4, 1, 2)
-    plt.plot(real_data_time, real_data_unwrapped_angle, 'k-', linewidth=2, label='Real Data')
-    plt.plot(t_sim, alpha_normalized_sim, 'r-', linewidth=1.5, label='Simulation')
+    plt.plot(results['real_data_time'], results['real_data_unwrapped_angle'], 'k-', linewidth=2, label='Real Data')
+    plt.plot(results['t_sim'], results['alpha_normalized_sim'], 'r-', linewidth=1.5, label='Simulation')
     plt.axhline(y=0, color='g', linestyle='-.', alpha=0.5, label='Upright Position')
     plt.ylabel('Pendulum angle (rad)')
-    plt.title('Comparison of Pendulum Angle (Alpha)')
+    plt.title(f'Comparison of Pendulum Angle (Alpha) - {dataset_name}')
     plt.legend()
     plt.grid(True)
 
     # Plot 3: Arm Angle Error
     plt.subplot(4, 1, 3)
-    plt.plot(real_data_time, theta_error, 'r-', linewidth=1.5, label=f'Simulation Error (RMSE: {theta_rmse:.4f})')
+    plt.plot(results['real_data_time'], results['theta_error'], 'r-', linewidth=1.5,
+             label=f'Simulation Error (RMSE: {results["theta_rmse"]:.4f})')
     plt.axhline(y=0, color='k', linestyle='-', alpha=0.5)
     plt.ylabel('Arm angle error (rad)')
-    plt.title('Arm Angle (Theta) Error')
+    plt.title(f'Arm Angle (Theta) Error - {dataset_name}')
     plt.legend()
     plt.grid(True)
 
     # Plot 4: Pendulum Angle Error
     plt.subplot(4, 1, 4)
-    plt.plot(real_data_time, alpha_error, 'r-', linewidth=1.5, label=f'Simulation Error (RMSE: {alpha_rmse:.4f})')
+    plt.plot(results['real_data_time'], results['alpha_error'], 'r-', linewidth=1.5,
+             label=f'Simulation Error (RMSE: {results["alpha_rmse"]:.4f})')
     plt.axhline(y=0, color='k', linestyle='-', alpha=0.5)
     plt.xlabel('Time (s)')
     plt.ylabel('Pendulum angle error (rad)')
-    plt.title('Pendulum Angle (Alpha) Error')
+    plt.title(f'Pendulum Angle (Alpha) Error - {dataset_name}')
     plt.legend()
     plt.grid(True)
 
     plt.tight_layout()
-    plt.savefig("pendulum_simulation_vs_real_data.png", dpi=300)
-    print("Plot saved as 'pendulum_simulation_vs_real_data.png'")
+
+    # Save the figure
+    output_filename = f"pendulum_simulation_vs_real_data_{dataset_name}.png"
+    plt.savefig(output_filename, dpi=300)
+    plt.close()
+    print(f"Plot saved as '{output_filename}'")
+
+
+def main():
+    start_time = time()
+    print("Starting pendulum simulation vs real data comparison for multiple datasets...")
+
+    # List of datasets to process
+    datasets = ['df1.csv', 'df2.csv', 'df3.csv', 'df4.csv', 'df5.csv', 'df6.csv']
+
+    # Summary data for final report
+    summary_data = []
+
+    # Process each dataset
+    for dataset in datasets:
+        dataset_name = dataset.split('.')[0]  # Remove file extension
+        results = process_dataset(dataset)
+
+        if results:
+            # Create plots for this dataset
+            create_comparison_plots(results, dataset_name)
+
+            # Add to summary
+            summary_data.append({
+                'dataset': dataset_name,
+                'theta_rmse': results['theta_rmse'],
+                'alpha_rmse': results['alpha_rmse']
+            })
+
+    # Create summary plot
+    if summary_data:
+        print("\nGenerating summary comparison...")
+        datasets = [data['dataset'] for data in summary_data]
+        theta_rmses = [data['theta_rmse'] for data in summary_data]
+        alpha_rmses = [data['alpha_rmse'] for data in summary_data]
+
+        plt.figure(figsize=(12, 8))
+
+        x = np.arange(len(datasets))
+        width = 0.35
+
+        plt.bar(x - width / 2, theta_rmses, width, label='Arm Angle (Theta) RMSE')
+        plt.bar(x + width / 2, alpha_rmses, width, label='Pendulum Angle (Alpha) RMSE')
+
+        plt.xlabel('Dataset')
+        plt.ylabel('RMSE (radians)')
+        plt.title('Simulation Error Comparison Across Datasets')
+        plt.xticks(x, datasets)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig("pendulum_simulation_error_summary.png", dpi=300)
+        print("Summary plot saved as 'pendulum_simulation_error_summary.png'")
+
+        # Print summary table
+        print("\nSummary of simulation errors across datasets:")
+        print("=" * 60)
+        print(f"{'Dataset':<10} {'Arm Angle RMSE':<20} {'Pendulum Angle RMSE':<20}")
+        print("-" * 60)
+        for data in summary_data:
+            print(f"{data['dataset']:<10} {data['theta_rmse']:<20.4f} {data['alpha_rmse']:<20.4f}")
+        print("=" * 60)
 
     sim_time = time() - start_time
-    print(f"Analysis completed in {sim_time:.2f} seconds!")
+    print(f"\nAnalysis completed in {sim_time:.2f} seconds!")
 
 
 if __name__ == "__main__":
