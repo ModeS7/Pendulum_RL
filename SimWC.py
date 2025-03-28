@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 from time import time
 import numba as nb
 
+from QUBE_PYTHON.logger import directory
+
 # System Parameters from the system identification document (Table 3)
 Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.0431  # Motor back-emf constant
@@ -68,56 +70,71 @@ def normalize_angle(angle):
 # -------------------- CONTROL ALGORITHMS --------------------
 @nb.njit(fastmath=True, cache=True)
 def simple_bang_bang(t, theta, alpha, theta_dot, alpha_dot):
-    """Ultra-fast bang-bang controller"""
-    # Add theta limit avoidance to controller
-    limit_margin = 0.6
+    """Ultra-fast bang-bang controller for inverted pendulum swing-up"""
+    # First, handle limit avoidance with highest priority
+    limit_margin = 1.5
     if theta > THETA_MAX - limit_margin and theta_dot > 0:
         return -max_voltage  # If close to upper limit, push back
     elif theta < THETA_MIN + limit_margin and theta_dot < 0:
         return max_voltage  # If close to lower limit, push back
 
-    if alpha == 0:
-        alpha = 0
+    pos_vel_same_sign = alpha * alpha_dot > 0
+    if pos_vel_same_sign:
+        # Apply torque against position to pump energy
+        if alpha < 0:
+            return -max_voltage
+        else:
+            return max_voltage
     else:
-        side = np.sin(alpha)/abs(np.sin(alpha))
-    if alpha_dot == 0:
-        alpha_dot = 0
-    else:
-        direction = alpha_dot / abs(alpha_dot)
+        # Apply torque with position
+        if alpha < 0:
+            return max_voltage
+        else:
+            return -max_voltage
 
-    if theta > THETA_MAX-0.6:
-        direction = 1
-    elif theta < THETA_MIN+0.6:
-        direction = -1
-
-    if direction == 1:
-        v = -max_voltage
-    elif direction == -1:
-        v = max_voltage
-    else:
-        v = 0
-
-    return clip_value(v, -max_voltage, max_voltage)
 
 @nb.njit(fastmath=True, cache=True)
 def energy_control(t, theta, alpha, theta_dot, alpha_dot):
-    alpha_norm = normalize_angle(alpha + np.pi)
-    E = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2
-    E_ref = Mp_g_Lp  # Energy at upright position
-    E_error = E - E_ref
+    """Improved energy-based swing-up controller with enhanced limit avoidance"""
+    # Calculate current energy and reference energy
+    E_current = Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * Jp * alpha_dot ** 2
+    E_ref = 2 * Mp_g_Lp  # Energy at upright position (2*m*g*L)
+    E_error = E_ref - E_current  # Positive when we need to add energy
 
-    # Exponential penalty when approaching limits
-    theta_penalty = 1.0
-    limit_margin = 0.5  # How close to the limit before strong penalty
-    if theta > THETA_MAX - limit_margin:
-        limit_penalty = 10.0 * np.exp((theta - (THETA_MAX - limit_margin)) / limit_margin)
-        theta_penalty += limit_penalty
-    elif theta < THETA_MIN + limit_margin:
-        limit_penalty = -10.0 * np.exp(((THETA_MIN + limit_margin) - theta) / limit_margin)
-        theta_penalty += limit_penalty
+    # Use standard energy pumping formula with sign(alpha_dot * sin(alpha))
+    # This determines when to apply torque to efficiently add/remove energy
+    pump_direction = np.sign(alpha_dot * np.sin(alpha))
 
-    direction = 1.0 if np.cos(alpha_norm) * alpha_dot > 0 else -1.0
-    u = 0.5 * E_error * direction - theta_penalty
+    # Adaptive gain - use smaller gain when close to target energy for smoother control
+    k_energy = 0.5  # Base gain
+    if abs(E_error) < 0.3 * Mp_g_Lp:
+        k_energy = 0.3  # More precise control when close to target
+
+    # Energy pumping control
+    u_energy = k_energy * E_error * pump_direction
+
+    # Enhanced limit avoidance with velocity consideration
+    # Use larger margin when moving quickly to account for momentum
+    base_margin = 0.5
+    velocity_factor = min(1.0, abs(theta_dot) / 2.0)
+    dynamic_margin = base_margin * (1.0 + velocity_factor)
+
+    # Calculate limit avoidance control
+    u_limit = 0.0
+    if theta > THETA_MAX - dynamic_margin:
+        # Stronger repulsion from upper limit when moving quickly
+        distance_ratio = (theta - (THETA_MAX - dynamic_margin)) / dynamic_margin
+        u_limit = -12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
+    elif theta < THETA_MIN + dynamic_margin:
+        # Stronger repulsion from lower limit when moving quickly
+        distance_ratio = ((THETA_MIN + dynamic_margin) - theta) / dynamic_margin
+        u_limit = 12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
+
+    # Add damping when pendulum has high velocity to prevent wild swings
+    u_damping = -0.1 * alpha_dot if abs(alpha_dot) > 5.0 else 0.0
+
+    # Combine all control components
+    u = u_energy + u_limit + u_damping
 
     return clip_value(u, -max_voltage, max_voltage)
 
@@ -127,7 +144,8 @@ def lqr_balance(theta, alpha, theta_dot, alpha_dot):
     alpha_upright = normalize_angle(alpha - np.pi)
 
     # Regular LQR control
-    u = -(-5.0 * theta + 50.0 * alpha_upright - 1.5 * theta_dot + 8.0 * alpha_dot)
+    #u = (2.0 * theta + 10.0 * alpha_upright + 1.5 * theta_dot + 8.0 * alpha_dot)  # 7v
+    u = (2.0 * theta + 50.0 * alpha_upright + 1.5 * theta_dot + 8.0 * alpha_dot) # 10v
 
     # Add limit avoidance term
     limit_margin = 0.3
@@ -237,7 +255,7 @@ def dynamics_step(state, t, vm):
     C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
 
     # For theta_L equation:
-    M21 = half_mL_LL_LA * np.cos(theta_L)
+    M21 = -half_mL_LL_LA * np.cos(theta_L)
     M22 = JL + quarter_mL_LL_squared
     C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
     G = half_mL_LL_g * np.sin(theta_L)
@@ -302,7 +320,7 @@ def main():
 
     # Simulation parameters
     t_span = (0.0, 15.0)  # 10 seconds of simulation
-    dt = 0.02  # 20ms timestep (50Hz)
+    dt = 0.0115  # 11.5ms timestep (87Hz)
 
     # Initial conditions
     initial_state = np.array([0.0, 0.1, 0.0, 0.0])  # [theta, alpha, theta_dot, alpha_dot]
