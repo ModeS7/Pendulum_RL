@@ -6,19 +6,21 @@ import numba as nb
 from scipy import signal
 
 # System Parameters from the system identification document (Table 3)
-Rm = 8.94  # Motor resistance (Ohm)
-Km = 0.0431  # Motor back-emf constant
+Rm = 8.4  # Motor resistance (Ohm)
+Km = 0.042  # Motor back-emf constant
 Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
 bm = 3e-4  # Viscous damping coefficient (Nm/rad/s)
 DA = 3e-4  # Damping coefficient of pendulum arm (Nm/rad/s)
 DL = 5e-4  # Damping coefficient of pendulum link (Nm/rad/s)
-mA = 0.053  # Weight of pendulum arm (kg)
+mA = 0.095  # Weight of pendulum arm (kg)
 mL = 0.024  # Weight of pendulum link (kg)
-LA = 0.086  # Length of pendulum arm (m)
-LL = 0.128  # Length of pendulum link (m)
+LA = 0.085  # Length of pendulum arm (m)
+LL = 0.129  # Length of pendulum link (m)
 JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
 JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
 g = 9.81  # Gravity constant (m/s^2)
+JA = mA * LA ** 2 * 7 / 48  # Pendulum arm moment of inertia (kg·m²)
+JL = mL * LL ** 2 / 3  # Pendulum link moment of inertia (kg·m²)
 
 # Pre-compute constants for optimization
 half_mL_LL_g = 0.5 * mL * LL * g
