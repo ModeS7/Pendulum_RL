@@ -321,10 +321,16 @@ class PendulumEnv:
         pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
 
         # COMPONENT 4: Smoother bonus for being close to upright position
-        # Instead of a hard cutoff, use a continuous Gaussian-like function
         upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
         stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
         bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
+
+        # COMPONENT 4.5: Smoother cost for being close to downright position
+        # For new convention, downright is at π
+        downright_alpha = normalize_angle(alpha - np.pi)
+        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
 
         # COMPONENT 5: Smoother penalty for approaching limits
         # Create a continuous penalty that increases as the arm approaches limits
@@ -351,7 +357,7 @@ class PendulumEnv:
         reward = (
                 upright_reward
                 #+ velocity_penalty
-                #+ pos_penalty
+                + pos_penalty
                 + bonus
                 + limit_penalty
                 + energy_reward
@@ -389,7 +395,7 @@ def dynamics_numba(state, t, vm, params, THETA_MAX, THETA_MIN):
              5] * sin_theta_L * cos_theta_L * theta_m_dot * theta_L_dot  # 0.5*mL*LL^2 * sin*cos * theta_m_dot*theta_L_dot
     C2 = params[4] * sin_theta_L * theta_L_dot ** 2  # half_mL_LL_LA * sin * theta_L_dot^2
 
-    M21 = params[4] * cos_theta_L  # half_mL_LL_LA * cos
+    M21 = -params[4] * cos_theta_L  # half_mL_LL_LA * cos
     M22 = params[11] + params[5]  # JL + quarter_mL_LL_squared
     C3 = -params[5] * cos_theta_L * sin_theta_L * theta_m_dot ** 2  # -quarter_mL_LL_squared * cos*sin * theta_m_dot^2
     G = params[3] * sin_theta_L  # half_mL_LL_g * sin
@@ -537,7 +543,7 @@ class SACAgent:
             hidden_dim=256,
             lr=3e-4,
             gamma=0.99,
-            tau=0.001,
+            tau=0.005,
             alpha=0.2,
             automatic_entropy_tuning=True
     ):
@@ -651,7 +657,7 @@ class SACAgent:
         # Optimize critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        #torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         # Update actor
@@ -665,7 +671,7 @@ class SACAgent:
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        #torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
         # Update automatic entropy tuning parameter
@@ -982,7 +988,8 @@ def train_or_continue(env, agent=None, model_path=None, critic_path=None, episod
         if (episode + 1) % 10 == 0:
             # Plot episode for visual progress tracking
             print(
-                f"Episode {episode + 1} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
+                f"Episode {episode + 1} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f} | "
+                f"C_Loss: {avg_critic_loss:.4f} | A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
             if plot_this_episode:
                 balanced_time = calculate_balanced_time(episode_states_buffer[:states_count], env.base_dt)
                 plot_episode(
@@ -1115,7 +1122,7 @@ def load_model(model_path, critic_path=None, state_dim=6, action_dim=1, hidden_d
     return agent
 
 
-@nb.njit(fastmath=True, cache=True)
+#@nb.njit(fastmath=True, cache=True)
 def evaluate_agent(agent, env, num_episodes=3, prefix="evaluation"):
     """Evaluate an agent's performance in an environment"""
     performance = {
@@ -1304,7 +1311,7 @@ def main():
     train_parser.add_argument('--delay', type=int, default=0, help='Fixed observation delay steps')
     train_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
     train_parser.add_argument('--episodes', type=int, default=500, help='Number of episodes to train')
-    train_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for training')
+    train_parser.add_argument('--lr', type=float, default=3, help='Learning rate for training')
     train_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
     train_parser.add_argument('--dt', type=float, default=0.0115, help='Base timestep in seconds')
     train_parser.add_argument('--dt-random', type=float, default=0.0, help='Randomization factor for timestep')
@@ -1328,7 +1335,7 @@ def main():
     continue_parser.add_argument('--delay', type=int, default=0, help='Fixed observation delay steps')
     continue_parser.add_argument('--delay-range', type=str, help='Variable delay range, format: min-max (e.g., 0-5)')
     continue_parser.add_argument('--episodes', type=int, default=500, help='Number of additional episodes to train')
-    continue_parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for continued training')
+    continue_parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate for continued training')
     continue_parser.add_argument('--eval', action='store_true', help='Evaluate the model after training')
     continue_parser.add_argument('--dt', type=float, default=0.0115, help='Base timestep in seconds')
     continue_parser.add_argument('--dt-random', type=float, default=0.0, help='Randomization factor for timestep')
