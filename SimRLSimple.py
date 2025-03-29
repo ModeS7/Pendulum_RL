@@ -111,7 +111,7 @@ def dynamics_step(state, t, vm):
     C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
 
     # For theta_L equation:
-    M21 = half_mL_LL_LA * np.cos(theta_L)
+    M21 = -half_mL_LL_LA * np.cos(theta_L)
     M22 = JL + quarter_mL_LL_squared
     C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
     G = half_mL_LL_g * np.sin(theta_L)
