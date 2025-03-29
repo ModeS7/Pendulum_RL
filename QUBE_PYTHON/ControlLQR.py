@@ -21,10 +21,10 @@ ENERGY_MODE = 3
 class SystemParameters:
     def __init__(self):
         # Control parameters
-        self.max_voltage = 8.0  # Maximum voltage (V)
+        self.max_voltage = 2.0  # Maximum voltage (V)
         self.theta_min = -2.0  # Minimum motor angle (rad)
         self.theta_max = 2.0  # Maximum motor angle (rad)
-        self.balance_range = np.radians(20)  # Range where balance control activates (rad)
+        self.balance_range = np.radians(15)  # Range where balance control activates (rad)
 
         # Energy control parameters (slightly adjusted for real system)
         self.m_p = 0.024  # Pendulum mass (kg)
@@ -32,8 +32,8 @@ class SystemParameters:
         self.l_com = self.l / 2  # Center of mass distance (m)
         self.J = (1 / 3) * self.m_p * self.l ** 2  # Moment of inertia (kg·m²)
         self.g = 9.81  # Gravity (m/s²)
-        self.ke = 50.0  # Energy controller gain
-        self.Er = 0.015  # Reference energy (J)
+        self.ke = 55.0  # Energy controller gain
+        self.Er = 0.056  # Reference energy (J)
 
         # Derived energy parameters (from simulation)
         self.Mp_g_Lp = self.m_p * self.g * self.l  # used in energy calculations
@@ -45,6 +45,7 @@ class SystemParameters:
         self.lqr_theta_dot_gain = 2.5  # Gain for motor velocity
         self.lqr_alpha_dot_gain = 8.0  # Gain for pendulum velocity
         self.lqr_avoid_factor = 20.0  # Limit avoidance factor
+        self.lqr_divider = 5.0  # Divider for LQR gains (was hardcoded as 5.0)
 
 
 class QUBEControllerWithBangBang:
@@ -63,6 +64,12 @@ class QUBEControllerWithBangBang:
         self.lqr_mode = False
         self.moving_to_position = False
         self.current_controller_mode = EMERGENCY_MODE  # Track current controller
+
+        # Track sign of LQR parameters (from script 2)
+        self.lqr_theta_sign = 1
+        self.lqr_alpha_sign = 1
+        self.lqr_theta_dot_sign = 1
+        self.lqr_alpha_dot_sign = 1
 
         # Data logging state
         self.data_logging = False
@@ -175,11 +182,21 @@ class QUBEControllerWithBangBang:
         self.lqr_theta_scale.set(self.params.lqr_theta_gain)
         self.lqr_theta_scale.grid(row=1, column=1, padx=5)
 
+        # Add sign toggle buttons for LQR parameters (from script 2)
+        self.lqr_theta_sign_btn = Button(lqr_frame, text="+", width=3,
+                                         command=self.toggle_theta_sign)
+        self.lqr_theta_sign_btn.grid(row=1, column=2, padx=5)
+
         Label(lqr_frame, text="Alpha Gain:").grid(row=2, column=0, padx=5)
         self.lqr_alpha_scale = Scale(lqr_frame, from_=0, to=100.0,
                                      resolution=1.0, orient=tk.HORIZONTAL, length=150)
         self.lqr_alpha_scale.set(self.params.lqr_alpha_gain)
         self.lqr_alpha_scale.grid(row=2, column=1, padx=5)
+
+        # Add sign toggle button for Alpha Gain
+        self.lqr_alpha_sign_btn = Button(lqr_frame, text="+", width=3,
+                                         command=self.toggle_alpha_sign)
+        self.lqr_alpha_sign_btn.grid(row=2, column=2, padx=5)
 
         Label(lqr_frame, text="Theta Dot Gain:").grid(row=3, column=0, padx=5)
         self.lqr_theta_dot_scale = Scale(lqr_frame, from_=0, to=5.0,
@@ -187,11 +204,28 @@ class QUBEControllerWithBangBang:
         self.lqr_theta_dot_scale.set(self.params.lqr_theta_dot_gain)
         self.lqr_theta_dot_scale.grid(row=3, column=1, padx=5)
 
+        # Add sign toggle button for Theta Dot Gain
+        self.lqr_theta_dot_sign_btn = Button(lqr_frame, text="+", width=3,
+                                             command=self.toggle_theta_dot_sign)
+        self.lqr_theta_dot_sign_btn.grid(row=3, column=2, padx=5)
+
         Label(lqr_frame, text="Alpha Dot Gain:").grid(row=4, column=0, padx=5)
         self.lqr_alpha_dot_scale = Scale(lqr_frame, from_=0, to=20.0,
                                          resolution=0.5, orient=tk.HORIZONTAL, length=150)
         self.lqr_alpha_dot_scale.set(self.params.lqr_alpha_dot_gain)
         self.lqr_alpha_dot_scale.grid(row=4, column=1, padx=5)
+
+        # Add sign toggle button for Alpha Dot Gain
+        self.lqr_alpha_dot_sign_btn = Button(lqr_frame, text="+", width=3,
+                                             command=self.toggle_alpha_dot_sign)
+        self.lqr_alpha_dot_sign_btn.grid(row=4, column=2, padx=5)
+
+        # Add a new slider for LQR divider factor
+        Label(lqr_frame, text="LQR Divider:").grid(row=5, column=0, padx=5)
+        self.lqr_divider_scale = Scale(lqr_frame, from_=1.0, to=20.0,
+                                       resolution=0.5, orient=tk.HORIZONTAL, length=150)
+        self.lqr_divider_scale.set(self.params.lqr_divider)
+        self.lqr_divider_scale.grid(row=5, column=1, padx=5)
 
         # Common parameters
         common_frame = Frame(param_frame)
@@ -309,6 +343,27 @@ class QUBEControllerWithBangBang:
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
 
+    # Toggle sign methods for LQR parameters (from script 2)
+    def toggle_theta_sign(self):
+        self.lqr_theta_sign *= -1
+        self.lqr_theta_sign_btn.config(text="+" if self.lqr_theta_sign > 0 else "-")
+        self.status_label.config(text=f"Theta Gain sign changed to {'+' if self.lqr_theta_sign > 0 else '-'}")
+
+    def toggle_alpha_sign(self):
+        self.lqr_alpha_sign *= -1
+        self.lqr_alpha_sign_btn.config(text="+" if self.lqr_alpha_sign > 0 else "-")
+        self.status_label.config(text=f"Alpha Gain sign changed to {'+' if self.lqr_alpha_sign > 0 else '-'}")
+
+    def toggle_theta_dot_sign(self):
+        self.lqr_theta_dot_sign *= -1
+        self.lqr_theta_dot_sign_btn.config(text="+" if self.lqr_theta_dot_sign > 0 else "-")
+        self.status_label.config(text=f"Theta Dot Gain sign changed to {'+' if self.lqr_theta_dot_sign > 0 else '-'}")
+
+    def toggle_alpha_dot_sign(self):
+        self.lqr_alpha_dot_sign *= -1
+        self.lqr_alpha_dot_sign_btn.config(text="+" if self.lqr_alpha_dot_sign > 0 else "-")
+        self.status_label.config(text=f"Alpha Dot Gain sign changed to {'+' if self.lqr_alpha_dot_sign > 0 else '-'}")
+
     def update_parameters(self):
         """Update control parameters from GUI"""
         self.params.max_voltage = self.bb_voltage_scale.get()
@@ -316,11 +371,12 @@ class QUBEControllerWithBangBang:
         self.params.ke = self.ke_scale.get()
         self.params.Er = self.er_scale.get()
 
-        # Update LQR parameters
-        self.params.lqr_theta_gain = self.lqr_theta_scale.get()
-        self.params.lqr_alpha_gain = self.lqr_alpha_scale.get()
-        self.params.lqr_theta_dot_gain = self.lqr_theta_dot_scale.get()
-        self.params.lqr_alpha_dot_gain = self.lqr_alpha_dot_scale.get()
+        # Update LQR parameters with sign toggle support (from script 2)
+        self.params.lqr_theta_gain = self.lqr_theta_sign * self.lqr_theta_scale.get()
+        self.params.lqr_alpha_gain = self.lqr_alpha_sign * self.lqr_alpha_scale.get()
+        self.params.lqr_theta_dot_gain = self.lqr_theta_dot_sign * self.lqr_theta_dot_scale.get()
+        self.params.lqr_alpha_dot_gain = self.lqr_alpha_dot_sign * self.lqr_alpha_dot_scale.get()
+        self.params.lqr_divider = self.lqr_divider_scale.get()
 
         self.status_label.config(text="Control parameters updated")
 
@@ -662,10 +718,10 @@ class QUBEControllerWithBangBang:
 
         # Check if we've reached the upright position
         if abs(self.normalize_angle(pendulum_angle + np.pi)) < self.params.balance_range:
-            # Switch to LQR for balancing
+            # Switch to LQR for balancing - using thread-safe approach from script 2
             if not self.lqr_mode:
-                self.toggle_lqr()
-                self.status_label.config(text="Switched to LQR for balance control")
+                self.master.after(0, self.toggle_lqr)
+                self.master.after(0, lambda: self.status_label.config(text="Switched to LQR for balance control"))
                 return
 
         # Use the simulation's bang-bang controller
@@ -680,54 +736,9 @@ class QUBEControllerWithBangBang:
         # Set controller mode
         self.current_controller_mode = BANGBANG_MODE
 
-    # Implement energy control from simulation (paste.txt)
-    def energy_control(self, t, theta, alpha, theta_dot, alpha_dot):
-        """Improved energy-based swing-up controller with enhanced limit avoidance"""
-        # Calculate current energy and reference energy
-        E_current = self.params.Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * self.params.Jp * alpha_dot ** 2
-        E_ref = self.params.Er  # Energy target from GUI
-        E_error = E_ref - E_current  # Positive when we need to add energy
-
-        # Use standard energy pumping formula with sign(alpha_dot * sin(alpha))
-        # This determines when to apply torque to efficiently add/remove energy
-        pump_direction = np.sign(alpha_dot * np.sin(alpha))
-
-        # Adaptive gain - use smaller gain when close to target energy for smoother control
-        k_energy = self.params.ke * 0.01  # Scale down GUI gain value
-        if abs(E_error) < 0.3 * self.params.Mp_g_Lp:
-            k_energy = k_energy * 0.6  # More precise control when close to target
-
-        # Energy pumping control
-        u_energy = k_energy * E_error * pump_direction
-
-        # Enhanced limit avoidance with velocity consideration
-        # Use larger margin when moving quickly to account for momentum
-        base_margin = 0.5
-        velocity_factor = min(1.0, abs(theta_dot) / 2.0)
-        dynamic_margin = base_margin * (1.0 + velocity_factor)
-
-        # Calculate limit avoidance control
-        u_limit = 0.0
-        if theta > self.params.theta_max - dynamic_margin:
-            # Stronger repulsion from upper limit when moving quickly
-            distance_ratio = (theta - (self.params.theta_max - dynamic_margin)) / dynamic_margin
-            u_limit = -12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
-        elif theta < self.params.theta_min + dynamic_margin:
-            # Stronger repulsion from lower limit when moving quickly
-            distance_ratio = ((self.params.theta_min + dynamic_margin) - theta) / dynamic_margin
-            u_limit = 12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
-
-        # Add damping when pendulum has high velocity to prevent wild swings
-        u_damping = -0.1 * alpha_dot if abs(alpha_dot) > 5.0 else 0.0
-
-        # Combine all control components
-        u = u_energy + u_limit + u_damping
-
-        return self.clip_value(u, -self.params.max_voltage, self.params.max_voltage)
-
-    # Update energy control using simulation algorithm
+    # IMPROVED ENERGY CONTROL IMPLEMENTATION FROM SCRIPT 2
     def update_energy_control(self):
-        """Update energy control using simulation algorithm"""
+        """Update energy-based swing-up control for the pendulum (improved from script 2)"""
         # Get current angles
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
@@ -736,85 +747,95 @@ class QUBEControllerWithBangBang:
         motor_angle = np.radians(motor_angle_deg)
         pendulum_angle = np.radians(pendulum_angle_deg)
 
-        # Calculate velocities using finite difference
-        current_time = time.time()
-        dt = current_time - self.prev_time
-
-        # Initialize previous values if needed
+        # Initialize prev_pendulum_angle if this is the first update
         if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
             self.prev_pendulum_angle = pendulum_angle
         if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
             self.prev_motor_angle = motor_angle
 
-        # Calculate velocities
+        # Calculate pendulum velocity via finite difference
+        current_time = time.time()
+        dt = current_time - self.prev_time
+
         pendulum_velocity = 0.0
         motor_velocity = 0.0
         if dt > 0:
             pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
             motor_velocity = (motor_angle - self.prev_motor_angle) / dt
 
-        # Update previous values
         self.prev_pendulum_angle = pendulum_angle
         self.prev_motor_angle = motor_angle
         self.prev_time = current_time
 
-        # Normalize pendulum angle for physics calculations (down = 0)
+        # Normalize pendulum angle - for energy calculation we want down position = 0
         pendulum_norm = self.normalize_angle(pendulum_angle)
 
-        # Check if pendulum is close to upright
+        # Get pendulum angle relative to upright position
         pendulum_upright = self.normalize_angle(pendulum_angle + np.pi)
+
+        # Check if we've reached the upright position
         if abs(pendulum_upright) < self.params.balance_range:
-            # Switch to LQR for balancing
+            # Switch to LQR for balancing - using thread-safe approach from script 2
             if not self.lqr_mode:
-                self.toggle_lqr()
-                self.status_label.config(text="Switched to LQR for balance control")
+                self.master.after(0, self.toggle_lqr)
+                self.master.after(0, lambda: self.status_label.config(text="Switched to LQR for balance control"))
                 return
 
-        # Use the simulation's energy controller
-        self.motor_voltage = self.energy_control(current_time, motor_angle, pendulum_norm,
-                                                 motor_velocity, pendulum_velocity)
+        # Calculate current energy of the pendulum (using pendulum_norm)
+        # E = Kinetic Energy + Potential Energy
+        E = 0.5 * self.params.J * pendulum_velocity ** 2 + \
+            self.params.m_p * self.params.g * self.params.l_com * (1 - np.cos(pendulum_norm))
 
-        # Calculate current energy for display
-        E_current = self.params.Mp_g_Lp * (1 - np.cos(pendulum_norm)) + 0.5 * self.params.Jp * pendulum_velocity ** 2
+        # Reference energy is the energy at upright position with zero velocity
         E_ref = self.params.Er
 
-        # Update status based on energy and angle from upright
-        upright_deg = abs(pendulum_upright) * 180 / np.pi
-        self.status_label.config(
-            text=f"Energy control - E={E_current:.3f}, E_ref={E_ref:.3f}, {upright_deg:.1f}° from upright")
+        # Energy error
+        E_error = E - E_ref
+
+        # Check if we're within balance range
+        if abs(pendulum_upright) < self.params.balance_range:
+            # Near upright position - apply damping control
+            if abs(pendulum_velocity) < 0.1:
+                # Very little motion, don't apply voltage
+                self.motor_voltage = 0.0
+            else:
+                # Apply opposite force to slow down
+                self.motor_voltage = -np.sign(pendulum_velocity) * 2.0
+
+            self.status_label.config(
+                text=f"Near balance - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
+        else:
+            # Check motor angle limits first
+            if motor_angle > self.params.theta_max - 0.3:
+                # Near upper limit, push back
+                self.motor_voltage = -self.params.max_voltage
+                self.status_label.config(text=f"Upper limit reached - pushing back")
+            elif motor_angle < self.params.theta_min + 0.3:
+                # Near lower limit, push back
+                self.motor_voltage = self.params.max_voltage
+                self.status_label.config(text=f"Lower limit reached - pushing back")
+            else:
+                # Apply energy control law:
+                # u = k_e * (E - E_ref) * sign(cos(θ) * dθ/dt)
+                # Where sign(cos(θ) * dθ/dt) determines if pendulum is moving toward or away from upright
+                energy_direction = np.cos(pendulum_norm) * pendulum_velocity
+                direction = -1.0 if energy_direction > 0 else 1.0
+
+                # Apply the control law
+                u = self.params.ke * E_error * direction
+
+                # Limit voltage
+                self.motor_voltage = max(-self.params.max_voltage, min(self.params.max_voltage, u))
+
+                self.status_label.config(
+                    text=f"Energy control - E={E:.3f}, E_ref={E_ref:.3f}, E_error={E_error:.3f}")
 
         # Set controller mode
         self.current_controller_mode = ENERGY_MODE
 
-    # Implement LQR control from simulation (paste.txt)
-    def lqr_balance(self, theta, alpha, theta_dot, alpha_dot):
-        """Ultra-fast LQR controller with theta limits consideration"""
-        alpha_upright = self.normalize_angle(alpha - np.pi)
-
-        # Regular LQR control with GUI-adjustable gains
-        u = (self.params.lqr_theta_gain * theta +
-             self.params.lqr_alpha_gain * alpha_upright +
-             self.params.lqr_theta_dot_gain * theta_dot +
-             self.params.lqr_alpha_dot_gain * alpha_dot) / 5.0
-
-        # Add limit avoidance term
-        limit_margin = 0.3
-        if theta > self.params.theta_max - limit_margin:
-            # Add strong negative control to avoid upper limit
-            avoid_factor = self.params.lqr_avoid_factor * (
-                        theta - (self.params.theta_max - limit_margin)) / limit_margin
-            u -= avoid_factor
-        elif theta < self.params.theta_min + limit_margin:
-            # Add strong positive control to avoid lower limit
-            avoid_factor = self.params.lqr_avoid_factor * (
-                        (self.params.theta_min + limit_margin) - theta) / limit_margin
-            u += avoid_factor
-
-        return self.clip_value(u, -self.params.max_voltage, self.params.max_voltage)
-
-    # Update LQR control using simulation algorithm
+    # IMPROVED LQR CONTROL FROM SCRIPT 2
     def update_lqr_control(self):
-        """LQR balance controller for pendulum using simulation algorithm"""
+        """LQR balance controller with improved implementation from script 2"""
         # Get current angles
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
@@ -845,22 +866,45 @@ class QUBEControllerWithBangBang:
         self.prev_motor_angle = motor_angle
         self.prev_time = current_time
 
-        # Normalize pendulum angle for LQR (we want pendulum_norm to be 0 at upright)
+        # Normalize pendulum angle to make upright = 0
         pendulum_norm = self.normalize_angle(pendulum_angle + np.pi)
 
         # Check if we're still close enough to balance
         if abs(pendulum_norm) > 2 * self.params.balance_range:
             # Too far from upright, switch back to energy-based swing-up
-            self.toggle_energy_control()
-            self.status_label.config(text="Pendulum too far from upright, switching to swing-up")
+            self.master.after(0, self.toggle_energy_control)
+            self.master.after(0, lambda: self.status_label.config(
+                text="Pendulum too far from upright, switching to swing-up"))
             return
 
-        # Use the simulation's LQR controller
-        self.motor_voltage = self.lqr_balance(motor_angle, pendulum_angle, motor_velocity, pendulum_velocity)
+        # LQR control with sign-adjusted gains
+        # Note: params already contains sign-adjusted values after update_parameters()
+        u = (
+                (self.params.lqr_theta_gain * motor_angle +
+                 self.params.lqr_alpha_gain * pendulum_norm +
+                 self.params.lqr_theta_dot_gain * motor_velocity +
+                 self.params.lqr_alpha_dot_gain * pendulum_velocity) / self.params.lqr_divider
+        )
+
+        # Add limit avoidance term
+        limit_margin = 0.3  # radians
+        if motor_angle > self.params.theta_max - limit_margin:
+            # Add strong negative control to avoid upper limit
+            avoid_factor = self.params.lqr_avoid_factor * (
+                    motor_angle - (self.params.theta_max - limit_margin)) / limit_margin
+            u -= avoid_factor
+        elif motor_angle < self.params.theta_min + limit_margin:
+            # Add strong positive control to avoid lower limit
+            avoid_factor = self.params.lqr_avoid_factor * (
+                    (self.params.theta_min + limit_margin) - motor_angle) / limit_margin
+            u += avoid_factor
+
+        # Limit voltage to system constraints
+        self.motor_voltage = max(-self.params.max_voltage, min(self.params.max_voltage, u))
 
         # Update status information
-        upright_deg = abs(pendulum_norm) * 180 / np.pi
-        self.status_label.config(text=f"LQR Balance - {upright_deg:.1f}° from upright")
+        self.status_label.config(
+            text=f"LQR Balance - {abs(pendulum_norm) * 180 / np.pi:.1f}° from upright")
 
         # Set controller mode
         self.current_controller_mode = LQR_MODE
@@ -916,26 +960,46 @@ class QUBEControllerWithBangBang:
         # Calculate current energy
         E_current = self.params.Mp_g_Lp * (1 - np.cos(pendulum_norm)) + 0.5 * self.params.Jp * pendulum_velocity ** 2
 
-        # Check if energy is low (pendulum hanging down) - use bang-bang for initial swing
-        if E_current > self.params.Mp_g_Lp * 1.1:
-            control_value = self.energy_control(current_time, motor_angle, pendulum_norm,
-                                                motor_velocity, pendulum_velocity)
-            self.motor_voltage = control_value
-            self.current_controller_mode = ENERGY_MODE
-            self.controller_label.config(text="Energy Control")
-            self.status_label.config(text=f"Energy - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
-            return
-        # If close to upright, use LQR
-        elif abs(pendulum_upright) < 0.3:
-            control_value = self.lqr_balance(motor_angle, pendulum_angle, motor_velocity, pendulum_velocity)
-            self.motor_voltage = control_value
+        # Check if we're close to upright position
+        if abs(pendulum_upright) < 0.3:
+            # Use LQR control near upright
+            control_value = -(
+                    (self.params.lqr_theta_gain * motor_angle +
+                     self.params.lqr_alpha_gain * pendulum_upright +
+                     self.params.lqr_theta_dot_gain * motor_velocity +
+                     self.params.lqr_alpha_dot_gain * pendulum_velocity) / self.params.lqr_divider
+            )
+
+            # Add limit avoidance
+            if motor_angle > self.params.theta_max - 0.3:
+                avoid_factor = self.params.lqr_avoid_factor * (motor_angle - (self.params.theta_max - 0.3)) / 0.3
+                control_value -= avoid_factor
+            elif motor_angle < self.params.theta_min + 0.3:
+                avoid_factor = self.params.lqr_avoid_factor * ((self.params.theta_min + 0.3) - motor_angle) / 0.3
+                control_value += avoid_factor
+
+            self.motor_voltage = self.clip_value(control_value, -self.params.max_voltage, self.params.max_voltage)
             self.current_controller_mode = LQR_MODE
             self.controller_label.config(text="LQR Balance Control")
             self.status_label.config(text=f"LQR - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
             return
 
-        # Otherwise use energy-based control for swing-up
+        # For swing-up, use energy control or bang-bang based on current energy
+        elif E_current > self.params.Mp_g_Lp * 1.1:
+            # Use energy control for higher energy states
+            energy_direction = np.cos(pendulum_norm) * pendulum_velocity
+            direction = -1.0 if energy_direction > 0 else 1.0
+            E_ref = self.params.Er
+            E_error = E_current - E_ref
+            control_value = self.params.ke * E_error * direction
+
+            self.motor_voltage = self.clip_value(control_value, -self.params.max_voltage, self.params.max_voltage)
+            self.current_controller_mode = ENERGY_MODE
+            self.controller_label.config(text="Energy Control")
+            self.status_label.config(text=f"Energy - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
+            return
         else:
+            # Use bang-bang control for initial swing-up when energy is low
             control_value = self.simple_bang_bang(current_time, motor_angle, pendulum_norm,
                                                   motor_velocity, pendulum_velocity)
             self.motor_voltage = control_value
