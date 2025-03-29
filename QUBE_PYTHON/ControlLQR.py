@@ -1,229 +1,20 @@
 import tkinter as tk
-from tkinter import Button, Label, Frame, Scale, Entry
+from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox
+from QUBE import QUBE
 import time
 import numpy as np
 import os
-import threading
-import serial
-import struct
+import csv
+from datetime import datetime
 
 # Update with your COM port
 COM_PORT = "COM10"
 
-
-class QUBE:
-    def __init__(self, port, baudrate=115200):
-        self.port = port
-        self.baudrate = baudrate
-        self.ser = None
-        self.connected = False
-
-        # Data storage
-        self.motor_angle = 0.0
-        self.pendulum_angle = 0.0
-        self.motor_rpm = 0.0
-        self.motor_current = 0.0
-
-        # Communication thread
-        self.comm_thread = None
-        self.running = False
-
-        # Locks for thread safety
-        self.data_lock = threading.Lock()
-        self.command_lock = threading.Lock()
-
-        # Command values
-        self.reset_motor = False
-        self.reset_pendulum = False
-        self.r = 0
-        self.g = 0
-        self.b = 999  # Default blue
-        self.motor_voltage = 0.0
-
-        self.connect()
-
-    def connect(self):
-        try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            self.connected = True
-            self.running = True
-            self.comm_thread = threading.Thread(target=self._communication_loop)
-            self.comm_thread.daemon = True
-            self.comm_thread.start()
-            print(f"Connected to QUBE on {self.port}")
-            return True
-        except Exception as e:
-            print(f"Failed to connect: {str(e)}")
-            self.connected = False
-            return False
-
-    def _communication_loop(self):
-        """Background thread for serial communication"""
-        last_send_time = 0
-        send_interval = 0.01  # 10ms (100Hz) command rate
-
-        while self.running:
-            current_time = time.time()
-
-            # Send commands at controlled rate
-            if current_time - last_send_time >= send_interval:
-                self._send_commands()
-                last_send_time = current_time
-
-            # Always check for incoming data (non-blocking)
-            self._receive_data()
-
-            # Small sleep to prevent CPU hogging
-            time.sleep(0.001)  # 1ms
-
-    def _send_commands(self):
-        if not self.connected:
-            return
-
-        try:
-            with self.command_lock:
-                # Pack command data
-                reset_motor_byte = 1 if self.reset_motor else 0
-                reset_pendulum_byte = 1 if self.reset_pendulum else 0
-
-                # Convert voltage to int format (-999 to 999)
-                voltage_int = int(self.motor_voltage * 100) + 999
-
-                # Ensure in valid range
-                voltage_int = max(0, min(1998, voltage_int))
-
-                # Format command packet (10 bytes)
-                command = bytearray([
-                    reset_motor_byte,
-                    reset_pendulum_byte,
-                    (self.r >> 8) & 0xFF,
-                    self.r & 0xFF,
-                    (self.g >> 8) & 0xFF,
-                    self.g & 0xFF,
-                    (self.b >> 8) & 0xFF,
-                    self.b & 0xFF,
-                    (voltage_int >> 8) & 0xFF,
-                    voltage_int & 0xFF
-                ])
-
-                self.ser.write(command)
-
-                # Reset flags after sending
-                self.reset_motor = False
-                self.reset_pendulum = False
-
-        except Exception as e:
-            print(f"Send error: {str(e)}")
-            self.connected = False
-
-    def _receive_data(self):
-        if not self.connected:
-            return
-
-        try:
-            # Check if we have a complete data packet (12 bytes)
-            if self.ser.in_waiting >= 12:
-                data = self.ser.read(12)
-
-                # Parse motor encoder data
-                motor_rev_raw = (data[0] << 8) | data[1]
-                motor_angle_raw = (data[2] << 8) | data[3]
-
-                # Parse pendulum encoder data
-                pendulum_rev_raw = (data[4] << 8) | data[5]
-                pendulum_angle_raw = (data[6] << 8) | data[7]
-
-                # Parse RPM data
-                rpm_raw = (data[8] << 8) | data[9]
-
-                # Parse current data
-                current_raw = (data[10] << 8) | data[11]
-
-                with self.data_lock:
-                    # Process motor angle
-                    motor_rev = motor_rev_raw & 0x7FFF  # Mask out sign bit
-                    motor_sign = -1 if (motor_rev_raw & 0x8000) else 1  # Extract sign
-                    motor_int = (motor_angle_raw >> 7) & 0x1FF  # Integer part (9 bits)
-                    motor_dec = (motor_angle_raw & 0x7F) / 100.0  # Decimal part (7 bits)
-
-                    # For negative angles, only the revolutions have sign, angle always positive
-                    if motor_sign < 0 and motor_rev == 0:
-                        # Special case for small negative angles (between 0 and -360)
-                        self.motor_angle = -1 * (motor_int + motor_dec)
-                    else:
-                        # Normal case
-                        self.motor_angle = motor_sign * (motor_rev * 360.0 + motor_int + motor_dec)
-
-                    # Process pendulum angle (same logic as motor angle)
-                    pendulum_rev = pendulum_rev_raw & 0x7FFF
-                    pendulum_sign = -1 if (pendulum_rev_raw & 0x8000) else 1
-                    pendulum_int = (pendulum_angle_raw >> 7) & 0x1FF
-                    pendulum_dec = (pendulum_angle_raw & 0x7F) / 100.0
-
-                    if pendulum_sign < 0 and pendulum_rev == 0:
-                        self.pendulum_angle = -1 * (pendulum_int + pendulum_dec)
-                    else:
-                        self.pendulum_angle = pendulum_sign * (pendulum_rev * 360.0 + pendulum_int + pendulum_dec)
-
-                    # Process RPM
-                    rpm_value = rpm_raw & 0x7FFF
-                    rpm_sign = -1 if (rpm_raw & 0x8000) else 1
-                    self.motor_rpm = rpm_sign * rpm_value
-
-                    # Process current
-                    self.motor_current = current_raw
-
-        except Exception as e:
-            print(f"Receive error: {str(e)}")
-            self.connected = False
-
-    def getMotorAngle(self):
-        with self.data_lock:
-            return self.motor_angle
-
-    def getPendulumAngle(self):
-        with self.data_lock:
-            return self.pendulum_angle
-
-    def getMotorRPM(self):
-        with self.data_lock:
-            return self.motor_rpm
-
-    def getMotorCurrent(self):
-        with self.data_lock:
-            return self.motor_current
-
-    def setMotorVoltage(self, voltage):
-        with self.command_lock:
-            self.motor_voltage = voltage
-
-    def setRGB(self, r, g, b):
-        with self.command_lock:
-            self.r = r
-            self.g = g
-            self.b = b
-
-    def resetMotorEncoder(self):
-        with self.command_lock:
-            self.reset_motor = True
-
-    def resetPendulumEncoder(self):
-        with self.command_lock:
-            self.reset_pendulum = True
-
-    def update(self):
-        # No longer needed - communication is handled in background thread
-        pass
-
-    def close(self):
-        self.running = False
-        if self.comm_thread and self.comm_thread.is_alive():
-            self.comm_thread.join(timeout=1.0)
-        if self.ser and self.connected:
-            try:
-                self.ser.close()
-            except:
-                pass
+# Control mode constants (from simulation)
+EMERGENCY_MODE = 0
+BANGBANG_MODE = 1
+LQR_MODE = 2
+ENERGY_MODE = 3
 
 
 # Simplified parameters for real system
@@ -235,7 +26,7 @@ class SystemParameters:
         self.theta_max = 2.0  # Maximum motor angle (rad)
         self.balance_range = np.radians(20)  # Range where balance control activates (rad)
 
-        # Energy control parameters
+        # Energy control parameters (slightly adjusted for real system)
         self.m_p = 0.024  # Pendulum mass (kg)
         self.l = 0.129  # Pendulum length (m)
         self.l_com = self.l / 2  # Center of mass distance (m)
@@ -244,10 +35,14 @@ class SystemParameters:
         self.ke = 50.0  # Energy controller gain
         self.Er = 0.015  # Reference energy (J)
 
+        # Derived energy parameters (from simulation)
+        self.Mp_g_Lp = self.m_p * self.g * self.l  # used in energy calculations
+        self.Jp = self.J  # Pendulum moment of inertia
+
         # LQR control parameters
-        self.lqr_theta_gain = 5.0  # Gain for motor angle
-        self.lqr_alpha_gain = 50.0  # Gain for pendulum angle
-        self.lqr_theta_dot_gain = 1.5  # Gain for motor velocity
+        self.lqr_theta_gain = 3.0  # Gain for motor angle
+        self.lqr_alpha_gain = 60.0  # Gain for pendulum angle
+        self.lqr_theta_dot_gain = 2.5  # Gain for motor velocity
         self.lqr_alpha_dot_gain = 8.0  # Gain for pendulum velocity
         self.lqr_avoid_factor = 20.0  # Limit avoidance factor
 
@@ -267,12 +62,15 @@ class QUBEControllerWithBangBang:
         self.energy_mode = False
         self.lqr_mode = False
         self.moving_to_position = False
+        self.current_controller_mode = EMERGENCY_MODE  # Track current controller
 
-        # Track sign of LQR parameters
-        self.lqr_theta_sign = 1
-        self.lqr_alpha_sign = 1
-        self.lqr_theta_dot_sign = 1
-        self.lqr_alpha_dot_sign = 1
+        # Data logging state
+        self.data_logging = False
+        self.csv_writer = None
+        self.csv_file = None
+        self.data_filename = ""
+        self.log_counter = 0
+        self.log_interval = 5  # Only log every 5 iterations (adjust for desired sampling rate)
 
         # Create GUI elements
         self.create_gui()
@@ -282,22 +80,11 @@ class QUBEControllerWithBangBang:
         self.prev_pendulum_angle = 0.0
         self.prev_motor_angle = 0.0
 
-        # Variables for high-frequency control loop
-        self.control_thread = None
-        self.running = True
-        self.control_interval = 0.001  # 1ms for controller (1000Hz)
-        self.gui_interval = 0.02  # 20ms for GUI update (50Hz)
-        self.last_gui_update = time.time()
-
-        # Start control thread
-        self.start_control_thread()
-
     def create_gui(self):
         # Main control frame
         control_frame = Frame(self.master, padx=10, pady=10)
         control_frame.pack()
 
-        # ... [GUI code remains the same as before] ...
         # Calibrate button
         self.calibrate_btn = Button(control_frame, text="Calibrate (Set Corner as Zero)",
                                     command=self.calibrate,
@@ -324,6 +111,12 @@ class QUBEControllerWithBangBang:
                               command=self.toggle_lqr,
                               width=15, height=2)
         self.lqr_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        # Add Combined Control Button
+        self.combined_btn = Button(control_mode_frame, text="Combined Control",
+                                   command=self.toggle_combined_control,
+                                   width=15, height=2)
+        self.combined_btn.grid(row=0, column=3, padx=5, pady=5)
 
         # Move to position input and button
         position_frame = Frame(control_frame)
@@ -374,55 +167,31 @@ class QUBEControllerWithBangBang:
         # LQR parameters frame
         lqr_frame = Frame(param_frame)
         lqr_frame.grid(row=0, column=2, padx=10, pady=5)
-        Label(lqr_frame, text="LQR Parameters", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=3)
+        Label(lqr_frame, text="LQR Parameters", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=2)
 
-        # Row 1: Theta Gain
         Label(lqr_frame, text="Theta Gain:").grid(row=1, column=0, padx=5)
         self.lqr_theta_scale = Scale(lqr_frame, from_=0, to=20.0,
                                      resolution=0.5, orient=tk.HORIZONTAL, length=150)
         self.lqr_theta_scale.set(self.params.lqr_theta_gain)
         self.lqr_theta_scale.grid(row=1, column=1, padx=5)
 
-        # Add sign toggle button for Theta Gain
-        self.lqr_theta_sign_btn = Button(lqr_frame, text="+", width=3,
-                                         command=self.toggle_theta_sign)
-        self.lqr_theta_sign_btn.grid(row=1, column=2, padx=5)
-
-        # Row 2: Alpha Gain
         Label(lqr_frame, text="Alpha Gain:").grid(row=2, column=0, padx=5)
         self.lqr_alpha_scale = Scale(lqr_frame, from_=0, to=100.0,
                                      resolution=1.0, orient=tk.HORIZONTAL, length=150)
         self.lqr_alpha_scale.set(self.params.lqr_alpha_gain)
         self.lqr_alpha_scale.grid(row=2, column=1, padx=5)
 
-        # Add sign toggle button for Alpha Gain
-        self.lqr_alpha_sign_btn = Button(lqr_frame, text="+", width=3,
-                                         command=self.toggle_alpha_sign)
-        self.lqr_alpha_sign_btn.grid(row=2, column=2, padx=5)
-
-        # Row 3: Theta Dot Gain
         Label(lqr_frame, text="Theta Dot Gain:").grid(row=3, column=0, padx=5)
         self.lqr_theta_dot_scale = Scale(lqr_frame, from_=0, to=5.0,
                                          resolution=0.1, orient=tk.HORIZONTAL, length=150)
         self.lqr_theta_dot_scale.set(self.params.lqr_theta_dot_gain)
         self.lqr_theta_dot_scale.grid(row=3, column=1, padx=5)
 
-        # Add sign toggle button for Theta Dot Gain
-        self.lqr_theta_dot_sign_btn = Button(lqr_frame, text="+", width=3,
-                                             command=self.toggle_theta_dot_sign)
-        self.lqr_theta_dot_sign_btn.grid(row=3, column=2, padx=5)
-
-        # Row 4: Alpha Dot Gain
         Label(lqr_frame, text="Alpha Dot Gain:").grid(row=4, column=0, padx=5)
         self.lqr_alpha_dot_scale = Scale(lqr_frame, from_=0, to=20.0,
                                          resolution=0.5, orient=tk.HORIZONTAL, length=150)
         self.lqr_alpha_dot_scale.set(self.params.lqr_alpha_dot_gain)
         self.lqr_alpha_dot_scale.grid(row=4, column=1, padx=5)
-
-        # Add sign toggle button for Alpha Dot Gain
-        self.lqr_alpha_dot_sign_btn = Button(lqr_frame, text="+", width=3,
-                                             command=self.toggle_alpha_dot_sign)
-        self.lqr_alpha_dot_sign_btn.grid(row=4, column=2, padx=5)
 
         # Common parameters
         common_frame = Frame(param_frame)
@@ -488,10 +257,44 @@ class QUBEControllerWithBangBang:
         self.voltage_label = Label(status_frame, text="0.0 V")
         self.voltage_label.grid(row=5, column=1, sticky=tk.W)
 
-        # Performance display
-        Label(status_frame, text="Control Loop Time:").grid(row=6, column=0, sticky=tk.W)
-        self.dt_label = Label(status_frame, text="0.0 ms")
-        self.dt_label.grid(row=6, column=1, sticky=tk.W)
+        # Add controller mode display
+        Label(status_frame, text="Controller:").grid(row=6, column=0, sticky=tk.W)
+        self.controller_label = Label(status_frame, text="None")
+        self.controller_label.grid(row=6, column=1, sticky=tk.W)
+
+        # Data Logging Panel
+        logging_frame = Frame(self.master, padx=10, pady=10)
+        logging_frame.pack()
+
+        Label(logging_frame, text="Data Logging", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=3)
+
+        self.start_logging_btn = Button(logging_frame, text="Start Logging",
+                                        command=self.start_data_logging,
+                                        width=15, height=1)
+        self.start_logging_btn.grid(row=1, column=0, padx=5, pady=5)
+
+        self.stop_logging_btn = Button(logging_frame, text="Stop Logging",
+                                       command=self.stop_data_logging,
+                                       width=15, height=1, state="disabled")
+        self.stop_logging_btn.grid(row=1, column=1, padx=5, pady=5)
+
+        self.save_path_label = Label(logging_frame, text="No log file selected", width=40)
+        self.save_path_label.grid(row=1, column=2, padx=5, pady=5)
+
+        # Logging options
+        log_options_frame = Frame(logging_frame)
+        log_options_frame.grid(row=2, column=0, columnspan=3, pady=5)
+
+        Label(log_options_frame, text="Log Interval (frames):").grid(row=0, column=0, padx=5)
+        self.log_interval_scale = Scale(log_options_frame, from_=1, to=20,
+                                        resolution=1, orient=tk.HORIZONTAL, length=150)
+        self.log_interval_scale.set(self.log_interval)
+        self.log_interval_scale.grid(row=0, column=1, padx=5)
+
+        self.update_interval_btn = Button(log_options_frame, text="Update Interval",
+                                          command=self.update_log_interval,
+                                          width=15)
+        self.update_interval_btn.grid(row=0, column=2, padx=10)
 
         # RGB Control
         rgb_frame = Frame(self.master, padx=10, pady=10)
@@ -506,111 +309,6 @@ class QUBEControllerWithBangBang:
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
 
-    def start_control_thread(self):
-        """Start the high-frequency control thread"""
-        self.control_thread = threading.Thread(target=self.control_loop)
-        self.control_thread.daemon = True
-        self.control_thread.start()
-
-    def control_loop(self):
-        """High-frequency control loop running in separate thread"""
-        last_control_time = time.time()
-        control_times = []  # For calculating average dt
-
-        while self.running:
-            try:
-                # Calculate dt
-                current_time = time.time()
-                dt = current_time - last_control_time
-                last_control_time = current_time
-
-                # Store dt for averaging (but ignore outliers)
-                if dt < 0.1:  # Ignore huge delays (e.g., from system sleep)
-                    control_times.append(dt)
-                    if len(control_times) > 100:
-                        control_times.pop(0)
-
-                # Call the control update function
-                self.update_control()
-
-                # Update dt display and GUI occasionally
-                if current_time - self.last_gui_update >= self.gui_interval:
-                    avg_dt = sum(control_times) / len(control_times) if control_times else 0
-                    freq = 1.0 / avg_dt if avg_dt > 0 else 0
-                    self.master.after(0, lambda: self.dt_label.config(text=f"{avg_dt * 1000:.2f} ms ({freq:.1f} Hz)"))
-                    self.update_gui_display()
-                    self.last_gui_update = current_time
-
-                # Calculate sleep time to maintain target frequency
-                sleep_time = self.control_interval - (time.time() - current_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-            except Exception as e:
-                print(f"Error in control loop: {e}")
-                # Short sleep to prevent CPU spin if there's a continuous error
-                time.sleep(0.01)
-
-    def update_control(self):
-        """Update control algorithms - runs at high frequency"""
-        # Execute appropriate control mode
-        if self.calibrating:
-            self.update_calibration()
-        elif self.moving_to_position:
-            self.update_position_control()
-        elif self.bang_bang_mode:
-            self.update_bang_bang_control()
-        elif self.energy_mode:
-            self.update_energy_control()
-        elif self.lqr_mode:
-            self.update_lqr_control()
-
-        # Apply motor voltage (automatically sends to Arduino via thread)
-        self.qube.setMotorVoltage(self.motor_voltage)
-
-        # RGB control
-        self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
-
-    def update_gui_display(self):
-        """Update GUI display elements - runs at lower frequency"""
-        # Get current sensor values
-        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
-        pendulum_angle_deg = self.qube.getPendulumAngle()
-
-        # Get pendulum angle relative to upright position
-        pendulum_angle_rad = np.radians(pendulum_angle_deg)
-        pendulum_norm = self.normalize_angle(pendulum_angle_rad + np.pi)
-        upright_angle = abs(pendulum_norm) * 180 / np.pi
-
-        rpm = self.qube.getMotorRPM()
-
-        # Update display labels
-        self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
-        self.pendulum_label.config(
-            text=f"{pendulum_angle_deg:.1f}° ({upright_angle:.1f}° from upright)")
-        self.rpm_label.config(text=f"{rpm:.1f}")
-        self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
-
-    # Toggle sign methods for LQR parameters
-    def toggle_theta_sign(self):
-        self.lqr_theta_sign *= -1
-        self.lqr_theta_sign_btn.config(text="+" if self.lqr_theta_sign > 0 else "-")
-        self.status_label.config(text=f"Theta Gain sign changed to {'+' if self.lqr_theta_sign > 0 else '-'}")
-
-    def toggle_alpha_sign(self):
-        self.lqr_alpha_sign *= -1
-        self.lqr_alpha_sign_btn.config(text="+" if self.lqr_alpha_sign > 0 else "-")
-        self.status_label.config(text=f"Alpha Gain sign changed to {'+' if self.lqr_alpha_sign > 0 else '-'}")
-
-    def toggle_theta_dot_sign(self):
-        self.lqr_theta_dot_sign *= -1
-        self.lqr_theta_dot_sign_btn.config(text="+" if self.lqr_theta_dot_sign > 0 else "-")
-        self.status_label.config(text=f"Theta Dot Gain sign changed to {'+' if self.lqr_theta_dot_sign > 0 else '-'}")
-
-    def toggle_alpha_dot_sign(self):
-        self.lqr_alpha_dot_sign *= -1
-        self.lqr_alpha_dot_sign_btn.config(text="+" if self.lqr_alpha_dot_sign > 0 else "-")
-        self.status_label.config(text=f"Alpha Dot Gain sign changed to {'+' if self.lqr_alpha_dot_sign > 0 else '-'}")
-
     def update_parameters(self):
         """Update control parameters from GUI"""
         self.params.max_voltage = self.bb_voltage_scale.get()
@@ -618,13 +316,30 @@ class QUBEControllerWithBangBang:
         self.params.ke = self.ke_scale.get()
         self.params.Er = self.er_scale.get()
 
-        # Update LQR parameters (with signs)
-        self.params.lqr_theta_gain = self.lqr_theta_sign * self.lqr_theta_scale.get()
-        self.params.lqr_alpha_gain = self.lqr_alpha_sign * self.lqr_alpha_scale.get()
-        self.params.lqr_theta_dot_gain = self.lqr_theta_dot_sign * self.lqr_theta_dot_scale.get()
-        self.params.lqr_alpha_dot_gain = self.lqr_alpha_dot_sign * self.lqr_alpha_dot_scale.get()
+        # Update LQR parameters
+        self.params.lqr_theta_gain = self.lqr_theta_scale.get()
+        self.params.lqr_alpha_gain = self.lqr_alpha_scale.get()
+        self.params.lqr_theta_dot_gain = self.lqr_theta_dot_scale.get()
+        self.params.lqr_alpha_dot_gain = self.lqr_alpha_dot_scale.get()
 
         self.status_label.config(text="Control parameters updated")
+
+    # Helper function from simulation
+    def clip_value(self, value, min_value, max_value):
+        """Clip value to min/max range"""
+        if value < min_value:
+            return min_value
+        elif value > max_value:
+            return max_value
+        else:
+            return value
+
+    def normalize_angle(self, angle):
+        """Normalize angle to [-π, π]"""
+        angle = angle % (2 * np.pi)
+        if angle > np.pi:
+            angle -= 2 * np.pi
+        return angle
 
     def set_manual_voltage(self, value):
         """Set manual voltage from slider"""
@@ -635,7 +350,9 @@ class QUBEControllerWithBangBang:
         self.bang_bang_mode = False
         self.energy_mode = False
         self.lqr_mode = False
+        self.combined_control_mode = False
         self.mode_label.config(text="Manual")
+        self.current_controller_mode = EMERGENCY_MODE
 
     def calibrate(self):
         """Simple calibration - move to corner and set as zero"""
@@ -644,7 +361,9 @@ class QUBEControllerWithBangBang:
         self.bang_bang_mode = False
         self.energy_mode = False
         self.lqr_mode = False
+        self.combined_control_mode = False
         self.voltage_slider.set(0)  # Reset slider
+        self.current_controller_mode = EMERGENCY_MODE
 
         # Set calibration start time
         self.calibration_start_time = time.time()
@@ -663,6 +382,7 @@ class QUBEControllerWithBangBang:
         if elapsed < 3.0:
             # Apply voltage to move to corner
             self.motor_voltage = 1.5
+            self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
         else:
             # At corner - set as zero
             self.motor_voltage = 0.0
@@ -678,13 +398,8 @@ class QUBEControllerWithBangBang:
 
             # End calibration
             self.calibrating = False
-
-            # Update status - use after() to safely update GUI from thread
-            self.master.after(0, lambda: self.status_label.config(text="Calibration complete - Corner is now zero"))
-            self.master.after(0, lambda: self.mode_label.config(text="Manual"))
-
-    # Other control methods (toggle_bang_bang, toggle_energy_control, etc.) remain mostly the same,
-    # but use self.master.after(0, lambda: ...) for GUI updates from the control thread
+            self.status_label.config(text="Calibration complete - Corner is now zero")
+            self.mode_label.config(text="Manual")
 
     def toggle_bang_bang(self):
         """Toggle bang-bang swing-up control mode"""
@@ -693,12 +408,14 @@ class QUBEControllerWithBangBang:
             self.bang_bang_mode = True
             self.energy_mode = False
             self.lqr_mode = False
+            self.combined_control_mode = False
             self.moving_to_position = False
             self.calibrating = False
             self.voltage_slider.set(0)  # Reset slider
             self.bang_bang_btn.config(text="Stop Bang-Bang")
             self.energy_btn.config(text="Energy Swing-Up")
             self.lqr_btn.config(text="LQR Balance")
+            self.combined_btn.config(text="Combined Control")
             self.status_label.config(text="Bang-Bang swing-up active")
             self.mode_label.config(text="Bang-Bang Control")
 
@@ -713,6 +430,7 @@ class QUBEControllerWithBangBang:
             self.bang_bang_btn.config(text="Bang-Bang Swing-Up")
             self.status_label.config(text="Bang-Bang control stopped")
             self.mode_label.config(text="Manual")
+            self.current_controller_mode = EMERGENCY_MODE
 
             # Set blue LED when stopped
             self.r_slider.set(0)
@@ -726,12 +444,14 @@ class QUBEControllerWithBangBang:
             self.energy_mode = True
             self.bang_bang_mode = False
             self.lqr_mode = False
+            self.combined_control_mode = False
             self.moving_to_position = False
             self.calibrating = False
             self.voltage_slider.set(0)  # Reset slider
             self.energy_btn.config(text="Stop Energy Control")
             self.bang_bang_btn.config(text="Bang-Bang Swing-Up")
             self.lqr_btn.config(text="LQR Balance")
+            self.combined_btn.config(text="Combined Control")
             self.status_label.config(text="Energy-based swing-up active")
             self.mode_label.config(text="Energy Control")
 
@@ -746,6 +466,7 @@ class QUBEControllerWithBangBang:
             self.energy_btn.config(text="Energy Swing-Up")
             self.status_label.config(text="Energy control stopped")
             self.mode_label.config(text="Manual")
+            self.current_controller_mode = EMERGENCY_MODE
 
             # Set blue LED when stopped
             self.r_slider.set(0)
@@ -759,12 +480,14 @@ class QUBEControllerWithBangBang:
             self.lqr_mode = True
             self.energy_mode = False
             self.bang_bang_mode = False
+            self.combined_control_mode = False
             self.moving_to_position = False
             self.calibrating = False
             self.voltage_slider.set(0)  # Reset slider
             self.lqr_btn.config(text="Stop LQR Control")
             self.bang_bang_btn.config(text="Bang-Bang Swing-Up")
             self.energy_btn.config(text="Energy Swing-Up")
+            self.combined_btn.config(text="Combined Control")
             self.status_label.config(text="LQR balance control active")
             self.mode_label.config(text="LQR Balance Control")
 
@@ -779,6 +502,43 @@ class QUBEControllerWithBangBang:
             self.lqr_btn.config(text="LQR Balance")
             self.status_label.config(text="LQR control stopped")
             self.mode_label.config(text="Manual")
+            self.current_controller_mode = EMERGENCY_MODE
+
+            # Set blue LED when stopped
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
+
+    def toggle_combined_control(self):
+        """Toggle combined control mode (using control_decision)"""
+        if not hasattr(self, 'combined_control_mode') or not self.combined_control_mode:
+            # Start combined control
+            self.combined_control_mode = True
+            self.lqr_mode = False
+            self.energy_mode = False
+            self.bang_bang_mode = False
+            self.moving_to_position = False
+            self.calibrating = False
+            self.voltage_slider.set(0)  # Reset slider
+            self.combined_btn.config(text="Stop Combined Control")
+            self.bang_bang_btn.config(text="Bang-Bang Swing-Up")
+            self.energy_btn.config(text="Energy Swing-Up")
+            self.lqr_btn.config(text="LQR Balance")
+            self.status_label.config(text="Combined automatic control active")
+            self.mode_label.config(text="Combined Control")
+
+            # Set white LED during combined control
+            self.r_slider.set(999)
+            self.g_slider.set(999)
+            self.b_slider.set(999)
+        else:
+            # Stop combined control
+            self.combined_control_mode = False
+            self.motor_voltage = 0.0
+            self.combined_btn.config(text="Combined Control")
+            self.status_label.config(text="Combined control stopped")
+            self.mode_label.config(text="Manual")
+            self.current_controller_mode = EMERGENCY_MODE
 
             # Set blue LED when stopped
             self.r_slider.set(0)
@@ -787,7 +547,7 @@ class QUBEControllerWithBangBang:
 
     def start_move_to_position(self):
         """Start moving to target position"""
-        if not self.calibrating and not self.bang_bang_mode and not self.energy_mode and not self.lqr_mode:
+        if not self.calibrating and not self.bang_bang_mode and not self.energy_mode and not self.lqr_mode and not self.combined_control_mode:
             try:
                 # Get target position from entry field
                 self.target_position = float(self.position_entry.get())
@@ -796,9 +556,11 @@ class QUBEControllerWithBangBang:
                 self.bang_bang_mode = False
                 self.energy_mode = False
                 self.lqr_mode = False
+                self.combined_control_mode = False
                 self.voltage_slider.set(0)  # Reset slider
                 self.status_label.config(text=f"Moving to {self.target_position:.1f}°...")
                 self.mode_label.config(text="Moving to Position")
+                self.current_controller_mode = EMERGENCY_MODE
 
                 # Set green LED during movement
                 self.r_slider.set(0)
@@ -806,13 +568,6 @@ class QUBEControllerWithBangBang:
                 self.b_slider.set(0)
             except ValueError:
                 self.status_label.config(text="Invalid position value")
-
-    def normalize_angle(self, angle):
-        """Normalize angle to [-π, π]"""
-        angle = angle % (2 * np.pi)
-        if angle > np.pi:
-            angle -= 2 * np.pi
-        return angle
 
     def update_position_control(self):
         """Update position control using a simple P controller"""
@@ -841,175 +596,37 @@ class QUBEControllerWithBangBang:
             self.g_slider.set(0)
             self.b_slider.set(999)
 
-            # Update GUI (thread-safe)
-            self.master.after(0, lambda: self.status_label.config(text="Position reached"))
-            self.master.after(0, lambda: self.mode_label.config(text="Manual"))
+            self.status_label.config(text="Position reached")
+            self.mode_label.config(text="Manual")
+            return
 
+    # Implement bang-bang control from simulation (paste.txt)
+    def simple_bang_bang(self, t, theta, alpha, theta_dot, alpha_dot):
+        """Ultra-fast bang-bang controller for inverted pendulum swing-up"""
+        # First, handle limit avoidance with highest priority
+        limit_margin = 1.5
+        if theta > self.params.theta_max - limit_margin and theta_dot > 0:
+            return -self.params.max_voltage  # If close to upper limit, push back
+        elif theta < self.params.theta_min + limit_margin and theta_dot < 0:
+            return self.params.max_voltage  # If close to lower limit, push back
+
+        pos_vel_same_sign = alpha * alpha_dot > 0
+        if pos_vel_same_sign:
+            # Apply torque against position to pump energy
+            if alpha < 0:
+                return -self.params.max_voltage
+            else:
+                return self.params.max_voltage
+        else:
+            # Apply torque with position
+            if alpha < 0:
+                return self.params.max_voltage
+            else:
+                return -self.params.max_voltage
+
+    # Update bang-bang control using simulation algorithm
     def update_bang_bang_control(self):
-        """Update bang-bang control for pendulum swing-up - simplified for real system"""
-        # Get current angles
-        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
-        pendulum_angle_deg = self.qube.getPendulumAngle()
-
-        # Convert to radians
-        motor_angle = np.radians(motor_angle_deg)
-        pendulum_angle = np.radians(pendulum_angle_deg)
-
-        # Initialize prev_pendulum_angle if this is the first update
-        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
-            self.prev_pendulum_angle = pendulum_angle
-
-        # Calculate pendulum angular velocity by simple finite difference
-        current_time = time.time()
-        dt = current_time - self.prev_time
-        pendulum_velocity = 0.0
-
-        if dt > 0:
-            pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
-
-        self.prev_pendulum_angle = pendulum_angle
-        self.prev_time = current_time
-
-        # Normalize pendulum angle to make upright = 0
-        pendulum_norm = self.normalize_angle(pendulum_angle + np.pi)
-
-        # Check if we've reached the upright position
-        if abs(pendulum_norm) < self.params.balance_range:
-            # Switch to LQR for balancing if LQR mode is enabled
-            if not self.lqr_mode:
-                # Thread-safe toggle via after()
-                self.master.after(0, self.toggle_lqr)
-                self.master.after(0, lambda: self.status_label.config(text="Switched to LQR for balance control"))
-                return
-
-        # Simple Bang-Bang control logic
-        if abs(pendulum_norm) < self.params.balance_range:
-            # We're close to upright position
-            if abs(pendulum_velocity) < 0.1:
-                # Very little motion, don't apply voltage
-                self.motor_voltage = 0.0
-            else:
-                # Apply opposite force to slow down
-                self.motor_voltage = -np.sign(pendulum_velocity) * self.params.max_voltage
-
-            # Thread-safe status update
-            self.master.after(0, lambda: self.status_label.config(
-                text=f"Near balance - {abs(pendulum_norm) * 180 / np.pi:.1f}° from upright"))
-        else:
-            # Motor angle limit protection
-            if motor_angle > self.params.theta_max - 0.6 and pendulum_velocity > 0:
-                self.motor_voltage = -self.params.max_voltage  # If close to upper limit, push back
-            elif motor_angle < self.params.theta_min + 0.6 and pendulum_velocity < 0:
-                self.motor_voltage = self.params.max_voltage  # If close to lower limit, push back
-            else:
-                # Simple bang-bang control: apply full voltage based on pendulum velocity direction
-                if pendulum_velocity == 0:
-                    # Minimal motion detected, apply small voltage to get it moving
-                    self.motor_voltage = 0.5 * self.params.max_voltage
-                else:
-                    # Full bang-bang: apply max voltage in direction of motion
-                    self.motor_voltage = np.sign(pendulum_velocity) * self.params.max_voltage
-
-            # Thread-safe status update
-            self.master.after(0, lambda: self.status_label.config(
-                text=f"Swinging - {abs(pendulum_norm) * 180 / np.pi:.1f}° from upright"))
-
-    # Other control methods remain similar but with thread-safe GUI updates
-
-    def update_energy_control(self):
-        """Update energy-based swing-up control for the pendulum"""
-        # Get current angles
-        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
-        pendulum_angle_deg = self.qube.getPendulumAngle()
-
-        # Convert to radians
-        motor_angle = np.radians(motor_angle_deg)
-        pendulum_angle = np.radians(pendulum_angle_deg)
-
-        # Initialize prev_pendulum_angle if this is the first update
-        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
-            self.prev_pendulum_angle = pendulum_angle
-
-        # Calculate pendulum velocity via finite difference
-        current_time = time.time()
-        dt = current_time - self.prev_time
-
-        pendulum_velocity = 0.0
-        if dt > 0:
-            pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
-
-        self.prev_pendulum_angle = pendulum_angle
-        self.prev_time = current_time
-
-        # Adjust pendulum angle to make upright = 0
-        # Note: for energy calculations, we want down position = 0, upright = π
-        pendulum_norm = self.normalize_angle(pendulum_angle + np.pi)
-
-        # Check if we've reached the upright position
-        if abs(pendulum_norm) < self.params.balance_range:
-            # Switch to LQR for balancing if LQR mode is enabled
-            if not self.lqr_mode:
-                # Thread-safe toggle via after()
-                self.master.after(0, self.toggle_lqr)
-                self.master.after(0, lambda: self.status_label.config(text="Switched to LQR for balance control"))
-                return
-
-        # Calculate current energy of the pendulum
-        # E = Kinetic Energy + Potential Energy
-        # E = 0.5 * J * ω² + m*g*l*(1-cos(θ))
-        # Where θ is measured from downward (θ=0 at bottom, θ=π at top)
-        E = 0.5 * self.params.J * pendulum_velocity ** 2 + \
-            self.params.m_p * self.params.g * self.params.l_com * (1 - np.cos(pendulum_angle))
-
-        # Reference energy is the energy at upright position with zero velocity
-        E_ref = self.params.Er  # Small non-zero value helps with convergence
-
-        # Energy error
-        E_error = E - E_ref
-
-        # Check if we're within balance range
-        if abs(pendulum_norm) < self.params.balance_range:
-            # Near upright position - apply damping control
-            if abs(pendulum_velocity) < 0.1:
-                # Very little motion, don't apply voltage
-                self.motor_voltage = 0.0
-            else:
-                # Apply opposite force to slow down
-                self.motor_voltage = -np.sign(pendulum_velocity) * 2.0
-
-            self.master.after(0, lambda: self.status_label.config(
-                text=f"Near balance - {abs(pendulum_norm) * 180 / np.pi:.1f}° from upright"))
-        else:
-            # Check motor angle limits first
-            if motor_angle > self.params.theta_max - 0.3:
-                # Near upper limit, push back
-                self.motor_voltage = -self.params.max_voltage
-                self.master.after(0, lambda: self.status_label.config(text=f"Upper limit reached - pushing back"))
-            elif motor_angle < self.params.theta_min + 0.3:
-                # Near lower limit, push back
-                self.motor_voltage = self.params.max_voltage
-                self.master.after(0, lambda: self.status_label.config(text=f"Lower limit reached - pushing back"))
-            else:
-                # Apply energy control law:
-                # u = k_e * (E - E_ref) * sign(cos(θ) * dθ/dt)
-                # Where sign(cos(θ) * dθ/dt) determines if pendulum is moving toward or away from upright
-                energy_direction = np.cos(pendulum_angle) * pendulum_velocity
-                direction = -1.0 if energy_direction > 0 else 1.0
-
-                # Apply the control law
-                u = self.params.ke * E_error * direction
-
-                # Limit voltage
-                self.motor_voltage = max(-self.params.max_voltage, min(self.params.max_voltage, u))
-
-                self.master.after(0, lambda: self.status_label.config(
-                    text=f"Energy control - E={E:.3f}, E_ref={E_ref:.3f}, E_error={E_error:.3f}"))
-
-        # Clamp motor voltage to system limits
-        self.motor_voltage = max(-self.params.max_voltage, min(self.params.max_voltage, self.motor_voltage))
-
-    def update_lqr_control(self):
-        """LQR balance controller for pendulum"""
+        """Update bang-bang control for pendulum swing-up using simulation algorithm"""
         # Get current angles
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
@@ -1022,18 +639,16 @@ class QUBEControllerWithBangBang:
         current_time = time.time()
         dt = current_time - self.prev_time
 
+        # Initialize previous values if needed
+        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
+            self.prev_pendulum_angle = pendulum_angle
+        if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
+            self.prev_motor_angle = motor_angle
+
+        # Calculate velocities
         pendulum_velocity = 0.0
         motor_velocity = 0.0
-
         if dt > 0:
-            # Make sure we have previous values stored
-            if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
-                self.prev_pendulum_angle = pendulum_angle
-
-            if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
-                self.prev_motor_angle = motor_angle
-
-            # Calculate velocities
             pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
             motor_velocity = (motor_angle - self.prev_motor_angle) / dt
 
@@ -1042,47 +657,458 @@ class QUBEControllerWithBangBang:
         self.prev_motor_angle = motor_angle
         self.prev_time = current_time
 
-        # Normalize pendulum angle to make upright = 0
-        # For LQR, we want pendulum_norm to be 0 at the upright position
+        # Normalize pendulum angle for control
+        pendulum_norm = self.normalize_angle(pendulum_angle)
+
+        # Check if we've reached the upright position
+        if abs(self.normalize_angle(pendulum_angle + np.pi)) < self.params.balance_range:
+            # Switch to LQR for balancing
+            if not self.lqr_mode:
+                self.toggle_lqr()
+                self.status_label.config(text="Switched to LQR for balance control")
+                return
+
+        # Use the simulation's bang-bang controller
+        self.motor_voltage = self.simple_bang_bang(current_time, motor_angle, pendulum_norm,
+                                                   motor_velocity, pendulum_velocity)
+
+        # Update status based on angle from upright
+        pendulum_upright = self.normalize_angle(pendulum_angle + np.pi)
+        upright_deg = abs(pendulum_upright) * 180 / np.pi
+        self.status_label.config(text=f"Bang-Bang control - {upright_deg:.1f}° from upright")
+
+        # Set controller mode
+        self.current_controller_mode = BANGBANG_MODE
+
+    # Implement energy control from simulation (paste.txt)
+    def energy_control(self, t, theta, alpha, theta_dot, alpha_dot):
+        """Improved energy-based swing-up controller with enhanced limit avoidance"""
+        # Calculate current energy and reference energy
+        E_current = self.params.Mp_g_Lp * (1 - np.cos(alpha)) + 0.5 * self.params.Jp * alpha_dot ** 2
+        E_ref = self.params.Er  # Energy target from GUI
+        E_error = E_ref - E_current  # Positive when we need to add energy
+
+        # Use standard energy pumping formula with sign(alpha_dot * sin(alpha))
+        # This determines when to apply torque to efficiently add/remove energy
+        pump_direction = np.sign(alpha_dot * np.sin(alpha))
+
+        # Adaptive gain - use smaller gain when close to target energy for smoother control
+        k_energy = self.params.ke * 0.01  # Scale down GUI gain value
+        if abs(E_error) < 0.3 * self.params.Mp_g_Lp:
+            k_energy = k_energy * 0.6  # More precise control when close to target
+
+        # Energy pumping control
+        u_energy = k_energy * E_error * pump_direction
+
+        # Enhanced limit avoidance with velocity consideration
+        # Use larger margin when moving quickly to account for momentum
+        base_margin = 0.5
+        velocity_factor = min(1.0, abs(theta_dot) / 2.0)
+        dynamic_margin = base_margin * (1.0 + velocity_factor)
+
+        # Calculate limit avoidance control
+        u_limit = 0.0
+        if theta > self.params.theta_max - dynamic_margin:
+            # Stronger repulsion from upper limit when moving quickly
+            distance_ratio = (theta - (self.params.theta_max - dynamic_margin)) / dynamic_margin
+            u_limit = -12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
+        elif theta < self.params.theta_min + dynamic_margin:
+            # Stronger repulsion from lower limit when moving quickly
+            distance_ratio = ((self.params.theta_min + dynamic_margin) - theta) / dynamic_margin
+            u_limit = 12.0 * np.exp(distance_ratio) * (1.0 + velocity_factor)
+
+        # Add damping when pendulum has high velocity to prevent wild swings
+        u_damping = -0.1 * alpha_dot if abs(alpha_dot) > 5.0 else 0.0
+
+        # Combine all control components
+        u = u_energy + u_limit + u_damping
+
+        return self.clip_value(u, -self.params.max_voltage, self.params.max_voltage)
+
+    # Update energy control using simulation algorithm
+    def update_energy_control(self):
+        """Update energy control using simulation algorithm"""
+        # Get current angles
+        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+        pendulum_angle_deg = self.qube.getPendulumAngle()
+
+        # Convert to radians
+        motor_angle = np.radians(motor_angle_deg)
+        pendulum_angle = np.radians(pendulum_angle_deg)
+
+        # Calculate velocities using finite difference
+        current_time = time.time()
+        dt = current_time - self.prev_time
+
+        # Initialize previous values if needed
+        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
+            self.prev_pendulum_angle = pendulum_angle
+        if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
+            self.prev_motor_angle = motor_angle
+
+        # Calculate velocities
+        pendulum_velocity = 0.0
+        motor_velocity = 0.0
+        if dt > 0:
+            pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
+            motor_velocity = (motor_angle - self.prev_motor_angle) / dt
+
+        # Update previous values
+        self.prev_pendulum_angle = pendulum_angle
+        self.prev_motor_angle = motor_angle
+        self.prev_time = current_time
+
+        # Normalize pendulum angle for physics calculations (down = 0)
+        pendulum_norm = self.normalize_angle(pendulum_angle)
+
+        # Check if pendulum is close to upright
+        pendulum_upright = self.normalize_angle(pendulum_angle + np.pi)
+        if abs(pendulum_upright) < self.params.balance_range:
+            # Switch to LQR for balancing
+            if not self.lqr_mode:
+                self.toggle_lqr()
+                self.status_label.config(text="Switched to LQR for balance control")
+                return
+
+        # Use the simulation's energy controller
+        self.motor_voltage = self.energy_control(current_time, motor_angle, pendulum_norm,
+                                                 motor_velocity, pendulum_velocity)
+
+        # Calculate current energy for display
+        E_current = self.params.Mp_g_Lp * (1 - np.cos(pendulum_norm)) + 0.5 * self.params.Jp * pendulum_velocity ** 2
+        E_ref = self.params.Er
+
+        # Update status based on energy and angle from upright
+        upright_deg = abs(pendulum_upright) * 180 / np.pi
+        self.status_label.config(
+            text=f"Energy control - E={E_current:.3f}, E_ref={E_ref:.3f}, {upright_deg:.1f}° from upright")
+
+        # Set controller mode
+        self.current_controller_mode = ENERGY_MODE
+
+    # Implement LQR control from simulation (paste.txt)
+    def lqr_balance(self, theta, alpha, theta_dot, alpha_dot):
+        """Ultra-fast LQR controller with theta limits consideration"""
+        alpha_upright = self.normalize_angle(alpha - np.pi)
+
+        # Regular LQR control with GUI-adjustable gains
+        u = (self.params.lqr_theta_gain * theta +
+             self.params.lqr_alpha_gain * alpha_upright +
+             self.params.lqr_theta_dot_gain * theta_dot +
+             self.params.lqr_alpha_dot_gain * alpha_dot) / 5.0
+
+        # Add limit avoidance term
+        limit_margin = 0.3
+        if theta > self.params.theta_max - limit_margin:
+            # Add strong negative control to avoid upper limit
+            avoid_factor = self.params.lqr_avoid_factor * (
+                        theta - (self.params.theta_max - limit_margin)) / limit_margin
+            u -= avoid_factor
+        elif theta < self.params.theta_min + limit_margin:
+            # Add strong positive control to avoid lower limit
+            avoid_factor = self.params.lqr_avoid_factor * (
+                        (self.params.theta_min + limit_margin) - theta) / limit_margin
+            u += avoid_factor
+
+        return self.clip_value(u, -self.params.max_voltage, self.params.max_voltage)
+
+    # Update LQR control using simulation algorithm
+    def update_lqr_control(self):
+        """LQR balance controller for pendulum using simulation algorithm"""
+        # Get current angles
+        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+        pendulum_angle_deg = self.qube.getPendulumAngle()
+
+        # Convert to radians
+        motor_angle = np.radians(motor_angle_deg)
+        pendulum_angle = np.radians(pendulum_angle_deg)
+
+        # Calculate velocities using finite difference
+        current_time = time.time()
+        dt = current_time - self.prev_time
+
+        # Initialize previous values if needed
+        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
+            self.prev_pendulum_angle = pendulum_angle
+        if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
+            self.prev_motor_angle = motor_angle
+
+        # Calculate velocities
+        pendulum_velocity = 0.0
+        motor_velocity = 0.0
+        if dt > 0:
+            pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
+            motor_velocity = (motor_angle - self.prev_motor_angle) / dt
+
+        # Update previous values
+        self.prev_pendulum_angle = pendulum_angle
+        self.prev_motor_angle = motor_angle
+        self.prev_time = current_time
+
+        # Normalize pendulum angle for LQR (we want pendulum_norm to be 0 at upright)
         pendulum_norm = self.normalize_angle(pendulum_angle + np.pi)
 
         # Check if we're still close enough to balance
         if abs(pendulum_norm) > 2 * self.params.balance_range:
-            # Too far from upright, switch back to swing-up
-            self.master.after(0, self.toggle_energy_control)  # Switch to energy-based swing-up
-            self.master.after(0, lambda: self.status_label.config(
-                text="Pendulum too far from upright, switching to swing-up"))
+            # Too far from upright, switch back to energy-based swing-up
+            self.toggle_energy_control()
+            self.status_label.config(text="Pendulum too far from upright, switching to swing-up")
             return
 
-        # LQR control
-        # u = -K*x where x = [theta, alpha, theta_dot, alpha_dot]
-        # Using the signs from the toggle buttons
-        u = -(
-                self.params.lqr_theta_gain * motor_angle +
-                self.params.lqr_alpha_gain * pendulum_norm +
-                self.params.lqr_theta_dot_gain * motor_velocity +
-                self.params.lqr_alpha_dot_gain * pendulum_velocity
-        )
+        # Use the simulation's LQR controller
+        self.motor_voltage = self.lqr_balance(motor_angle, pendulum_angle, motor_velocity, pendulum_velocity)
 
-        # Add limit avoidance term
-        limit_margin = 0.3  # radians
-        if motor_angle > self.params.theta_max - limit_margin:
-            # Add strong negative control to avoid upper limit
-            avoid_factor = self.params.lqr_avoid_factor * (
-                    motor_angle - (self.params.theta_max - limit_margin)) / limit_margin
-            u -= avoid_factor
-        elif motor_angle < self.params.theta_min + limit_margin:
-            # Add strong positive control to avoid lower limit
-            avoid_factor = self.params.lqr_avoid_factor * (
-                    (self.params.theta_min + limit_margin) - motor_angle) / limit_margin
-            u += avoid_factor
+        # Update status information
+        upright_deg = abs(pendulum_norm) * 180 / np.pi
+        self.status_label.config(text=f"LQR Balance - {upright_deg:.1f}° from upright")
 
-        # Limit voltage to system constraints
-        self.motor_voltage = max(-self.params.max_voltage, min(self.params.max_voltage, u))
+        # Set controller mode
+        self.current_controller_mode = LQR_MODE
 
-        # Update status information (thread-safe)
-        self.master.after(0, lambda: self.status_label.config(
-            text=f"LQR Balance - {abs(pendulum_norm) * 180 / np.pi:.1f}° from upright"))
+    # Implement control decision function from simulation
+    def control_decision(self):
+        """Combined controller with controller mode tracking - adapted from simulation"""
+        # Get current angles
+        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+        pendulum_angle_deg = self.qube.getPendulumAngle()
+
+        # Convert to radians
+        motor_angle = np.radians(motor_angle_deg)
+        pendulum_angle = np.radians(pendulum_angle_deg)
+
+        # Calculate velocities using finite difference
+        current_time = time.time()
+        dt = current_time - self.prev_time
+
+        # Initialize previous values if needed
+        if not hasattr(self, 'prev_pendulum_angle') or self.prev_pendulum_angle is None:
+            self.prev_pendulum_angle = pendulum_angle
+        if not hasattr(self, 'prev_motor_angle') or self.prev_motor_angle is None:
+            self.prev_motor_angle = motor_angle
+
+        # Calculate velocities
+        pendulum_velocity = 0.0
+        motor_velocity = 0.0
+        if dt > 0:
+            pendulum_velocity = (pendulum_angle - self.prev_pendulum_angle) / dt
+            motor_velocity = (motor_angle - self.prev_motor_angle) / dt
+
+        # Update previous values
+        self.prev_pendulum_angle = pendulum_angle
+        self.prev_motor_angle = motor_angle
+        self.prev_time = current_time
+
+        # Normalize pendulum angle (down = 0) for calculations
+        pendulum_norm = self.normalize_angle(pendulum_angle)
+
+        # Pendulum angle relative to upright (upright = 0)
+        pendulum_upright = self.normalize_angle(pendulum_angle + np.pi)
+
+        # Emergency limit handling - override all other controllers
+        if (motor_angle >= self.params.theta_max and motor_velocity > 0) or (
+                motor_angle <= self.params.theta_min and motor_velocity < 0):
+            control_value = -self.params.max_voltage if motor_velocity > 0 else self.params.max_voltage
+            self.motor_voltage = control_value
+            self.current_controller_mode = EMERGENCY_MODE
+            self.controller_label.config(text="Emergency Limit Control")
+            return
+
+        # Calculate current energy
+        E_current = self.params.Mp_g_Lp * (1 - np.cos(pendulum_norm)) + 0.5 * self.params.Jp * pendulum_velocity ** 2
+
+        # Check if energy is low (pendulum hanging down) - use bang-bang for initial swing
+        if E_current > self.params.Mp_g_Lp * 1.1:
+            control_value = self.energy_control(current_time, motor_angle, pendulum_norm,
+                                                motor_velocity, pendulum_velocity)
+            self.motor_voltage = control_value
+            self.current_controller_mode = ENERGY_MODE
+            self.controller_label.config(text="Energy Control")
+            self.status_label.config(text=f"Energy - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
+            return
+        # If close to upright, use LQR
+        elif abs(pendulum_upright) < 0.3:
+            control_value = self.lqr_balance(motor_angle, pendulum_angle, motor_velocity, pendulum_velocity)
+            self.motor_voltage = control_value
+            self.current_controller_mode = LQR_MODE
+            self.controller_label.config(text="LQR Balance Control")
+            self.status_label.config(text=f"LQR - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
+            return
+
+        # Otherwise use energy-based control for swing-up
+        else:
+            control_value = self.simple_bang_bang(current_time, motor_angle, pendulum_norm,
+                                                  motor_velocity, pendulum_velocity)
+            self.motor_voltage = control_value
+            self.current_controller_mode = BANGBANG_MODE
+            self.controller_label.config(text="Bang-Bang Control")
+            self.status_label.config(text=f"Bang-Bang - {abs(pendulum_upright) * 180 / np.pi:.1f}° from upright")
+            return
+
+    # Update combined control using control_decision function
+    def update_combined_control(self):
+        """Update using the automatic controller selection from simulation"""
+        self.control_decision()
+
+        # Set LED color based on active controller
+        if self.current_controller_mode == EMERGENCY_MODE:
+            self.r_slider.set(999)
+            self.g_slider.set(0)
+            self.b_slider.set(0)  # RED for emergency
+        elif self.current_controller_mode == BANGBANG_MODE:
+            self.r_slider.set(999)
+            self.g_slider.set(500)
+            self.b_slider.set(0)  # ORANGE for bang-bang
+        elif self.current_controller_mode == LQR_MODE:
+            self.r_slider.set(0)
+            self.g_slider.set(999)
+            self.b_slider.set(400)  # GREEN for LQR
+        elif self.current_controller_mode == ENERGY_MODE:
+            self.r_slider.set(500)
+            self.g_slider.set(0)
+            self.b_slider.set(999)  # PURPLE for energy
+
+        # Update mode label
+        mode_names = ["Emergency", "Bang-Bang", "LQR", "Energy"]
+        self.mode_label.config(text=f"Combined Control: {mode_names[self.current_controller_mode]}")
+
+    def start_data_logging(self):
+        """Start logging data to CSV file"""
+        try:
+            # Create a timestamp-based filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"qube_data_{timestamp}.csv"
+
+            # Ask user for save location
+            self.data_filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile=default_filename
+            )
+
+            if not self.data_filename:  # User canceled
+                return
+
+            # Open the file and create CSV writer
+            self.csv_file = open(self.data_filename, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+
+            # Write header row
+            headers = [
+                'Time(s)',
+                'Motor_Angle(deg)',
+                'Motor_Angle(rad)',
+                'Pendulum_Angle(deg)',
+                'Pendulum_Angle(rad)',
+                'Pendulum_Angle_From_Upright(deg)',
+                'Motor_Velocity(rad/s)',
+                'Pendulum_Velocity(rad/s)',
+                'Motor_Voltage(V)',
+                'Controller_Mode',
+                'Motor_RPM'
+            ]
+            self.csv_writer.writerow(headers)
+
+            # Start logging
+            self.data_logging = True
+            self.log_counter = 0
+            self.log_start_time = time.time()
+
+            # Update UI
+            self.start_logging_btn.config(state="disabled")
+            self.stop_logging_btn.config(state="normal")
+            self.save_path_label.config(text=f"Logging to: {os.path.basename(self.data_filename)}")
+            self.status_label.config(text=f"Data logging started")
+
+        except Exception as e:
+            messagebox.showerror("Logging Error", f"Could not start logging: {str(e)}")
+            self.stop_data_logging()
+
+    def stop_data_logging(self):
+        """Stop logging data"""
+        if self.data_logging:
+            try:
+                # Close the file
+                if self.csv_file:
+                    self.csv_file.close()
+
+                # Update state
+                self.data_logging = False
+                self.csv_writer = None
+                self.csv_file = None
+
+                # Update UI
+                self.start_logging_btn.config(state="normal")
+                self.stop_logging_btn.config(state="disabled")
+                self.save_path_label.config(text=f"Logging stopped. File saved.")
+                self.status_label.config(text=f"Data logging stopped")
+
+            except Exception as e:
+                messagebox.showerror("Logging Error", f"Error while stopping logging: {str(e)}")
+
+    def update_log_interval(self):
+        """Update the logging interval"""
+        self.log_interval = self.log_interval_scale.get()
+        self.status_label.config(text=f"Log interval updated to {self.log_interval} frames")
+
+    def log_data_point(self):
+        """Log a single data point to the CSV file"""
+        if not self.data_logging or not self.csv_writer:
+            return
+
+        # Only log every 'log_interval' frames to control file size
+        self.log_counter += 1
+        if self.log_counter < self.log_interval:
+            return
+
+        self.log_counter = 0
+
+        try:
+            # Get current data
+            current_time = time.time() - self.log_start_time
+            motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+            pendulum_angle_deg = self.qube.getPendulumAngle()
+            motor_angle_rad = np.radians(motor_angle_deg)
+            pendulum_angle_rad = np.radians(pendulum_angle_deg)
+
+            # Calculate derived values
+            pendulum_upright = self.normalize_angle(pendulum_angle_rad + np.pi)
+            upright_angle_deg = abs(pendulum_upright) * 180 / np.pi
+
+            # Get velocities (if available)
+            motor_velocity = 0
+            pendulum_velocity = 0
+
+            if hasattr(self, 'prev_pendulum_angle') and hasattr(self, 'prev_motor_angle') and hasattr(self,
+                                                                                                      'prev_time'):
+                dt = current_time - (time.time() - self.prev_time)
+                if dt > 0:
+                    motor_velocity = (motor_angle_rad - self.prev_motor_angle) / dt
+                    pendulum_velocity = (pendulum_angle_rad - self.prev_pendulum_angle) / dt
+
+            # Get controller mode name
+            mode_names = ["Emergency", "Bang-Bang", "LQR", "Energy"]
+            controller_mode = mode_names[self.current_controller_mode]
+
+            # Prepare row data
+            row_data = [
+                f"{current_time:.3f}",
+                f"{motor_angle_deg:.3f}",
+                f"{motor_angle_rad:.3f}",
+                f"{pendulum_angle_deg:.3f}",
+                f"{pendulum_angle_rad:.3f}",
+                f"{upright_angle_deg:.3f}",
+                f"{motor_velocity:.3f}",
+                f"{pendulum_velocity:.3f}",
+                f"{self.motor_voltage:.3f}",
+                controller_mode,
+                f"{self.qube.getMotorRPM():.1f}"
+            ]
+
+            # Write to CSV
+            self.csv_writer.writerow(row_data)
+
+        except Exception as e:
+            print(f"Error logging data: {str(e)}")
 
     def stop_motor(self):
         """Stop the motor"""
@@ -1091,11 +1117,16 @@ class QUBEControllerWithBangBang:
         self.bang_bang_mode = False
         self.energy_mode = False
         self.lqr_mode = False
+        if hasattr(self, 'combined_control_mode'):
+            self.combined_control_mode = False
         self.motor_voltage = 0.0
         self.voltage_slider.set(0)
         self.bang_bang_btn.config(text="Bang-Bang Swing-Up")
         self.energy_btn.config(text="Energy Swing-Up")
         self.lqr_btn.config(text="LQR Balance")
+        if hasattr(self, 'combined_btn'):
+            self.combined_btn.config(text="Combined Control")
+        self.current_controller_mode = EMERGENCY_MODE
 
         # Set blue LED when stopped
         self.r_slider.set(0)
@@ -1104,48 +1135,104 @@ class QUBEControllerWithBangBang:
 
         self.status_label.config(text="Motor stopped")
         self.mode_label.config(text="Manual")
+        self.controller_label.config(text="None")
 
-    def shutdown(self):
-        """Clean shutdown of threads"""
-        self.running = False
-        if self.control_thread and self.control_thread.is_alive():
-            self.control_thread.join(timeout=1.0)
+    def update_gui(self):
+        """Update the GUI and control the hardware - called continuously"""
+        # Update automatic control modes if active
+        if self.calibrating:
+            self.update_calibration()
+        elif self.moving_to_position:
+            self.update_position_control()
+        elif self.bang_bang_mode:
+            self.update_bang_bang_control()
+        elif self.energy_mode:
+            self.update_energy_control()
+        elif self.lqr_mode:
+            self.update_lqr_control()
+        elif hasattr(self, 'combined_control_mode') and self.combined_control_mode:
+            self.update_combined_control()
 
-        # Stop the motor
-        self.motor_voltage = 0.0
-        self.qube.setMotorVoltage(0.0)
-        self.qube.close()
+        # Apply the current motor voltage - THIS IS CRITICAL TO DO ON EVERY LOOP!
+        self.qube.setMotorVoltage(self.motor_voltage)
+
+        # Apply RGB values
+        self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
+
+        # Update display information
+        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
+        pendulum_angle_deg = self.qube.getPendulumAngle()
+
+        # Get pendulum angle relative to upright position
+        pendulum_angle_rad = np.radians(pendulum_angle_deg)
+        pendulum_norm = self.normalize_angle(pendulum_angle_rad + np.pi)
+        upright_angle = abs(pendulum_norm) * 180 / np.pi
+
+        rpm = self.qube.getMotorRPM()
+
+        self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
+        self.pendulum_label.config(
+            text=f"{pendulum_angle_deg:.1f}° ({upright_angle:.1f}° from upright)")
+        self.rpm_label.config(text=f"{rpm:.1f}")
+        self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+
+        # Log data if enabled
+        if self.data_logging:
+            self.log_data_point()
 
 
 def main():
-    print("Starting QUBE Controller with Swing-Up and LQR Balance Control...")
+    print("Starting QUBE Controller with Advanced Control Algorithms...")
     print("Will set corner position as zero")
 
+    app = None
+
     try:
-        # Initialize QUBE with new communication model
+        # Initialize QUBE
         qube = QUBE(COM_PORT, 115200)
+
+        # Initial reset
+        qube.resetMotorEncoder()
+        qube.resetPendulumEncoder()
+        qube.setMotorVoltage(0.0)
+        qube.setRGB(0, 0, 999)  # Blue LED to start
+        qube.update()
 
         # Create GUI
         root = tk.Tk()
         app = QUBEControllerWithBangBang(root, qube)
 
-        # Clean shutdown on window close
-        root.protocol("WM_DELETE_WINDOW", lambda: [app.shutdown(), root.destroy()])
+        # Main loop
+        while True:
+            qube.update()
+            app.update_gui()
+            root.update()
+            time.sleep(0.01)  # 100Hz update rate
 
-        # Main loop - just for GUI updates
-        root.mainloop()
-
+    except tk.TclError:
+        # Window closed
+        print("Window closed")
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C
+        print("User interrupted program")
     except Exception as e:
         print(f"Error: {str(e)}")
     finally:
+        # Clean up data logging
+        if app and app.data_logging:
+            try:
+                app.stop_data_logging()
+                print("Data logging stopped and file closed properly")
+            except:
+                print("Error while stopping data logging")
+
         # Final stop attempt
         try:
-            if 'qube' in locals():
-                qube.setMotorVoltage(0.0)
-                qube.close()
+            qube.setMotorVoltage(0.0)
+            qube.update()
             print("Motor stopped")
-        except:
-            pass
+        except Exception as e:
+            print(f"Error during shutdown: {str(e)}")
 
 
 if __name__ == "__main__":
