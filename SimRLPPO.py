@@ -3,13 +3,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
-# Remove numba import as we're not using it now
-# import numba as nb
-from collections import deque
 import matplotlib.pyplot as plt
-import time
+from tqdm import tqdm
+import numba as nb
+from time import time
 
-# System Parameters
+# System Parameters (same as in your original code)
 Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.0431  # Motor back-emf constant
 Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
@@ -35,30 +34,37 @@ quarter_mL_LL_squared = 0.25 * mL * LL ** 2
 Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
-batch_size = 256 * 32  # Batch size for training
 
-
-# Helper functions
-# No njit for this function since we need to handle both arrays and scalars
+# Helper functions with numba optimization
+@nb.njit(fastmath=True, cache=True)
 def clip_value(value, min_value, max_value):
-    """Clip function that works with both arrays and scalars"""
-    return np.clip(value, min_value, max_value)
+    """Fast custom clip function"""
+    if value < min_value:
+        return min_value
+    elif value > max_value:
+        return max_value
+    else:
+        return value
 
 
-# Remove njit for better type compatibility
+@nb.njit(fastmath=True, cache=True)
 def apply_voltage_deadzone(vm):
     """Apply motor voltage dead zone"""
-    # Handle both scalar and array inputs
-    return np.where(np.abs(vm) <= 0.2, 0.0, vm)
+    if -0.2 <= vm <= 0.2:
+        vm = 0.0
+    return vm
 
 
-# Remove njit for type compatibility
+@nb.njit(fastmath=True, cache=True)
 def normalize_angle(angle):
     """Normalize angle to [-π, π]"""
-    return ((angle + np.pi) % (2 * np.pi)) - np.pi
+    angle = angle % (2 * np.pi)
+    if angle > np.pi:
+        angle -= 2 * np.pi
+    return angle
 
 
-# Remove njit for type compatibility
+@nb.njit(fastmath=True, cache=True)
 def enforce_theta_limits(state):
     """Enforce hard limits on theta angle and velocity"""
     theta, alpha, theta_dot, alpha_dot = state
@@ -75,29 +81,20 @@ def enforce_theta_limits(state):
         if theta_dot < 0:
             theta_dot = 0.0
 
-    return np.array([theta, alpha, theta_dot, alpha_dot], dtype=np.float32)
+    return np.array([theta, alpha, theta_dot, alpha_dot])
 
 
-# Remove njit to handle mixed types better
+@nb.njit(fastmath=True, cache=True)
 def dynamics_step(state, t, vm):
-    """Dynamics calculation with theta limits"""
-    # Convert input to float scalar values to avoid array issues
-    theta_m = float(state[0])
-    theta_L = float(state[1])
-    theta_m_dot = float(state[2])
-    theta_L_dot = float(state[3])
-
-    # If vm is an array with one element, convert to scalar
-    if hasattr(vm, 'shape') and vm.size == 1:
-        vm = float(vm)
+    """Ultra-optimized dynamics calculation with theta limits"""
+    theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
 
     # Check theta limits - implement hard stops
     if (theta_m >= THETA_MAX and theta_m_dot > 0) or (theta_m <= THETA_MIN and theta_m_dot < 0):
         theta_m_dot = 0.0  # Stop the arm motion at the limits
 
     # Apply dead zone and calculate motor torque
-    if -0.2 <= vm <= 0.2:  # Direct implementation rather than using the function
-        vm = 0.0
+    vm = apply_voltage_deadzone(vm)
 
     # Motor torque calculation
     im = (vm - Km * theta_m_dot) / Rm
@@ -111,7 +108,7 @@ def dynamics_step(state, t, vm):
     C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
 
     # For theta_L equation:
-    M21 = half_mL_LL_LA * np.cos(theta_L)
+    M21 = -half_mL_LL_LA * np.cos(theta_L)
     M22 = JL + quarter_mL_LL_squared
     C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
     G = half_mL_LL_g * np.sin(theta_L)
@@ -121,8 +118,8 @@ def dynamics_step(state, t, vm):
 
     # Handle near-singular matrix
     if abs(det_M) < 1e-10:
-        theta_m_ddot = 0.0
-        theta_L_ddot = 0.0
+        theta_m_ddot = 0
+        theta_L_ddot = 0
     else:
         # Right-hand side of equations
         RHS1 = Tm - C1 - C2 - DA * theta_m_dot
@@ -132,21 +129,156 @@ def dynamics_step(state, t, vm):
         theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
         theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
 
-    # Create a numpy array with all values as float32
-    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot], dtype=np.float32)
+    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 
-# Neural Network Architecture for PPO
+# Simulation environment with RK4 integration like in SAC code
+class PendulumEnv:
+    def __init__(self, dt=0.0115, max_steps=1300):
+        self.dt = dt
+        self.max_steps = max_steps
+        self.step_count = 0
+        self.state = None
+
+    def reset(self, random_init=True):
+        # Initialize with small random variations if requested
+        if random_init:
+            self.state = np.array([
+                np.random.uniform(-0.1, 0.1),  # theta
+                np.random.uniform(-0.1, 0.1),  # alpha (small angle from bottom)
+                np.random.uniform(-0.05, 0.05),  # theta_dot
+                np.random.uniform(-0.05, 0.05)  # alpha_dot
+            ])
+        else:
+            self.state = np.array([0.0, 0.1, 0.0, 0.0])  # Default initial state
+
+        self.step_count = 0
+        return self._get_observation()
+
+    def _get_observation(self):
+        # Normalize the state for RL
+        theta, alpha, theta_dot, alpha_dot = self.state
+
+        # Normalize angles to [-π, π] for the observation
+        alpha_norm = normalize_angle(alpha + np.pi)  # Normalized relative to upright
+
+        # Create observation vector with sin/cos values for angles to avoid discontinuities
+        obs = np.array([
+            np.sin(theta), np.cos(theta),
+            np.sin(alpha_norm), np.cos(alpha_norm),
+            theta_dot / 10.0,  # Scale velocities to roughly [-1, 1]
+            alpha_dot / 10.0
+        ])
+
+        return obs
+
+    def step(self, action):
+        # Convert normalized action to voltage
+        voltage = float(action) * max_voltage if isinstance(action, np.ndarray) else action
+
+        # RK4 integration step
+        self.state = self._rk4_step(self.state, voltage)
+
+        # Enforce limits
+        self.state = enforce_theta_limits(self.state)
+
+        # Get reward
+        reward = self._compute_reward()
+
+        # Check if done
+        self.step_count += 1
+        done = self.step_count >= self.max_steps
+
+        return self._get_observation(), reward, done, {}
+
+    def _rk4_step(self, state, vm):
+        """4th-order Runge-Kutta integrator step"""
+        # Apply limits to initial state
+        state = enforce_theta_limits(state)
+
+        k1 = dynamics_step(state, 0, vm)
+        state_k2 = enforce_theta_limits(state + 0.5 * self.dt * k1)
+        k2 = dynamics_step(state_k2, 0, vm)
+
+        state_k3 = enforce_theta_limits(state + 0.5 * self.dt * k2)
+        k3 = dynamics_step(state_k3, 0, vm)
+
+        state_k4 = enforce_theta_limits(state + self.dt * k3)
+        k4 = dynamics_step(state_k4, 0, vm)
+
+        new_state = state + (self.dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return enforce_theta_limits(new_state)
+
+    def _compute_reward(self):
+        theta, alpha, theta_dot, alpha_dot = self.state
+        alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
+
+        # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
+        # Uses cosine which is a naturally smooth function
+        upright_reward = 2.0 * np.cos(alpha_norm)
+
+        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
+        # Use tanh to create a smoother penalty that doesn't grow excessively large
+        velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0  # Normalize velocities
+        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
+
+        # COMPONENT 3: Smooth penalty for arm position away from center
+        # Again using tanh for smooth bounded penalties
+        pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
+
+        # COMPONENT 4: Smoother bonus for being close to upright position
+        upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
+        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
+
+        # COMPONENT 4.5: Smoother cost for being close to downright position
+        # For new convention, downright is at π
+        downright_alpha = normalize_angle(alpha - np.pi)
+        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
+        stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
+
+        # COMPONENT 5: Smoother penalty for approaching limits
+        # Create a continuous penalty that increases as the arm approaches limits
+        # Map the distance to limits to a 0-1 range, with 1 being at the limit
+        theta_max_dist = np.clip(1.0 - abs(theta - THETA_MAX) / 0.5, 0, 1)
+        theta_min_dist = np.clip(1.0 - abs(theta - THETA_MIN) / 0.5, 0, 1)
+        limit_distance = max(theta_max_dist, theta_min_dist)
+
+        # Apply a nonlinear function to create gradually increasing penalty
+        # The penalty grows more rapidly as the arm gets very close to limits
+        limit_penalty = -10.0 * limit_distance ** 3
+
+        # COMPONENT 6: Energy management reward
+        # This component is already quite smooth, just adjust scaling
+        energy_reward = 2 - 0.15 * abs(Mp_g_Lp * (np.cos(alpha_norm))
+                                       + 0.5 * Jp * alpha_dot ** 2
+                                       - Mp_g_Lp)
+
+        # Combine all components
+        reward = (
+                upright_reward
+                # + velocity_penalty
+                # + pos_penalty
+                + bonus
+                + limit_penalty
+                + energy_reward
+        )
+
+        return reward
+
+
+# Actor (Policy) Network - Keep the PPO architecture
 class Actor(nn.Module):
     """Policy network for the PPO algorithm"""
 
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Actor, self).__init__()
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
+            nn.ReLU()
         )
 
         # Mean and log_std heads for the action distribution
@@ -156,7 +288,7 @@ class Actor(nn.Module):
     def forward(self, state):
         """Forward pass through the network"""
         x = self.network(state)
-        mean = self.mean(x)
+        mean = torch.tanh(self.mean(x))
 
         # Get the action distribution
         std = torch.exp(self.log_std).expand_as(mean)
@@ -165,16 +297,17 @@ class Actor(nn.Module):
         return dist
 
 
+# Critic (Value) Network - Keep the PPO architecture
 class Critic(nn.Module):
     """Value network for the PPO algorithm"""
 
-    def __init__(self, state_dim, hidden_dim=64):
+    def __init__(self, state_dim, hidden_dim=256):
         super(Critic, self).__init__()
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
@@ -183,6 +316,7 @@ class Critic(nn.Module):
         return self.network(state)
 
 
+# PPO Buffer - Modified to be more like SAC's buffer structure
 class PPOBuffer:
     """Storage buffer for PPO algorithm"""
 
@@ -258,13 +392,23 @@ class PPOBuffer:
         )
 
 
+# PPO Agent - Keeping the same functionality while matching SAC structure
 class PPOAgent:
-    """PPO agent implementation"""
-
-    def __init__(self, state_dim, action_dim, action_low, action_high,
-                 gamma=0.99, clip_ratio=0.2, policy_lr=3e-4, vf_lr=1e-3,
-                 train_iters=80, target_kl=0.01, hidden_dim=64, lam=0.97):
-
+    def __init__(
+            self,
+            state_dim,
+            action_dim,
+            action_low=-1.0,
+            action_high=1.0,
+            gamma=0.99,
+            clip_ratio=0.2,
+            policy_lr=3e-4,
+            vf_lr=3e-4,
+            train_iters=80,
+            target_kl=0.01,
+            hidden_dim=256,
+            lam=0.97
+    ):
         # Environment parameters
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -285,80 +429,133 @@ class PPOAgent:
         # Setup optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=policy_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=vf_lr)
+        self.actor_scheduler = optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=1000, gamma=0.95)
+        self.critic_scheduler = optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=1000, gamma=0.95)
 
         # For tracking training progress
         self.episode_rewards = []
         self.mean_rewards = []
 
-    def get_action(self, state, deterministic=False):
-        """Get action from policy network"""
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        # Setup device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.actor.to(self.device)
+        self.critic.to(self.device)
+
+    def select_action(self, state, deterministic=False):
+        """Get action from policy network (like SAC's select_action)"""
+        state_tensor = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         dist = self.actor(state_tensor)
 
         if deterministic:
-            action = dist.mean.detach().numpy()[0]
+            action = dist.mean.detach().cpu().numpy()[0]
         else:
-            action = dist.sample().detach().numpy()[0]
+            action = dist.sample().detach().cpu().numpy()[0]
 
         # Clip action to environment's action space
         action = np.clip(action, self.action_low, self.action_high)
 
-        # Get log probability of the action
-        log_prob = dist.log_prob(torch.FloatTensor(action)).sum().detach().numpy()
-
-        # Get value estimate
-        value = self.critic(state_tensor).detach().numpy()[0, 0]
+        # Get log probability of the action and value
+        log_prob = dist.log_prob(torch.FloatTensor(action).to(self.device)).sum().detach().cpu().numpy()
+        value = self.critic(state_tensor).detach().cpu().numpy()[0, 0]
 
         return action, log_prob, value
 
-    def update(self, buffer):
-        """Update the policy and value network using PPO"""
+    def update_parameters(self, buffer):
+        """Update the policy and value network using PPO with minibatches"""
         data = buffer.get()
 
-        states = torch.FloatTensor(data['states'])
-        actions = torch.FloatTensor(data['actions'])
-        returns = torch.FloatTensor(data['returns']).unsqueeze(1)
-        advantages = torch.FloatTensor(data['advantages']).unsqueeze(1)
-        old_logp = torch.FloatTensor(data['logp_old']).unsqueeze(1)
+        # Get full dataset
+        states = torch.FloatTensor(data['states']).to(self.device)
+        actions = torch.FloatTensor(data['actions']).to(self.device)
+        returns = torch.FloatTensor(data['returns']).to(self.device).unsqueeze(1)
+        advantages = torch.FloatTensor(data['advantages']).to(self.device).unsqueeze(1)
+        old_logp = torch.FloatTensor(data['logp_old']).to(self.device).unsqueeze(1)
 
-        # Train the policy and value network multiple times
+        # Set up minibatch training
+        batch_size = len(states)
+        minibatch_size = 128  # Choose a reasonable size
+        num_minibatches = batch_size // minibatch_size
+
+        policy_losses = []
+        value_losses = []
+        kl_divs = []
+
+        # Train for multiple epochs
         for _ in range(self.train_iters):
-            # Get current action distribution and values
-            dist = self.actor(states)
-            values = self.critic(states)
+            # Generate random indices for minibatches
+            indices = torch.randperm(batch_size)
 
-            # Calculate log probabilities of actions
-            logp = dist.log_prob(actions).sum(dim=1, keepdim=True)
+            # Track KL divergence for early stopping
+            total_kl = 0
 
-            # Calculate ratio for PPO
-            ratio = torch.exp(logp - old_logp)
+            # Process minibatches
+            for start in range(0, batch_size, minibatch_size):
+                end = min(start + minibatch_size, batch_size)
+                mb_idx = indices[start:end]
 
-            # Calculate surrogate losses
-            surrogate1 = ratio * advantages
-            surrogate2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+                mb_states = states[mb_idx]
+                mb_actions = actions[mb_idx]
+                mb_returns = returns[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                mb_old_logp = old_logp[mb_idx]
 
-            # Policy loss (negative because we're maximizing)
-            policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                # Get current action distribution
+                dist = self.actor(mb_states)
+                values = self.critic(mb_states)
 
-            # Value function loss
-            value_loss = ((values - returns) ** 2).mean()
+                # Calculate log probabilities of actions
+                logp = dist.log_prob(mb_actions).sum(dim=1, keepdim=True)
 
-            # Calculate approximate KL divergence for early stopping
-            approx_kl = ((old_logp - logp) ** 2).mean()
+                # Calculate ratio for PPO
+                ratio = torch.exp(logp - mb_old_logp)
 
-            # Update the policy network
-            self.actor_optimizer.zero_grad()
-            policy_loss.backward()
-            self.actor_optimizer.step()
+                # Calculate surrogate losses
+                surrogate1 = ratio * mb_advantages
+                surrogate2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * mb_advantages
 
-            # Update the value network
-            self.critic_optimizer.zero_grad()
-            value_loss.backward()
-            self.critic_optimizer.step()
+                # Policy loss (negative because we're maximizing)
+                policy_loss = -torch.min(surrogate1, surrogate2).mean()
 
-            # Stop early if KL divergence is too large
-            if approx_kl > 1.5 * self.target_kl:
+                # Value function loss with clipping (PPO2-style)
+                old_values = self.critic(mb_states).detach()
+                values_clipped = old_values + torch.clamp(values - old_values, -self.clip_ratio, self.clip_ratio)
+                v_loss1 = (values - mb_returns) ** 2
+                v_loss2 = (values_clipped - mb_returns) ** 2
+                value_loss = torch.max(v_loss1, v_loss2).mean()
+
+                # Update the networks
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+
+                policy_loss.backward()
+                value_loss.backward()
+
+                # Optional: Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.1)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.1)
+
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+                self.actor_scheduler.step()
+                self.critic_scheduler.step()
+
+                # Calculate approximate KL for early stopping
+                approx_kl = ((mb_old_logp - logp) ** 2).mean().item()
+                total_kl += approx_kl * (end - start) / batch_size
+
+                # Track losses
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+
+            # Early stopping based on KL divergence
+            if total_kl > 1.5 * self.target_kl:
                 break
+
+        return {
+            'policy_loss': np.mean(policy_losses),
+            'value_loss': np.mean(value_losses),
+            'kl_div': np.mean(kl_divs) if kl_divs else total_kl
+        }
 
     def save(self, path):
         """Save the model weights"""
@@ -377,399 +574,383 @@ class PPOAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
 
-    def train(self, env, num_epochs=100, steps_per_epoch=4000, batch_size=64, max_ep_len=1000, render_every=10):
-        """Train the agent using PPO"""
-        # Initialize replay buffer
-        buffer = PPOBuffer(self.state_dim, self.action_dim, steps_per_epoch, self.gamma, self.lam)
 
-        # Track average reward
-        best_mean_reward = -np.inf
+def train():
+    """Training function, structured like the SAC training function"""
+    print("Starting PPO training for inverted pendulum control...")
 
-        # Start training
-        total_steps = 0
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
+    # Environment setup
+    env = PendulumEnv()
 
-            # Collect trajectories
-            state = env.reset()
-            episode_reward = 0
-            episode_length = 0
+    # Hyperparameters
+    state_dim = 6  # Our observation space
+    action_dim = 1  # Motor voltage (normalized)
+    max_episodes = 10000
+    max_steps = 1300
+    steps_per_epoch = 1300
 
-            for t in range(steps_per_epoch):
-                # Get action
-                action, logp, val = self.get_action(state)
+    # Scale actions to motor voltage range
+    action_low = -1.0  # Will be scaled to -max_voltage
+    action_high = 1.0  # Will be scaled to max_voltage
 
-                # Take step in environment
-                next_state, reward, done, _ = env.step(action)
-
-                # Store transition in buffer
-                buffer.store(state, action, reward, next_state, val, logp, done)
-
-                # Update state and counters
-                state = next_state
-                episode_reward += reward
-                episode_length += 1
-                total_steps += 1
-
-                # Handle episode termination
-                timeout = episode_length >= max_ep_len
-                terminal = done or timeout
-
-                if terminal or t == steps_per_epoch - 1:
-                    if not terminal:
-                        # If trajectory didn't reach terminal state, bootstrap value
-                        _, _, last_val = self.get_action(state)
-                    else:
-                        last_val = 0
-
-                    buffer.finish_path(last_val)
-
-                    # Only record episode reward if it's a genuine episode termination
-                    if terminal:
-                        self.episode_rewards.append(episode_reward)
-
-                    # Reset for next episode
-                    state = env.reset()
-                    episode_reward = 0
-                    episode_length = 0
-
-            # Update the policy and value networks after collecting a batch of data
-            self.update(buffer)
-
-            # Calculate mean reward over last 10 episodes
-            mean_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else 0
-            self.mean_rewards.append(mean_reward)
-
-            # Save model if it's the best so far
-            if mean_reward > best_mean_reward:
-                best_mean_reward = mean_reward
-                self.save('best_ppo_model.pt')
-
-            # Render every few epochs
-            if epoch % render_every == 0:
-                test_env = PendulumEnv()
-                test_state = test_env.reset()
-                done = False
-
-                while not done:
-                    action, _, _ = self.get_action(test_state, deterministic=True)
-                    test_state, _, done, _ = test_env.step(action)
-
-                test_env.render()
-
-            # Print epoch statistics
-            epoch_time = time.time() - epoch_start_time
-            print(f"Epoch {epoch + 1}/{num_epochs} | Mean Reward: {mean_reward:.2f} | Time: {epoch_time:.2f}s")
-
-        # Plot learning curve
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.mean_rewards)
-        plt.title("Learning Curve")
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean Reward")
-        plt.savefig("learning_curve.png")
-        plt.show()
-
-        return self.mean_rewards
-
-
-# Simulation environment for RL
-class PendulumEnv:
-    def __init__(self, dt=0.01, max_steps=500):
-        self.dt = dt  # Time step for simulation
-        self.max_steps = max_steps
-        self.current_steps = 0
-        self.state = None
-
-        # Action space: motor voltage
-        self.action_space_low = -max_voltage
-        self.action_space_high = max_voltage
-
-        # State space dimensions
-        # For normalized observation, dimension is 6 (sin/cos of angles + velocities)
-        # For raw state, dimension is 4 (theta, alpha, theta_dot, alpha_dot)
-        self.observation_dim = 6  # Using normalized observation with sin/cos
-
-        # For rendering
-        self.state_history = []
-        self.reward_history = []
-        self.action_history = []
-
-    def reset(self, random_init=True):
-        """Reset the environment"""
-        # Initialize state
-        if random_init:
-            # Small random variations for more robust training
-            self.state = np.array([
-                np.random.uniform(-0.1, 0.1),  # theta
-                np.pi + np.random.uniform(-0.1, 0.1),  # alpha (near bottom)
-                np.random.uniform(-0.05, 0.05),  # theta_dot
-                np.random.uniform(-0.05, 0.05)  # alpha_dot
-            ], dtype=np.float32)
-        else:
-            # Default initial state (pendulum hanging down)
-            self.state = np.array([0.0, np.pi, 0.0, 0.0], dtype=np.float32)
-
-        self.current_steps = 0
-        self.state_history = [self.state.copy()]
-        self.reward_history = []
-        self.action_history = []
-
-        return self._get_observation()
-
-    def _get_observation(self):
-        """Convert internal state to observation for RL agent"""
-        theta, alpha, theta_dot, alpha_dot = self.state
-
-        # Normalize angles using sin/cos to avoid discontinuities
-        # This is important for the policy to learn smoother representations
-        obs = np.array([
-            np.sin(theta), np.cos(theta),  # Arm angle
-            np.sin(alpha), np.cos(alpha),  # Pendulum angle
-            theta_dot / 10.0,  # Normalize velocities
-            alpha_dot / 10.0  # to be roughly in [-1, 1]
-        ], dtype=np.float32)
-
-        return obs
-
-    def step(self, action):
-        """Take a step in the environment with the given action"""
-        # Clip action to valid range
-        vm = clip_value(action, -max_voltage, max_voltage)
-
-        # Store action for visualization
-        self.action_history.append(vm)
-
-        # Integrate using RK4 for better accuracy
-        state_array = self.state.astype(np.float32)  # Ensure consistent type
-        k1 = dynamics_step(state_array, 0, vm)
-        k2 = dynamics_step(state_array + 0.5 * self.dt * k1, 0, vm)
-        k3 = dynamics_step(state_array + 0.5 * self.dt * k2, 0, vm)
-        k4 = dynamics_step(state_array + self.dt * k3, 0, vm)
-
-        # Update state
-        new_state = self.state + (self.dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-        # Enforce limits on theta
-        new_state = enforce_theta_limits(new_state)
-
-        # Normalize alpha to [-π, π]
-        new_state[1] = normalize_angle(new_state[1])
-
-        self.state = new_state
-        self.current_steps += 1
-
-        # Store state for visualization
-        self.state_history.append(self.state.copy())
-
-        # Calculate reward
-        reward = self._compute_reward()
-        self.reward_history.append(reward)
-
-        # Check termination
-        done = self.current_steps >= self.max_steps
-
-        return self._get_observation(), reward, done, {}
-
-    def _compute_reward(self):
-        theta, alpha, theta_dot, alpha_dot = self.state
-        alpha_norm = normalize_angle(alpha + np.pi)  # Normalized for upright position
-
-        # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
-        # Uses cosine which is a naturally smooth function
-        upright_reward = 2.0 * np.cos(alpha_norm)
-
-        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
-        # Use tanh to create a smoother penalty that doesn't grow excessively large
-        velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0  # Normalize velocities
-        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
-
-        # COMPONENT 3: Smooth penalty for arm position away from center
-        # Again using tanh for smooth bounded penalties
-        pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
-
-        # COMPONENT 4: Smoother bonus for being close to upright position
-        upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
-        stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
-        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
-
-        # COMPONENT 4.5: Smoother cost for being close to downright position
-        # For new convention, downright is at π
-        downright_alpha = normalize_angle(alpha - np.pi)
-        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-        stability_factor = np.exp(-1.0 * alpha_dot ** 2)
-        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
-
-        # COMPONENT 5: Smoother penalty for approaching limits
-        # Create a continuous penalty that increases as the arm approaches limits
-        # Map the distance to limits to a 0-1 range, with 1 being at the limit
-        theta_max_dist = np.clip(1.0 - abs(theta - THETA_MAX) / 0.5, 0, 1)
-        theta_min_dist = np.clip(1.0 - abs(theta - THETA_MIN) / 0.5, 0, 1)
-        limit_distance = max(theta_max_dist, theta_min_dist)
-
-        # Apply a nonlinear function to create gradually increasing penalty
-        # The penalty grows more rapidly as the arm gets very close to limits
-        limit_penalty = -10.0 * limit_distance ** 3
-
-        # COMPONENT 6: Energy management reward
-        # This component is already quite smooth, just adjust scaling
-        energy_reward = 2 - 0.15 * abs(Mp_g_Lp * (np.cos(alpha_norm))
-                                       + 0.5 * Jp * alpha_dot ** 2
-                                       - Mp_g_Lp)
-
-        # Combine all components
-        reward = (
-                upright_reward
-                # + velocity_penalty
-                + pos_penalty
-                + bonus
-                + limit_penalty
-                + energy_reward
-        )
-
-        return reward
-
-    def render(self, mode='plot', save_path=None):
-        """Visualize the pendulum trajectory
-
-        Args:
-            mode (str): Visualization mode ('plot' for matplotlib)
-            save_path (str): Optional path to save the visualization
-        """
-        if mode == 'plot':
-            states = np.array(self.state_history)
-            actions = np.array(self.action_history) if self.action_history else np.zeros(len(states) - 1)
-
-            plt.figure(figsize=(15, 12))
-
-            # Plot state variables
-            plt.subplot(3, 2, 1)
-            plt.plot(states[:, 0])
-            plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.3)
-            plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.3)
-            plt.title('Arm Angle (theta)')
-            plt.xlabel('Step')
-            plt.ylabel('Radians')
-
-            plt.subplot(3, 2, 2)
-            plt.plot(states[:, 1])
-            plt.axhline(y=0, color='g', linestyle='--', alpha=0.3)  # Upright position
-            plt.axhline(y=np.pi, color='r', linestyle='--', alpha=0.3)  # Downward position
-            plt.axhline(y=-np.pi, color='r', linestyle='--', alpha=0.3)  # Also downward position
-            plt.title('Pendulum Angle (alpha)')
-            plt.xlabel('Step')
-            plt.ylabel('Radians')
-
-            plt.subplot(3, 2, 3)
-            plt.plot(states[:, 2])
-            plt.title('Arm Angular Velocity')
-            plt.xlabel('Step')
-            plt.ylabel('Radians/s')
-
-            plt.subplot(3, 2, 4)
-            plt.plot(states[:, 3])
-            plt.title('Pendulum Angular Velocity')
-            plt.xlabel('Step')
-            plt.ylabel('Radians/s')
-
-            plt.subplot(3, 2, 5)
-            plt.plot(self.reward_history)
-            plt.title('Rewards per Step')
-            plt.xlabel('Step')
-            plt.ylabel('Reward')
-
-            plt.subplot(3, 2, 6)
-            plt.plot(actions)
-            plt.axhline(y=max_voltage, color='r', linestyle='--', alpha=0.3)
-            plt.axhline(y=-max_voltage, color='r', linestyle='--', alpha=0.3)
-            plt.title('Control Actions (Voltage)')
-            plt.xlabel('Step')
-            plt.ylabel('Voltage')
-
-            plt.tight_layout()
-
-            # Save figure if path is provided
-            if save_path:
-                plt.savefig(save_path)
-
-            plt.show()
-
-
-def test_agent(agent, env, episodes=5):
-    """Test the trained agent and visualize the results"""
-    for episode in range(episodes):
-        state = env.reset()
-        done = False
-        total_reward = 0
-
-        while not done:
-            # Get action (using deterministic policy)
-            action, _, _ = agent.get_action(state, deterministic=True)
-
-            # Take step in environment
-            state, reward, done, _ = env.step(action)
-            total_reward += reward
-
-        print(f"Test Episode {episode + 1}: Total Reward = {total_reward:.2f}")
-
-        # Render the episode
-        env.render()
-
-    return total_reward
-
-
-# Training function
-def train_pendulum_ppo():
-    """Train a PPO agent to control the pendulum system"""
-    print("Starting PPO training for pendulum system...")
-
-    # Set random seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    # Create the environment
-    env = PendulumEnv(dt=0.01, max_steps=500)
-
-    # Get dimensions from environment
-    state_dim = env.observation_dim
-    action_dim = 1  # Single motor voltage
-    action_low = env.action_space_low
-    action_high = env.action_space_high
-
-    # Initialize PPO agent
+    # Initialize agent
     agent = PPOAgent(
         state_dim=state_dim,
         action_dim=action_dim,
         action_low=action_low,
         action_high=action_high,
-        gamma=0.99,  # Discount factor
-        clip_ratio=0.2,  # PPO clipping parameter
-        policy_lr=3e-4,  # Learning rate for policy
-        vf_lr=1e-3,  # Learning rate for value function
-        train_iters=80,  # Number of policy updates per batch
-        target_kl=0.01,  # Target KL divergence
-        hidden_dim=64,  # Hidden dimension of neural networks
-        lam=0.97  # GAE-Lambda parameter
+        gamma=0.99,
+        clip_ratio=0.2,
+        policy_lr=3e-4,
+        vf_lr=3e-4,
+        train_iters=80,
+        target_kl=0.01,
+        hidden_dim=256,
+        lam=0.97
     )
 
-    # Train the agent
-    rewards = agent.train(
-        env=env,
-        num_epochs=100,  # Number of epochs
-        steps_per_epoch=4000,  # Steps per epoch
-        batch_size=64,  # Batch size
-        max_ep_len=500,  # Maximum episode length
-        render_every=10  # Render every N epochs
-    )
+    # Initialize buffer for storing trajectories
+    buffer = PPOBuffer(state_dim, action_dim, steps_per_epoch, gamma=0.99, lam=0.97)
 
-    print("Training complete!")
+    # Metrics
+    episode_rewards = []
+    avg_rewards = []
 
-    # Test the trained agent
-    test_agent(agent, env, episodes=5)
+    # For visualization - store episode data
+    states_history = []
+    actions_history = []
 
-    return agent, rewards
+    # Training loop
+    start_time = time()
+
+    total_steps = 0
+    for epoch in range(max_episodes):
+        epoch_start_time = time()
+
+        # Collect trajectories
+        state = env.reset()
+        episode_reward = 0
+        episode_length = 0
+
+        # If we're going to plot this episode, prepare to collect state data
+        plot_this_episode = (epoch + 1) % 100 == 0
+        if plot_this_episode:
+            episode_states = []
+            episode_actions = []
+
+        for t in range(steps_per_epoch):
+            # Get action
+            action, log_prob, value = agent.select_action(state)
+
+            # Scale action to motor voltage
+            scaled_action = action * max_voltage
+
+            # Take step in environment
+            next_state, reward, done, _ = env.step(scaled_action)
+
+            # Store transition in buffer
+            buffer.store(state, action, reward, next_state, value, log_prob, done)
+
+            # If we're plotting, store the raw state and action
+            if plot_this_episode and episode_length < max_steps:
+                episode_states.append(env.state.copy())
+                episode_actions.append(action)
+
+            # Update state and counters
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+            total_steps += 1
+
+            # Handle episode termination or buffer full
+            timeout = episode_length >= max_steps
+            terminal = done or timeout
+
+            if terminal or t == steps_per_epoch - 1:
+                # If trajectory didn't reach terminal state, bootstrap value
+                if not terminal:
+                    _, _, last_val = agent.select_action(state)
+                else:
+                    last_val = 0
+
+                buffer.finish_path(last_val)
+
+                # Only record episode reward if it's a genuine episode termination
+                if terminal:
+                    episode_rewards.append(episode_reward)
+                    last_completed_reward = episode_reward  # Store the last reward before resetting
+
+                    # Reset for next episode
+                state = env.reset()
+                episode_reward = 0
+                episode_length = 0
+
+        # Update the policy and value networks after collecting a batch of data
+        update_info = agent.update_parameters(buffer)
+
+        # Calculate mean reward over last 10 episodes
+        mean_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0
+        avg_rewards.append(mean_reward)
+
+        # Log progress
+        if (epoch + 1) % 100 == 0:
+            print(f"Episode {epoch + 1}/{max_episodes} | Reward: {last_completed_reward:.2f} | "
+                  f"Avg Reward: {mean_reward:.2f} | Policy Loss: {update_info['policy_loss']:.4f} | "
+                  f"Value Loss: {update_info['value_loss']:.4f} | KL Div: {update_info['kl_div']:.4f}")
+
+            # Plot simulation for visual progress tracking
+            if plot_this_episode:
+                plot_training_episode(epoch, episode_states, episode_actions, env.dt, last_completed_reward)
+
+            if (epoch + 1) % 1000 == 0:
+                # Save trained model
+                timestamp = int(time())
+                agent.save(f"{epoch + 1}_ppo_{timestamp}.pth")
+
+        # Early stopping if well trained
+        """if mean_reward > 5000 and epoch > 50:
+            print(f"Environment solved in {epoch + 1} episodes!")
+            break"""
+
+    training_time = time() - start_time
+    print(f"Training completed in {training_time:.2f} seconds!")
+
+    # Save trained model
+    timestamp = int(time())
+    agent.save(f"ppo_{timestamp}.pth")
+
+    # Plot training progress
+    plt.figure(figsize=(10, 5))
+    plt.plot(episode_rewards, label='Episode Reward')
+    plt.plot(avg_rewards, label='10-Episode Moving Average')
+    plt.xlabel('Episodes')
+    plt.ylabel('Reward')
+    plt.title('PPO Training for Inverted Pendulum')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("ppo_training_progress.png")
+    plt.close()
+
+    return agent
 
 
-# Execute the training if this script is run directly
+def plot_learning_curve(rewards, filename="ppo_learning_curve.png"):
+    """Plot the learning curve showing episode rewards and moving average"""
+    plt.figure(figsize=(10, 6))
+    plt.plot(rewards, label='Episode Reward')
+
+    # Calculate moving average with window size of 10
+    if len(rewards) >= 10:
+        moving_avg = np.convolve(rewards, np.ones(10) / 10, mode='valid')
+        plt.plot(range(9, len(rewards)), moving_avg, 'r', label='10-Episode Moving Average')
+
+    plt.xlabel('Episodes')
+    plt.ylabel('Total Reward')
+    plt.title('PPO Learning Curve')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+
+def evaluate(agent, num_episodes=5, render=True):
+    """Evaluate function, similar to the SAC evaluation function"""
+    env = PendulumEnv()
+
+    for episode in range(num_episodes):
+        state = env.reset(random_init=False)  # Start from standard position
+        total_reward = 0
+
+        # Store episode data for plotting
+        states_history = []
+        actions_history = []
+
+        for step in range(env.max_steps):
+            # Select action (deterministic for evaluation)
+            action, _, _ = agent.select_action(state, deterministic=True)
+
+            # Scale action to motor voltage
+            scaled_action = action * max_voltage
+
+            # Step environment
+            next_state, reward, done, _ = env.step(scaled_action)
+
+            # Store data
+            states_history.append(env.state.copy())  # Store raw state
+            actions_history.append(action)
+
+            total_reward += reward
+            state = next_state
+
+            if done:
+                break
+
+        print(f"Episode {episode + 1}: Total Reward = {total_reward:.2f}")
+
+        if render:
+            # Convert history to numpy arrays
+            states_history = np.array(states_history)
+            actions_history = np.array(actions_history)
+
+            # Extract components
+            thetas = states_history[:, 0]
+            alphas = states_history[:, 1]
+            theta_dots = states_history[:, 2]
+            alpha_dots = states_history[:, 3]
+
+            # Normalize alpha for visualization
+            alpha_normalized = np.zeros(len(alphas))
+            for i in range(len(alphas)):
+                alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
+
+            # Generate time array
+            t = np.arange(len(states_history)) * env.dt
+
+            # Count performance metrics
+            balanced_time = 0.0
+            num_upright_points = 0
+
+            for i in range(len(alpha_normalized)):
+                # Check if pendulum is close to upright
+                if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
+                    balanced_time += env.dt
+                    num_upright_points += 1
+
+            # Plot results
+            plt.figure(figsize=(14, 12))
+
+            # Plot arm angle
+            plt.subplot(4, 1, 1)
+            plt.plot(t, thetas, 'b-')
+            plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
+            plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
+            plt.ylabel('Arm angle (rad)')
+            plt.title(f'PPO Inverted Pendulum Control - Episode {episode + 1}')
+            plt.legend()
+            plt.grid(True)
+
+            # Plot pendulum angle
+            plt.subplot(4, 1, 2)
+            plt.plot(t, alpha_normalized, 'g-')
+            plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
+            plt.ylabel('Pendulum angle (rad)')
+            plt.grid(True)
+
+            # Plot motor voltage (actions)
+            plt.subplot(4, 1, 3)
+            plt.plot(t, actions_history * max_voltage, 'r-')  # Scale back to actual voltage
+            plt.ylabel('Control voltage (V)')
+            plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
+            plt.grid(True)
+
+            # Plot angular velocities
+            plt.subplot(4, 1, 4)
+            plt.plot(t, theta_dots, 'b-', label='Arm velocity')
+            plt.plot(t, alpha_dots, 'g-', label='Pendulum velocity')
+            plt.xlabel('Time (s)')
+            plt.ylabel('Angular velocity (rad/s)')
+            plt.legend()
+            plt.grid(True)
+
+            plt.tight_layout()
+            plt.savefig(f"ppo_evaluation_episode_{episode + 1}.png")
+            plt.close()
+
+            print(f"Time spent balanced: {balanced_time:.2f} seconds")
+            print(f"Data points with pendulum upright: {num_upright_points}")
+            print(f"Max arm angle: {np.max(np.abs(thetas)):.2f} rad")
+            print(f"Max pendulum angular velocity: {np.max(np.abs(alpha_dots)):.2f} rad/s")
+            final_angle_deg = abs(alpha_normalized[-1]) * 180 / np.pi
+            print(
+                f"Final pendulum angle from vertical: {abs(alpha_normalized[-1]):.2f} rad ({final_angle_deg:.1f} degrees)")
+            print("-" * 50)
+
+
+def plot_training_episode(episode, states_history, actions_history, dt, episode_reward):
+    """Plot the pendulum state evolution for a training episode"""
+    # Convert history to numpy arrays
+    states_history = np.array(states_history)
+    actions_history = np.array(actions_history)
+
+    # Extract components
+    thetas = states_history[:, 0]
+    alphas = states_history[:, 1]
+    theta_dots = states_history[:, 2]
+    alpha_dots = states_history[:, 3]
+
+    # Normalize alpha for visualization
+    alpha_normalized = np.zeros(len(alphas))
+    for i in range(len(alphas)):
+        alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
+
+    # Generate time array
+    t = np.arange(len(states_history)) * dt
+
+    # Count performance metrics
+    balanced_time = 0.0
+    num_upright_points = 0
+
+    for i in range(len(alpha_normalized)):
+        # Check if pendulum is close to upright
+        if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
+            balanced_time += dt
+            num_upright_points += 1
+
+    # Plot results
+    plt.figure(figsize=(12, 9))
+
+    # Plot arm angle
+    plt.subplot(3, 1, 1)
+    plt.plot(t, thetas, 'b-')
+    plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
+    plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
+    plt.ylabel('Arm angle (rad)')
+    plt.title(f'Training Episode {episode} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+    plt.legend()
+    plt.grid(True)
+
+    # Plot pendulum angle
+    plt.subplot(3, 1, 2)
+    plt.scatter(t, alpha_normalized)
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Line at upright position
+    plt.axhline(y=0.17, color='r', linestyle=':', alpha=0.5)  # Upper balanced threshold
+    plt.axhline(y=-0.17, color='r', linestyle=':', alpha=0.5)  # Lower balanced threshold
+    plt.ylabel('Pendulum angle (rad)')
+    plt.grid(True)
+
+    # Plot control actions
+    plt.subplot(3, 1, 3)
+    plt.plot(t, actions_history * max_voltage, 'r-')  # Scale back to actual voltage
+    plt.xlabel('Time (s)')
+    plt.ylabel('Control voltage (V)')
+    plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"PPO_training_episode_{episode}.png")
+    plt.close()  # Close the figure to avoid memory issues
+
+    """print(f"Time spent balanced: {balanced_time:.2f} seconds")
+    print(f"Data points with pendulum upright: {num_upright_points}")
+    print(f"Max arm angle: {np.max(np.abs(thetas)):.2f} rad")
+    print(f"Max pendulum angular velocity: {np.max(np.abs(alpha_dots)):.2f} rad/s")
+    final_angle_deg = abs(alpha_normalized[-1]) * 180 / np.pi
+    print(
+        f"Final pendulum angle from vertical: {abs(alpha_normalized[-1]):.2f} rad ({final_angle_deg:.1f} degrees)")
+    print("-" * 50)"""
+
+
 if __name__ == "__main__":
-    agent, rewards = train_pendulum_ppo()
+    print("TorchRL Inverted Pendulum Training and Evaluation")
+    print("=" * 50)
+
+    # Train agent
+    agent = train()
+
+    # Evaluate trained agent
+    print("\nEvaluating trained agent...")
+    evaluate(agent, num_episodes=3)
+
+    print("=" * 50)
+    print("PROGRAM EXECUTION COMPLETE")
+    print("=" * 50)
