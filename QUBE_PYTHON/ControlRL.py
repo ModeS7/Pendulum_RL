@@ -63,6 +63,7 @@ class QUBEControllerWithRL:
         self.moving_to_position = False
         self.rl_model = None
         self.max_voltage = 10.0  # Use full voltage range as in training
+        self.rl_scaling_factor = 4.0  # Default scaling factor, now adjustable
 
         # Initialize the RL model (but don't load weights yet)
         self.initialize_rl_model()
@@ -132,9 +133,26 @@ class QUBEControllerWithRL:
                                      width=15, state=tk.DISABLED)
         self.rl_control_btn.grid(row=0, column=1, padx=5)
 
+        # ADD RL SCALING FACTOR SLIDER
+        rl_scaling_frame = Frame(control_frame)
+        rl_scaling_frame.grid(row=2, column=0, pady=5)
+
+        self.rl_scaling_slider = Scale(
+            rl_scaling_frame,
+            from_=1.0,
+            to=10.0,
+            orient=tk.HORIZONTAL,
+            label="RL Voltage Scaling Factor",
+            length=300,
+            resolution=0.1,
+            command=self.set_rl_scaling_factor
+        )
+        self.rl_scaling_slider.set(self.rl_scaling_factor)  # Default to 4.0
+        self.rl_scaling_slider.pack(padx=5)
+
         # Move to position input and button
         position_frame = Frame(control_frame)
-        position_frame.grid(row=2, column=0, pady=10)
+        position_frame.grid(row=3, column=0, pady=10)
 
         Label(position_frame, text="Target Position (degrees):").grid(row=0, column=0, padx=5)
         self.position_entry = Entry(position_frame, width=10)
@@ -150,7 +168,7 @@ class QUBEControllerWithRL:
                                command=self.stop_motor,
                                width=20, height=2,
                                bg="red", fg="white")
-        self.stop_btn.grid(row=3, column=0, pady=10)
+        self.stop_btn.grid(row=4, column=0, pady=10)
 
         # Manual voltage control
         self.voltage_slider = Scale(
@@ -164,7 +182,7 @@ class QUBEControllerWithRL:
             command=self.set_manual_voltage
         )
         self.voltage_slider.set(0)
-        self.voltage_slider.grid(row=4, column=0, padx=5, pady=10)
+        self.voltage_slider.grid(row=5, column=0, padx=5, pady=10)
 
         # Status display
         status_frame = Frame(self.master, padx=10, pady=10)
@@ -194,6 +212,11 @@ class QUBEControllerWithRL:
         self.voltage_label = Label(status_frame, text="0.0 V")
         self.voltage_label.grid(row=5, column=1, sticky=tk.W)
 
+        # Add scaling factor display
+        Label(status_frame, text="RL Scaling Factor:").grid(row=6, column=0, sticky=tk.W)
+        self.scaling_label = Label(status_frame, text=f"{self.rl_scaling_factor:.1f}")
+        self.scaling_label.grid(row=6, column=1, sticky=tk.W)
+
         # RGB Control
         rgb_frame = Frame(self.master, padx=10, pady=10)
         rgb_frame.pack()
@@ -206,6 +229,11 @@ class QUBEControllerWithRL:
 
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
+
+    def set_rl_scaling_factor(self, value):
+        """Set the RL scaling factor from slider"""
+        self.rl_scaling_factor = float(value)
+        self.scaling_label.config(text=f"{self.rl_scaling_factor:.1f}")
 
     def set_manual_voltage(self, value):
         """Set manual voltage from slider"""
@@ -386,8 +414,8 @@ class QUBEControllerWithRL:
             action_mean, _ = self.actor(state_tensor)
             action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
 
-        # Convert normalized action [-1, 1] to voltage
-        self.motor_voltage = float(action) * self.max_voltage
+        # Convert normalized action [-1, 1] to voltage using adjustable scaling factor
+        self.motor_voltage = float(action) * self.max_voltage / self.rl_scaling_factor
 
         # Update status
         upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
