@@ -30,7 +30,7 @@ LL = 0.128  # Length of pendulum link (m)
 JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
 JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
 g = 9.81  # Gravity constant (m/s^2)
-max_voltage = 10.0  # Maximum motor voltage
+max_voltage = 2.0  # Maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -364,7 +364,7 @@ class QUBEControllerWithRLTraining:
         self.updates_per_step = 1
         self.exploration_prob = 0.2  # Initial exploration rate
         self.train_every_n_steps = 10
-        self.save_policy_every_n_episodes = 5
+        self.save_policy_every_n_episodes = 50
         self.max_episode_steps = 1300  # Extended maximum episode length (around 30s at 86Hz)
         self.warmup_steps = 200  # Warmup steps before enabling termination conditions
         self.consecutive_limit = 50  # Number of consecutive bad states to end episode
@@ -382,7 +382,7 @@ class QUBEControllerWithRLTraining:
                 'consecutive_limit': 60,
                 'min_steps_between_episodes': 150,
                 'warmup_steps': 250,
-                'max_motor_angle': 130.0
+                'max_motor_angle': 200.0
             },
             'Medium': {
                 'exploration': 0.2,
@@ -390,7 +390,7 @@ class QUBEControllerWithRLTraining:
                 'consecutive_limit': 40,
                 'min_steps_between_episodes': 100,
                 'warmup_steps': 200,
-                'max_motor_angle': 130.0
+                'max_motor_angle': 200.0
             },
             'Hard': {
                 'exploration': 0.1,
@@ -398,7 +398,7 @@ class QUBEControllerWithRLTraining:
                 'consecutive_limit': 30,
                 'min_steps_between_episodes': 50,
                 'warmup_steps': 100,
-                'max_motor_angle': 130.0
+                'max_motor_angle': 200.0
             }
         }
 
@@ -1160,39 +1160,60 @@ class QUBEControllerWithRLTraining:
         # Component 1: Reward for pendulum being close to upright
         upright_reward = np.cos(pendulum_angle_norm)  # 1 when upright, -1 when downward
 
-        # Component 2: Penalty for high velocities
-        velocity_penalty = -0.01 * (motor_velocity ** 2 + pendulum_velocity ** 2)
+        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
+        # Use tanh to create a smoother penalty that doesn't grow excessively large
+        velocity_norm = (motor_velocity ** 2 + pendulum_velocity ** 2) / 10.0  # Normalize velocities
+        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
 
         # Component 3: Penalty for arm position away from center
-        pos_penalty = -0.01 * motor_angle ** 2
+        pos_penalty = -0.1 * np.tanh(motor_angle ** 2 / 2.0)
+
+        # COMPONENT 4: Smoother bonus for being close to upright position
+        upright_closeness = np.exp(-10.0 * pendulum_angle_norm ** 2)  # Close to 1 when near upright, falls off quickly
+        stability_factor = np.exp(-1.0 * pendulum_velocity ** 2)  # Close to 1 when velocity is low
+        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
+
+        # COMPONENT 4.5: Smoother cost for being close to downright position
+        # For new convention, downright is at π
+        downright_alpha = normalize_angle(pendulum_angle - np.pi)
+        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
+        stability_factor = np.exp(-1.0 * pendulum_velocity ** 2)
+        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
+
 
         # Component 4: Extra reward for being very close to upright and stable
         bonus = 0.0
         if abs(pendulum_angle_norm) < 0.2 and abs(pendulum_velocity) < 1.0:
             bonus = 5.0
 
-        # Component 5: Penalty for voltage oscillations (reduce voltage swings)
-        voltage_penalty = -0.005 * voltage ** 2
+        # COMPONENT 5: Smoother penalty for approaching limits
+        # Create a continuous penalty that increases as the arm approaches limits
+        # Map the distance to limits to a 0-1 range, with 1 being at the limit
+        theta_max_dist = np.clip(1.0 - abs(motor_angle - THETA_MAX) / 0.5, 0, 1)
+        theta_min_dist = np.clip(1.0 - abs(motor_angle - THETA_MIN) / 0.5, 0, 1)
+        limit_distance = max(theta_max_dist, theta_min_dist)
+
+        # Apply a nonlinear function to create gradually increasing penalty
+        # The penalty grows more rapidly as the arm gets very close to limits
+        limit_penalty = -10.0 * limit_distance ** 3
 
         # Component 6: Energy management reward
         Mp_g_Lp = mL * g * LL  # Pendulum mass * gravity * length
         Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia
+        energy_reward = 2 - 0.15 * abs(Mp_g_Lp * (1 - np.cos(pendulum_angle_norm))
+                                + 0.5 * Jp * pendulum_velocity ** 2
+                                - Mp_g_Lp)  # Difference from optimal energy
 
-        # Calculate energy
-        E = Mp_g_Lp * (1 - np.cos(pendulum_angle_norm)) + 0.5 * Jp * pendulum_velocity ** 2  # Current energy
-        E_ref = Mp_g_Lp  # Energy at upright position (target energy)
-        E_diff = abs(E - E_ref)  # Difference from optimal energy
 
-        # Reward for being close to the optimal energy (inverted Gaussian)
-        energy_reward = 2.0 * np.exp(-0.5 * (E_diff / (0.2 * E_ref)) ** 2)
-
-        # Component 7: Penalty for hitting limits
-        limit_penalty = 0.0
-        if abs(motor_angle - 2.2) < 0.05 or abs(motor_angle + 2.2) < 0.05:
-            limit_penalty = -40.0  # Smaller penalty to avoid early episode termination
-
-        # Total reward
-        reward = upright_reward + bonus + energy_reward + limit_penalty
+        # Combine all components
+        reward = (
+                upright_reward
+                # + velocity_penalty
+                + pos_penalty
+                + bonus
+                + limit_penalty
+                + energy_reward
+        )
 
         # Check if pendulum is balanced (for tracking balanced time)
         is_balanced = abs(pendulum_angle_norm) < 0.17  # ~10 degrees
@@ -1310,7 +1331,7 @@ class QUBEControllerWithRLTraining:
             action = self.agent.select_action(obs, evaluate=not self.training_mode)
 
         # Apply action as voltage
-        self.motor_voltage = float(action[0]) * self.max_voltage
+        self.motor_voltage = float(action[0]) / 5.0 * self.max_voltage
 
         # If training mode is active, handle training logic
         if self.training_mode:
