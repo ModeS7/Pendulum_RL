@@ -20,8 +20,8 @@ mA = 0.053  # Weight of pendulum arm (kg)
 mL = 0.024  # Weight of pendulum link (kg)
 LA = 0.086  # Length of pendulum arm (m)
 LL = 0.128  # Length of pendulum link (m)
-JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
-JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
+JA = mA * LA ** 2 * 7 / 48  # Inertia moment of pendulum arm (kg·m^2)
+JL = mL * LL ** 2 / 3  # Inertia moment of pendulum link (kg·m^2)
 g = 9.81  # Gravity constant (m/s^2)
 
 max_voltage = 10.0  # Maximum motor voltage
@@ -135,15 +135,53 @@ def dynamics_step(state, t, vm):
     return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 
-# Simulation environment for RL
+# NEW - Time step generator based on real measurements
+class VariableTimeGenerator:
+    """Generate variable time steps based on real system measurements."""
+
+    def __init__(
+            self,
+            mean=0.013926,
+            std_dev=0.0022,
+            min_dt=0.010,
+            max_dt=0.060
+    ):
+        self.mean = mean
+        self.std_dev = std_dev
+        self.min_dt = min_dt
+        self.max_dt = max_dt
+
+    def get_next_dt(self):
+        """Generate next time step following a normal distribution."""
+        dt = np.random.normal(self.mean, self.std_dev)
+        return clip_value(dt, self.min_dt, self.max_dt)
+
+
+# Simulation environment for RL - MODIFIED to support variable time steps
 class PendulumEnv:
-    def __init__(self, dt=0.0115, max_steps=1300):  # 15 seconds at 50Hz
-        self.dt = dt
+    def __init__(self, dt=0.014, max_steps=1300, variable_dt=False):  # ~15 seconds at ~70Hz
+        self.fixed_dt = dt
+        self.variable_dt = variable_dt
+
+        # Initialize time generator if using variable time steps
+        if variable_dt:
+            self.time_generator = VariableTimeGenerator()
+            self.dt = self.time_generator.get_next_dt()
+        else:
+            self.dt = self.fixed_dt
+
         self.max_steps = max_steps
         self.step_count = 0
         self.state = None
+        self.time_history = []  # Track actual time steps used
 
     def reset(self, random_init=True):
+        # Reset dt if using variable time steps
+        if self.variable_dt:
+            self.dt = self.time_generator.get_next_dt()
+        else:
+            self.dt = self.fixed_dt
+
         # Initialize with small random variations if requested
         if random_init:
             self.state = np.array([
@@ -156,6 +194,7 @@ class PendulumEnv:
             self.state = np.array([0.0, 0.1, 0.0, 0.0])  # Default initial state
 
         self.step_count = 0
+        self.time_history = []  # Reset time history
         return self._get_observation()
 
     def _get_observation(self):
@@ -179,8 +218,15 @@ class PendulumEnv:
         # Convert normalized action [-1, 1] to voltage
         voltage = float(action) * max_voltage
 
-        # RK4 integration step
+        # Record current dt value
+        self.time_history.append(self.dt)
+
+        # RK4 integration step with current dt
         self.state = self._rk4_step(self.state, voltage)
+
+        # Update dt for next step if using variable time
+        if self.variable_dt:
+            self.dt = self.time_generator.get_next_dt()
 
         # Enforce limits
         self.state = enforce_theta_limits(self.state)
@@ -258,7 +304,6 @@ class PendulumEnv:
                                        + 0.5 * Jp * alpha_dot ** 2
                                        - Mp_g_Lp)
 
-
         # Combine all components
         reward = (
                 upright_reward
@@ -270,6 +315,7 @@ class PendulumEnv:
         )
 
         return reward
+
 
 # Actor (Policy) Network
 class Actor(nn.Module):
@@ -509,11 +555,46 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def train():
-    print("Starting SAC training for inverted pendulum control...")
+# NEW - Function to load pre-trained models
+def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hidden_dim=256):
+    """
+    Load pre-trained actor and critic models and create an agent.
 
-    # Environment setup
-    env = PendulumEnv()
+    Args:
+        actor_path (str): Path to the saved actor model
+        critic_path (str): Path to the saved critic model
+        state_dim (int): State dimension
+        action_dim (int): Action dimension
+        hidden_dim (int): Hidden layer dimension
+
+    Returns:
+        SACAgent: Agent with loaded models
+    """
+    # Initialize a new agent
+    agent = SACAgent(state_dim, action_dim, hidden_dim)
+
+    # Load actor if path is provided
+    if actor_path:
+        agent.actor.load_state_dict(torch.load(actor_path, map_location=agent.device))
+        print(f"Actor model loaded from {actor_path}")
+
+    # Load critic if path is provided
+    if critic_path:
+        agent.critic.load_state_dict(torch.load(critic_path, map_location=agent.device))
+        # Update target critic as well
+        agent.critic_target.load_state_dict(torch.load(critic_path, map_location=agent.device))
+        print(f"Critic model loaded from {critic_path}")
+
+    return agent
+
+
+# MODIFIED - Training function to accept pre-trained models and variable time steps
+def train(actor_path=None, critic_path=None, variable_dt=False):
+    print("Starting SAC training for inverted pendulum control...")
+    print(f"Using variable time steps: {variable_dt}")
+
+    # Environment setup with variable time step option
+    env = PendulumEnv(variable_dt=variable_dt)
 
     # Hyperparameters
     state_dim = 6  # Our observation space
@@ -524,8 +605,11 @@ def train():
     replay_buffer_size = 100000
     updates_per_step = 1
 
-    # Initialize agent
-    agent = SACAgent(state_dim, action_dim)
+    # Initialize agent (with pre-trained models if provided)
+    if actor_path or critic_path:
+        agent = load_agent(actor_path, critic_path, state_dim, action_dim)
+    else:
+        agent = SACAgent(state_dim, action_dim)
 
     # Initialize replay buffer
     replay_buffer = ReplayBuffer(replay_buffer_size)
@@ -600,15 +684,16 @@ def train():
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
-                plot_training_episode(episode, episode_states, episode_actions, env.dt, episode_reward)
-                # Save trained model
-                timestamp = int(time())
+                plot_training_episode(episode, episode_states, episode_actions,
+                                      env.time_history if variable_dt else [env.dt] * len(episode_states),
+                                      episode_reward)
 
-        if (episode + 1) % 100 == 0:
+        if (episode + 1) % 50 == 0:
+            timestamp = int(time())
             torch.save(agent.actor.state_dict(), f"{episode + 1}_actor_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 5000 and episode > 50:
+        if avg_reward > 4900 and episode > 150:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
@@ -633,10 +718,26 @@ def train():
     # plt.show()
     plt.close()
 
+    # Plot time step distribution if variable time was used
+    if variable_dt and env.time_history:
+        plt.figure(figsize=(10, 5))
+        plt.hist(env.time_history, bins=30, alpha=0.7)
+        plt.axvline(x=np.mean(env.time_history), color='r', linestyle='--',
+                    label=f'Mean: {np.mean(env.time_history):.6f}')
+        plt.axvline(x=np.median(env.time_history), color='g', linestyle='--',
+                    label=f'Median: {np.median(env.time_history):.6f}')
+        plt.xlabel('Time Step (s)')
+        plt.ylabel('Frequency')
+        plt.title('Distribution of Variable Time Steps')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("time_step_distribution.png")
+        plt.close()
+
     return agent
 
 
-def plot_training_episode(episode, states_history, actions_history, dt, episode_reward):
+def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward):
     """Plot the pendulum state evolution for a training episode"""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
@@ -653,8 +754,16 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
     for i in range(len(alphas)):
         alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
 
-    # Generate time array
-    t = np.arange(len(states_history)) * dt
+    # Generate time array - calculate cumulative time if variable dt
+    if isinstance(dt_history, list) and len(dt_history) > 0:
+        # Create cumulative time array
+        t = np.zeros(len(dt_history))
+        t[0] = dt_history[0]
+        for i in range(1, len(dt_history)):
+            t[i] = t[i - 1] + dt_history[i]
+    else:
+        # Use fixed dt
+        t = np.arange(len(states_history)) * dt_history[0]
 
     # Count performance metrics
     balanced_time = 0.0
@@ -663,7 +772,10 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
     for i in range(len(alpha_normalized)):
         # Check if pendulum is close to upright
         if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
-            balanced_time += dt
+            if i < len(dt_history):
+                balanced_time += dt_history[i]
+            else:
+                balanced_time += dt_history[0]  # Use first dt if index out of range
             num_upright_points += 1
 
     # Plot results
@@ -701,9 +813,10 @@ def plot_training_episode(episode, states_history, actions_history, dt, episode_
     plt.close()  # Close the figure to avoid memory issues
 
 
-def evaluate(agent, num_episodes=5, render=True):
+# MODIFIED - Evaluate function to support variable time steps
+def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
     """Evaluate the trained agent's performance"""
-    env = PendulumEnv()
+    env = PendulumEnv(variable_dt=variable_dt)
 
     for episode in range(num_episodes):
         state = env.reset(random_init=False)  # Start from standard position
@@ -748,8 +861,16 @@ def evaluate(agent, num_episodes=5, render=True):
             for i in range(len(alphas)):
                 alpha_normalized[i] = normalize_angle(alphas[i] + np.pi)
 
-            # Generate time array
-            t = np.arange(len(states_history)) * env.dt
+            # Generate time array - calculate cumulative time for variable dt
+            if variable_dt:
+                # Create cumulative time array
+                t = np.zeros(len(env.time_history))
+                t[0] = env.time_history[0]
+                for i in range(1, len(env.time_history)):
+                    t[i] = t[i - 1] + env.time_history[i]
+            else:
+                # Use fixed dt
+                t = np.arange(len(states_history)) * env.dt
 
             # Count performance metrics
             balanced_time = 0.0
@@ -758,7 +879,10 @@ def evaluate(agent, num_episodes=5, render=True):
             for i in range(len(alpha_normalized)):
                 # Check if pendulum is close to upright
                 if abs(alpha_normalized[i]) < 0.17:  # about 10 degrees
-                    balanced_time += env.dt
+                    if variable_dt and i < len(env.time_history):
+                        balanced_time += env.time_history[i]
+                    else:
+                        balanced_time += env.dt
                     num_upright_points += 1
 
             # Plot results
@@ -770,7 +894,8 @@ def evaluate(agent, num_episodes=5, render=True):
             plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
             plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
             plt.ylabel('Arm angle (rad)')
-            plt.title(f'SAC Inverted Pendulum Control - Episode {episode + 1}')
+            plt.title(f'SAC Inverted Pendulum Control - Episode {episode + 1}' +
+                      (" (Variable dt)" if variable_dt else ""))
             plt.legend()
             plt.grid(True)
 
@@ -799,7 +924,7 @@ def evaluate(agent, num_episodes=5, render=True):
 
             plt.tight_layout()
             plt.savefig(f"sac_evaluation_episode_{episode + 1}.png")
-            #plt.show()
+            # plt.show()
             plt.close()
 
             print(f"Time spent balanced: {balanced_time:.2f} seconds")
@@ -811,13 +936,43 @@ def evaluate(agent, num_episodes=5, render=True):
                 f"Final pendulum angle from vertical: {abs(alpha_normalized[-1]):.2f} rad ({final_angle_deg:.1f} degrees)")
             print("-" * 50)
 
+            # If variable dt was used, plot the time step distribution
+            if variable_dt and env.time_history:
+                plt.figure(figsize=(10, 5))
+                plt.hist(env.time_history, bins=30, alpha=0.7)
+                plt.axvline(x=np.mean(env.time_history), color='r', linestyle='--',
+                            label=f'Mean: {np.mean(env.time_history):.6f}')
+                plt.axvline(x=np.median(env.time_history), color='g', linestyle='--',
+                            label=f'Median: {np.median(env.time_history):.6f}')
+                plt.xlabel('Time Step (s)')
+                plt.ylabel('Frequency')
+                plt.title(f'Distribution of Variable Time Steps - Episode {episode + 1}')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(f"time_step_distribution_ep_{episode + 1}.png")
+                plt.close()
+
 
 if __name__ == "__main__":
     print("TorchRL Inverted Pendulum Training and Evaluation")
     print("=" * 50)
 
-    # Train agent
-    agent = train()
+    # Examples of how to use the modified code
+
+    # Option 1: Train a new agent with variable time steps
+    # agent = train(variable_dt=True)
+
+    # Option 2: Continue training from a pre-trained model
+    # agent = train(actor_path="actor_1234567890.pth", critic_path="critic_1234567890.pth", variable_dt=True)
+
+    # Option 3: Load a pre-trained model and evaluate it with variable time steps
+    # agent = load_agent(actor_path="actor_1234567890.pth", critic_path="critic_1234567890.pth")
+    # evaluate(agent, num_episodes=3, variable_dt=True)
+
+    # Default: Train a new agent with fixed time steps
+    # agent = train()
+
+    agent = train(actor_path="actor_1743257887.pth", critic_path="critic_1743257887.pth", variable_dt=True)
 
     # Evaluate trained agent
     print("\nEvaluating trained agent...")
