@@ -8,27 +8,39 @@ from tqdm import tqdm
 import numba as nb
 from time import time
 
-# Import the necessary constants and functions from your existing code
-# System Parameters (same as in your original code)
-Rm = 8.94  # Motor resistance (Ohm)
-Km = 0.0431  # Motor back-emf constant
-Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
-bm = 3e-4  # Viscous damping coefficient (Nm/rad/s)
-DA = 3e-4  # Damping coefficient of pendulum arm (Nm/rad/s)
-DL = 5e-4  # Damping coefficient of pendulum link (Nm/rad/s)
-mA = 0.053  # Weight of pendulum arm (kg)
-mL = 0.024  # Weight of pendulum link (kg)
-LA = 0.086  # Length of pendulum arm (m)
-LL = 0.128  # Length of pendulum link (m)
-JA = mA * LA ** 2 * 7 / 48  # Inertia moment of pendulum arm (kg·m^2)
-JL = mL * LL ** 2 / 3  # Inertia moment of pendulum link (kg·m^2)
-g = 9.81  # Gravity constant (m/s^2)
+# System Parameters - These are now base values that will vary between episodes
+base_Rm = 8.94  # Motor resistance (Ohm)
+base_Km = 0.0431  # Motor back-emf constant
+base_Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
+base_bm = 3e-4  # Viscous damping coefficient (Nm/rad/s)
+base_DA = 3e-4  # Damping coefficient of pendulum arm (Nm/rad/s)
+base_DL = 5e-4  # Damping coefficient of pendulum link (Nm/rad/s)
+base_mA = 0.053  # Weight of pendulum arm (kg)
+base_mL = 0.024  # Weight of pendulum link (kg)
+base_LA = 0.086  # Length of pendulum arm (m)
+base_LL = 0.128  # Length of pendulum link (m)
 
+# Constants that don't vary
+g = 9.81  # Gravity constant (m/s^2)
 max_voltage = 10.0  # Maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
-# Pre-compute constants for optimization (same as in your original code)
+# Current parameter values (will be updated per episode)
+Rm = base_Rm
+Km = base_Km
+Jm = base_Jm
+bm = base_bm
+DA = base_DA
+DL = base_DL
+mA = base_mA
+mL = base_mL
+LA = base_LA
+LL = base_LL
+JA = mA * LA ** 2 * 7 / 48  # Inertia moment of pendulum arm (kg·m^2)
+JL = mL * LL ** 2 / 3  # Inertia moment of pendulum link (kg·m^2)
+
+# Pre-compute constants for optimization
 half_mL_LL_g = 0.5 * mL * LL * g
 half_mL_LL_LA = 0.5 * mL * LL * LA
 quarter_mL_LL_squared = 0.25 * mL * LL ** 2
@@ -36,6 +48,140 @@ Mp_g_Lp = mL * g * LL
 Jp = (1 / 3) * mL * LL ** 2  # Pendulum moment of inertia (kg·m²)
 
 batch_size = 256 * 32  # Batch size for training
+
+
+# Parameter Manager class to handle parameter variations
+class ParameterManager:
+    """Manages system parameters with random variations between episodes."""
+
+    def __init__(self, variation_pct=0.1, fixed_params=False):
+        """
+        Initialize parameter manager.
+
+        Args:
+            variation_pct: Percentage variation allowed (0.1 = 10%)
+            fixed_params: If True, parameters won't vary between episodes
+        """
+        self.variation_pct = variation_pct
+        self.fixed_params = fixed_params
+
+        # Store base parameter values
+        self.base_params = {
+            'Rm': base_Rm,
+            'Km': base_Km,
+            'Jm': base_Jm,
+            'bm': base_bm,
+            'DA': base_DA,
+            'DL': base_DL,
+            'mA': base_mA,
+            'mL': base_mL,
+            'LA': base_LA,
+            'LL': base_LL
+        }
+
+        # Current parameter values (will be updated on reset)
+        self.current_params = {}
+
+        # History of parameter values used
+        self.param_history = []
+
+        # Initialize parameters
+        self.reset()
+
+    def reset(self):
+        """Reset parameters with random variations if not fixed."""
+        if self.fixed_params:
+            # Use base parameters without variation
+            self.current_params = self.base_params.copy()
+        else:
+            # Apply random variations to each parameter
+            self.current_params = {}
+            for name, base_value in self.base_params.items():
+                # Generate random variation within ±variation_pct
+                variation_factor = 1.0 + np.random.uniform(-self.variation_pct, self.variation_pct)
+                self.current_params[name] = base_value * variation_factor
+
+        # Store this set of parameters in history
+        self.param_history.append(self.current_params.copy())
+
+        # Update global parameters (needed for Numba compatibility)
+        self._update_globals()
+
+        return self.current_params
+
+    def _update_globals(self):
+        """Update global parameter values for use in Numba-accelerated functions."""
+        global Rm, Km, Jm, bm, DA, DL, mA, mL, LA, LL, JA, JL
+        global half_mL_LL_g, half_mL_LL_LA, quarter_mL_LL_squared, Mp_g_Lp, Jp
+
+        # Update basic parameters
+        Rm = self.current_params['Rm']
+        Km = self.current_params['Km']
+        Jm = self.current_params['Jm']
+        bm = self.current_params['bm']
+        DA = self.current_params['DA']
+        DL = self.current_params['DL']
+        mA = self.current_params['mA']
+        mL = self.current_params['mL']
+        LA = self.current_params['LA']
+        LL = self.current_params['LL']
+
+        # Compute derived parameters
+        JA = mA * LA ** 2 * 7 / 48
+        JL = mL * LL ** 2 / 3
+
+        # Pre-compute constants for optimization
+        half_mL_LL_g = 0.5 * mL * LL * g
+        half_mL_LL_LA = 0.5 * mL * LL * LA
+        quarter_mL_LL_squared = 0.25 * mL * LL ** 2
+        Mp_g_Lp = mL * g * LL
+        Jp = (1 / 3) * mL * LL ** 2
+
+    def get_current_params(self):
+        """Get current parameter values including computed ones."""
+        params = self.current_params.copy()
+        params.update({
+            'JA': JA,
+            'JL': JL,
+            'half_mL_LL_g': half_mL_LL_g,
+            'half_mL_LL_LA': half_mL_LL_LA,
+            'quarter_mL_LL_squared': quarter_mL_LL_squared,
+            'Mp_g_Lp': Mp_g_Lp,
+            'Jp': Jp
+        })
+        return params
+
+    def plot_parameter_history(self, save_path=None):
+        """Plot the history of parameter variations."""
+        if len(self.param_history) <= 1:
+            print("Not enough episodes to plot parameter history")
+            return
+
+        param_names = list(self.base_params.keys())
+        fig, axes = plt.subplots(len(param_names), 1, figsize=(10, 2 * len(param_names)))
+
+        for i, param_name in enumerate(param_names):
+            base_value = self.base_params[param_name]
+            values = [params[param_name] for params in self.param_history]
+
+            # Convert to percentage variation from base
+            pct_variations = [(val / base_value - 1.0) * 100 for val in values]
+
+            axes[i].plot(pct_variations, 'b-')
+            axes[i].axhline(y=0, color='r', linestyle='--')
+            axes[i].axhline(y=self.variation_pct * 100, color='g', linestyle=':')
+            axes[i].axhline(y=-self.variation_pct * 100, color='g', linestyle=':')
+            axes[i].set_ylabel(f'{param_name} var %')
+            axes[i].grid(True)
+
+        axes[-1].set_xlabel('Episode')
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path)
+            plt.close()
+        else:
+            plt.show()
 
 
 # Reuse some of your helper functions
@@ -89,7 +235,7 @@ def enforce_theta_limits(state):
 
 @nb.njit(fastmath=True, cache=True)
 def dynamics_step(state, t, vm):
-    """Ultra-optimized dynamics calculation with theta limits"""
+    """Ultra-optimized dynamics calculation with theta limits, using current global parameters"""
     theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
 
     # Check theta limits - implement hard stops
@@ -135,16 +281,16 @@ def dynamics_step(state, t, vm):
     return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
 
 
-# NEW - Time step generator based on real measurements
+# Time step generator based on real measurements
 class VariableTimeGenerator:
     """Generate variable time steps based on real system measurements."""
 
     def __init__(
             self,
             mean=0.013926,
-            std_dev=0.0022,
-            min_dt=0.010,
-            max_dt=0.060
+            std_dev=0.001871,
+            min_dt=0.011,
+            max_dt=0.041
     ):
         self.mean = mean
         self.std_dev = std_dev
@@ -157,9 +303,19 @@ class VariableTimeGenerator:
         return clip_value(dt, self.min_dt, self.max_dt)
 
 
-# Simulation environment for RL - MODIFIED to support variable time steps
+# Simulation environment for RL - MODIFIED to support parameter variation
 class PendulumEnv:
-    def __init__(self, dt=0.014, max_steps=1300, variable_dt=False):  # ~15 seconds at ~70Hz
+    def __init__(self, dt=0.014, max_steps=1300, variable_dt=False, param_variation=0.1, fixed_params=False):
+        """
+        Initialize pendulum environment.
+
+        Args:
+            dt: Fixed time step (if variable_dt=False)
+            max_steps: Maximum steps per episode
+            variable_dt: If True, use variable time steps
+            param_variation: Parameter variation percentage (0.1 = 10%)
+            fixed_params: If True, parameters won't vary between episodes
+        """
         self.fixed_dt = dt
         self.variable_dt = variable_dt
 
@@ -169,6 +325,12 @@ class PendulumEnv:
             self.dt = self.time_generator.get_next_dt()
         else:
             self.dt = self.fixed_dt
+
+        # Initialize parameter manager
+        self.param_manager = ParameterManager(
+            variation_pct=param_variation,
+            fixed_params=fixed_params
+        )
 
         self.max_steps = max_steps
         self.step_count = 0
@@ -181,6 +343,9 @@ class PendulumEnv:
             self.dt = self.time_generator.get_next_dt()
         else:
             self.dt = self.fixed_dt
+
+        # Reset parameters - this updates the global variables
+        self.param_manager.reset()
 
         # Initialize with small random variations if requested
         if random_init:
@@ -241,7 +406,7 @@ class PendulumEnv:
         return self._get_observation(), reward, done, {}
 
     def _rk4_step(self, state, vm):
-        """4th-order Runge-Kutta integrator step"""
+        """4th-order Runge-Kutta integrator step using current parameters"""
         # Apply limits to initial state
         state = enforce_theta_limits(state)
 
@@ -315,6 +480,10 @@ class PendulumEnv:
         )
 
         return reward
+
+    def get_current_parameters(self):
+        """Get current parameter values for reporting and analysis."""
+        return self.param_manager.get_current_params()
 
 
 # Actor (Policy) Network
@@ -555,7 +724,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# NEW - Function to load pre-trained models
+# Function to load pre-trained models
 def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hidden_dim=256):
     """
     Load pre-trained actor and critic models and create an agent.
@@ -588,13 +757,18 @@ def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hid
     return agent
 
 
-# MODIFIED - Training function to accept pre-trained models and variable time steps
-def train(actor_path=None, critic_path=None, variable_dt=False):
+# Modified training function to include parameter variation and visualization
+def train(actor_path=None, critic_path=None, variable_dt=False, param_variation=0.1, fixed_params=False):
     print("Starting SAC training for inverted pendulum control...")
     print(f"Using variable time steps: {variable_dt}")
+    print(f"Using parameter variation: {param_variation if not fixed_params else 'OFF'}")
 
-    # Environment setup with variable time step option
-    env = PendulumEnv(variable_dt=variable_dt)
+    # Environment setup with variable time step and parameter variation options
+    env = PendulumEnv(
+        variable_dt=variable_dt,
+        param_variation=param_variation,
+        fixed_params=fixed_params
+    )
 
     # Hyperparameters
     state_dim = 6  # Our observation space
@@ -617,6 +791,7 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
     # Metrics
     episode_rewards = []
     avg_rewards = []
+    parameter_variations = []
 
     # For visualization - store episode data
     states_history = []
@@ -628,6 +803,10 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
     for episode in range(max_episodes):
         state = env.reset()
         episode_reward = 0
+
+        # Store current parameter set for analysis
+        current_params = env.get_current_parameters()
+        parameter_variations.append(current_params)
 
         # Track losses and alpha for this episode
         critic_losses = []
@@ -680,7 +859,14 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
 
         if (episode + 1) % 10 == 0:
             print(
-                f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
+                f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | "
+                f"Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | "
+                f"A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}")
+
+            # Print some current parameter values
+            if not fixed_params:
+                print(
+                    f"  Current Rm: {current_params['Rm']:.4f} | Km: {current_params['Km']:.6f} | mL: {current_params['mL']:.6f}")
 
             # Plot simulation for visual progress tracking
             if plot_this_episode:
@@ -688,9 +874,13 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
                                       env.time_history if variable_dt else [env.dt] * len(episode_states),
                                       episode_reward)
 
-        if (episode + 1) % 50 == 0:
-            timestamp = int(time())
-            torch.save(agent.actor.state_dict(), f"{episode + 1}_actor_{timestamp}.pth")
+        #if (episode + 1) % 50 == 0:
+        #    timestamp = int(time())
+        #    torch.save(agent.actor.state_dict(), f"{episode + 1}_actor_{timestamp}.pth")
+
+            # Plot parameter variation history
+            if not fixed_params and episode > 10:
+                env.param_manager.plot_parameter_history(f"param_variations_ep{episode + 1}.png")
 
         # Early stopping if well trained
         if avg_reward > 4900 and episode > 150:
@@ -715,7 +905,6 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
     plt.legend()
     plt.grid(True)
     plt.savefig("sac_training_progress.png")
-    # plt.show()
     plt.close()
 
     # Plot time step distribution if variable time was used
@@ -733,6 +922,10 @@ def train(actor_path=None, critic_path=None, variable_dt=False):
         plt.grid(True)
         plt.savefig("time_step_distribution.png")
         plt.close()
+
+    # Final parameter variation plot
+    if not fixed_params:
+        env.param_manager.plot_parameter_history("param_variations_final.png")
 
     return agent
 
@@ -813,14 +1006,27 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
     plt.close()  # Close the figure to avoid memory issues
 
 
-# MODIFIED - Evaluate function to support variable time steps
-def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
+# Modified evaluate function to include parameter variation analysis
+def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variation=0.1, fixed_params=False):
     """Evaluate the trained agent's performance"""
-    env = PendulumEnv(variable_dt=variable_dt)
+    env = PendulumEnv(
+        variable_dt=variable_dt,
+        param_variation=param_variation,
+        fixed_params=fixed_params
+    )
+
+    # For storing performance metrics
+    all_rewards = []
+    all_balance_times = []
+    all_params = []  # Store parameters for each episode
 
     for episode in range(num_episodes):
         state = env.reset(random_init=False)  # Start from standard position
         total_reward = 0
+
+        # Store the parameters for this episode
+        current_params = env.get_current_parameters()
+        all_params.append(current_params)
 
         # Store episode data for plotting
         states_history = []
@@ -843,7 +1049,14 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
             if done:
                 break
 
+        all_rewards.append(total_reward)
+
         print(f"Episode {episode + 1}: Total Reward = {total_reward:.2f}")
+
+        # Print parameter values if varying
+        if not fixed_params:
+            print(
+                f"  Parameters - Rm: {current_params['Rm']:.4f}, Km: {current_params['Km']:.6f}, mL: {current_params['mL']:.6f}")
 
         if render:
             # Convert history to numpy arrays
@@ -885,6 +1098,8 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
                         balanced_time += env.dt
                     num_upright_points += 1
 
+            all_balance_times.append(balanced_time)
+
             # Plot results
             plt.figure(figsize=(14, 12))
 
@@ -894,8 +1109,14 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
             plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Theta Limits')
             plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
             plt.ylabel('Arm angle (rad)')
-            plt.title(f'SAC Inverted Pendulum Control - Episode {episode + 1}' +
-                      (" (Variable dt)" if variable_dt else ""))
+
+            title = f'SAC Inverted Pendulum Control - Episode {episode + 1}'
+            if variable_dt:
+                title += " (Variable dt)"
+            if not fixed_params:
+                title += f" (Param var: {param_variation * 100:.0f}%)"
+            plt.title(title)
+
             plt.legend()
             plt.grid(True)
 
@@ -924,7 +1145,6 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
 
             plt.tight_layout()
             plt.savefig(f"sac_evaluation_episode_{episode + 1}.png")
-            # plt.show()
             plt.close()
 
             print(f"Time spent balanced: {balanced_time:.2f} seconds")
@@ -952,31 +1172,74 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False):
                 plt.savefig(f"time_step_distribution_ep_{episode + 1}.png")
                 plt.close()
 
+    # Print summary statistics
+    print("\n===== Evaluation Summary =====")
+    print(f"Average reward: {np.mean(all_rewards):.2f} ± {np.std(all_rewards):.2f}")
+    if all_balance_times:
+        print(f"Average balanced time: {np.mean(all_balance_times):.2f} ± {np.std(all_balance_times):.2f} seconds")
+
+    # If parameters varied, analyze robustness
+    if not fixed_params and len(all_params) > 1:
+        print("\n===== Parameter Variation Analysis =====")
+        param_keys = ['Rm', 'Km', 'mL', 'LA', 'LL']  # Key parameters to analyze
+
+        # Create correlation analysis between parameters and performance
+        if len(all_rewards) > 3:  # Only meaningful with enough data points
+            plt.figure(figsize=(15, 10))
+            for i, param in enumerate(param_keys):
+                values = [p[param] for p in all_params]
+
+                # Calculate correlation
+                if len(set(values)) > 1:  # Only if parameter actually varied
+                    corr = np.corrcoef(values, all_rewards)[0, 1]
+                    plt.subplot(len(param_keys), 1, i + 1)
+                    plt.scatter(values, all_rewards)
+                    plt.xlabel(f'{param} value')
+                    plt.ylabel('Reward')
+                    plt.title(f'Correlation between {param} and reward: {corr:.3f}')
+                    plt.grid(True)
+
+            plt.tight_layout()
+            plt.savefig("parameter_reward_correlation.png")
+            plt.close()
+
 
 if __name__ == "__main__":
     print("TorchRL Inverted Pendulum Training and Evaluation")
     print("=" * 50)
 
-    # Examples of how to use the modified code
+    # Examples of how to use the modified code with parameter variations
 
-    # Option 1: Train a new agent with variable time steps
-    # agent = train(variable_dt=True)
+    # Option 1: Train a new agent with variable time steps and parameter variation
+    # agent = train(variable_dt=True, param_variation=0.1)
 
-    # Option 2: Continue training from a pre-trained model
-    # agent = train(actor_path="actor_1234567890.pth", critic_path="critic_1234567890.pth", variable_dt=True)
+    # Option 2: Continue training from a pre-trained model with parameter variation
+    # agent = train(actor_path="actor_1234567890.pth", critic_path="critic_1234567890.pth",
+    #               variable_dt=True, param_variation=0.15)
 
-    # Option 3: Load a pre-trained model and evaluate it with variable time steps
+    # Option 3: Train with fixed time steps but variable parameters
+    # agent = train(param_variation=0.1)
+
+    # Option 4: Train with both fixed time and parameters (baseline)
+    # agent = train(fixed_params=True)
+
+    # Option 5: Evaluate a model with parameter variation to test robustness
     # agent = load_agent(actor_path="actor_1234567890.pth", critic_path="critic_1234567890.pth")
-    # evaluate(agent, num_episodes=3, variable_dt=True)
+    # evaluate(agent, num_episodes=10, param_variation=0.2)
 
-    # Default: Train a new agent with fixed time steps
-    # agent = train()
+    # Default: Train with parameter variation and evaluate
+    # agent = train(variable_dt=True, param_variation=0.1)
 
-    agent = train(actor_path="actor_1743257887.pth", critic_path="critic_1743257887.pth", variable_dt=True)
+    agent = train(actor_path="actor_1743356809.pth", critic_path="critic_1743356809.pth",
+                                 variable_dt=True, param_variation=0.5)
 
-    # Evaluate trained agent
-    print("\nEvaluating trained agent...")
-    evaluate(agent, num_episodes=3)
+    # Evaluate trained agent with parameter variation
+    print("\nEvaluating trained agent with parameter variation...")
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.5)
+
+    # Also test with larger parameter variation to see robustness
+    print("\nEvaluating trained agent with LARGER parameter variation...")
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.7)
 
     print("=" * 50)
     print("PROGRAM EXECUTION COMPLETE")
