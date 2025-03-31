@@ -11,7 +11,7 @@ from numpy.ma.core import arctan2
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
-max_voltage = 2.0  # Maximum motor voltage
+base_max_voltage = 3.0  # Base maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -83,16 +83,24 @@ def enforce_theta_limits(state):
 class ParameterManager:
     """Manages system parameters with random variations between episodes."""
 
-    def __init__(self, variation_pct=0.1, fixed_params=False):
+    def __init__(
+            self,
+            variation_pct=0.1,
+            fixed_params=False,
+            voltage_range=None
+    ):
         """
         Initialize parameter manager.
 
         Args:
             variation_pct: Percentage variation allowed (0.1 = 10%)
             fixed_params: If True, parameters won't vary between episodes
+            voltage_range: Tuple (min_voltage, max_voltage) for varying max_voltage
+                          If None, uses base_max_voltage with normal variation
         """
         self.variation_pct = variation_pct
         self.fixed_params = fixed_params
+        self.voltage_range = voltage_range
 
         # Store base parameter values
         self.base_params = {
@@ -106,7 +114,8 @@ class ParameterManager:
             'LL': base_LL,
             'JA': base_JA,
             'JL': base_JL,
-            'k': base_k
+            'k': base_k,
+            'max_voltage': base_max_voltage  # Added max_voltage as a parameter
         }
 
         # Current parameter values and history
@@ -125,9 +134,14 @@ class ParameterManager:
             # Apply random variations to each parameter
             self.current_params = {}
             for name, base_value in self.base_params.items():
-                # Generate random variation within ±variation_pct
-                variation_factor = 1.0 + np.random.uniform(-self.variation_pct, self.variation_pct)
-                self.current_params[name] = base_value * variation_factor
+                # Special handling for max_voltage if voltage_range is provided
+                if name == 'max_voltage' and self.voltage_range is not None:
+                    min_v, max_v = self.voltage_range
+                    self.current_params[name] = np.random.uniform(min_v, max_v)
+                else:
+                    # Generate random variation within ±variation_pct
+                    variation_factor = 1.0 + np.random.uniform(-self.variation_pct, self.variation_pct)
+                    self.current_params[name] = base_value * variation_factor
 
         # Store this set of parameters in history
         self.param_history.append(self.current_params.copy())
@@ -278,11 +292,12 @@ class PendulumEnv:
 
     def __init__(
             self,
-            dt=0.014,
+            dt=0.01,
             max_steps=1000,
             variable_dt=False,
             param_variation=0.1,
-            fixed_params=False
+            fixed_params=False,
+            voltage_range=None
     ):
         """
         Initialize pendulum environment.
@@ -293,9 +308,12 @@ class PendulumEnv:
             variable_dt: If True, use variable time steps
             param_variation: Parameter variation percentage (0.1 = 10%)
             fixed_params: If True, parameters won't vary between episodes
+            voltage_range: Tuple (min_voltage, max_voltage) for varying max_voltage
+                          If None, uses base_max_voltage with normal variation
         """
         self.fixed_dt = dt
         self.variable_dt = variable_dt
+        self.voltage_range = voltage_range
 
         # Initialize time generator if using variable time steps
         if variable_dt:
@@ -307,13 +325,17 @@ class PendulumEnv:
         # Initialize parameter manager
         self.param_manager = ParameterManager(
             variation_pct=param_variation,
-            fixed_params=fixed_params
+            fixed_params=fixed_params,
+            voltage_range=voltage_range
         )
 
         self.max_steps = max_steps
         self.step_count = 0
         self.state = None
         self.time_history = []
+
+        # Initialize parameters (including max_voltage)
+        self.params = None
 
     def reset(self, random_init=True):
         """Reset the environment to initial state."""
@@ -362,7 +384,8 @@ class PendulumEnv:
 
     def step(self, action):
         """Take a step in the environment with the given action."""
-        # Convert normalized action [-1, 1] to voltage
+        # Convert normalized action [-1, 1] to voltage using current max_voltage
+        max_voltage = self.params['max_voltage']
         voltage = float(action) * max_voltage
 
         # Record current dt value
@@ -418,7 +441,7 @@ class PendulumEnv:
 
         # 2. Penalty for high velocities
         velocity_norm = (theta_0_dot ** 2 + theta_1_dot ** 2) / 10.0
-        velocity_penalty = -0.3 * np.tanh(velocity_norm)
+        velocity_penalty = -0.05 * np.tanh(velocity_norm)
 
         # 3. Penalty for arm position away from center
         pos_penalty = -0.1 * np.tanh(theta_0 ** 2 / 2.0)
@@ -453,7 +476,7 @@ class PendulumEnv:
         reward = (
                 upright_reward +
                 velocity_penalty +
-                #pos_penalty +
+                pos_penalty +
                 bonus +
                 limit_penalty +
                 energy_reward
@@ -734,6 +757,7 @@ def train(
         variable_dt=False,
         param_variation=0.1,
         fixed_params=False,
+        voltage_range=None,
         max_episodes=500,
         eval_interval=10
 ):
@@ -742,11 +766,17 @@ def train(
     print(f"Using variable time steps: {variable_dt}")
     print(f"Using parameter variation: {param_variation if not fixed_params else 'OFF'}")
 
+    if voltage_range:
+        print(f"Using voltage range: {voltage_range[0]} to {voltage_range[1]} V")
+    else:
+        print(f"Using base max voltage: {base_max_voltage} V with {param_variation * 100}% variation")
+
     # Environment setup
     env = PendulumEnv(
         variable_dt=variable_dt,
         param_variation=param_variation,
-        fixed_params=fixed_params
+        fixed_params=fixed_params,
+        voltage_range=voltage_range
     )
 
     # Setup parameters
@@ -840,7 +870,8 @@ def train(
             current_params = env.get_current_parameters()
             print(
                 f"  Parameters: Rm={current_params['Rm']:.4f}, Km={current_params['Km']:.6f}, "
-                f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}"
+                f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}, "
+                f"max_voltage={current_params['max_voltage']:.2f}V"  # Added max_voltage to log
             )
 
             # Plot simulation for visual progress tracking
@@ -850,7 +881,8 @@ def train(
                     episode_states,
                     episode_actions,
                     env.time_history if variable_dt else [env.dt] * len(episode_states),
-                    episode_reward
+                    episode_reward,
+                    env.params['max_voltage']  # Pass current max_voltage to plotting function
                 )
 
             # Plot parameter variation history
@@ -933,7 +965,8 @@ def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hid
 
 
 # ====== Visualization Helper ======
-def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward):
+def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward,
+                          max_voltage=base_max_voltage):
     """Plot the pendulum state evolution for a training episode."""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
@@ -979,7 +1012,8 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
     plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Limits')
     plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
     plt.ylabel('Arm angle (rad)')
-    plt.title(f'Episode {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s')
+    plt.title(
+        f'Episode {episode + 1} | Reward: {episode_reward:.2f} | Balanced: {balanced_time:.2f}s | Max Voltage: {max_voltage:.2f}V')
     plt.legend()
     plt.grid(True)
 
@@ -994,7 +1028,7 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
 
     # Plot control actions
     plt.subplot(3, 1, 3)
-    plt.plot(t, actions_history * max_voltage, 'r-')  # Convert to actual voltage
+    plt.plot(t, actions_history * max_voltage, 'r-')  # Use current max_voltage value
     plt.xlabel('Time (s)')
     plt.ylabel('Control voltage (V)')
     plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
@@ -1006,13 +1040,15 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
 
 
 # ====== Evaluation Function ======
-def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variation=0.1, fixed_params=False):
+def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variation=0.1, fixed_params=False,
+             voltage_range=None):
     """Evaluate the trained agent's performance."""
     # Create environment with specified parameters
     env = PendulumEnv(
         variable_dt=variable_dt,
         param_variation=param_variation,
-        fixed_params=fixed_params
+        fixed_params=fixed_params,
+        voltage_range=voltage_range
     )
 
     # Performance tracking
@@ -1056,7 +1092,8 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
         # Print parameter values
         if not fixed_params:
             print(f"  Parameters: Rm={current_params['Rm']:.4f}, Km={current_params['Km']:.6f}, "
-                  f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}")
+                  f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}, "
+                  f"max_voltage={current_params['max_voltage']:.2f}V")  # Added max_voltage
 
         if render:
             # Calculate evaluation metrics and create visualizations
@@ -1109,6 +1146,8 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
                 title += " (Variable dt)"
             if not fixed_params:
                 title += f" (Param var: {param_variation * 100:.0f}%)"
+            if voltage_range:
+                title += f" (Voltage: {current_params['max_voltage']:.2f}V)"
             plt.title(title)
             plt.legend()
             plt.grid(True)
@@ -1124,9 +1163,9 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
 
             # Plot motor voltage
             plt.subplot(4, 1, 3)
-            plt.plot(t, actions_history * max_voltage, 'r-')
+            plt.plot(t, actions_history * current_params['max_voltage'], 'r-')  # Use current max_voltage
             plt.ylabel('Control voltage (V)')
-            plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
+            plt.ylim([-current_params['max_voltage'] * 1.1, current_params['max_voltage'] * 1.1])
             plt.grid(True)
 
             # Plot angular velocities
@@ -1161,7 +1200,7 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
     if not fixed_params and len(all_params) > 1:
         print("\n===== Parameter Variation Analysis =====")
         # Important parameters to analyze
-        param_keys = ['Rm', 'Km', 'mL', 'LA', 'LL', 'JA', 'JL', 'k']
+        param_keys = ['Rm', 'Km', 'mL', 'LA', 'LL', 'JA', 'JL', 'k', 'max_voltage']  # Added max_voltage
 
         # Create correlation analysis
         if len(all_rewards) > 3:
@@ -1191,10 +1230,11 @@ if __name__ == "__main__":
 
     # Choose one training configuration
 
-    # Option 1: Train a new agent from scratch
+    # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
         variable_dt=True,
         param_variation=0.2,
+        voltage_range=(1.0, 18.0),
         max_episodes=1000,
         eval_interval=10
     )
@@ -1205,15 +1245,16 @@ if __name__ == "__main__":
     #     critic_path="critic_final_12345.pth",
     #     variable_dt=True,
     #     param_variation=0.15,
+    #     voltage_range=(2.0, 10.0),  # Set voltage range from 2.0V to 10.0V
     #     max_episodes=100
     # )
 
     # Evaluate trained agent with different parameter variations
     print("\n--- Standard Evaluation ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.1)
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.1, voltage_range=(2.0, 5.0))
 
     print("\n--- Robustness Test (High Variation) ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.3)
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.3, voltage_range=(2.0, 10.0))
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")
