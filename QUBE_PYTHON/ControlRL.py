@@ -65,6 +65,17 @@ class QUBEControllerWithRL:
         self.max_voltage = 10.0  # Use full voltage range as in training
         self.rl_scaling_factor = 4.0  # Default scaling factor, now adjustable
 
+        # Performance optimization settings
+        self.target_frequency = 200  # Target control frequency in Hz (was ~60Hz with sleep)
+        self.ui_update_interval = 5  # Update UI every N iterations (was every iteration)
+        self.ui_counter = 0
+        self.last_loop_time = time.time()
+        self.actual_frequency = 0
+
+        # Performance tracking
+        self.iteration_count = 0
+        self.start_time = time.time()
+
         # Initialize the RL model (but don't load weights yet)
         self.initialize_rl_model()
 
@@ -184,6 +195,38 @@ class QUBEControllerWithRL:
         self.voltage_slider.set(0)
         self.voltage_slider.grid(row=5, column=0, padx=5, pady=10)
 
+        # Performance settings frame
+        perf_frame = Frame(control_frame)
+        perf_frame.grid(row=6, column=0, pady=5)
+
+        # Add frequency slider
+        self.freq_slider = Scale(
+            perf_frame,
+            from_=60,
+            to=500,
+            orient=tk.HORIZONTAL,
+            label="Target Control Frequency (Hz)",
+            length=300,
+            resolution=10,
+            command=self.set_target_frequency
+        )
+        self.freq_slider.set(self.target_frequency)
+        self.freq_slider.grid(row=0, column=0, padx=5)
+
+        # Add UI update interval slider
+        self.ui_slider = Scale(
+            perf_frame,
+            from_=1,
+            to=20,
+            orient=tk.HORIZONTAL,
+            label="UI Update Every N Iterations",
+            length=300,
+            resolution=1,
+            command=self.set_ui_update_interval
+        )
+        self.ui_slider.set(self.ui_update_interval)
+        self.ui_slider.grid(row=1, column=0, padx=5)
+
         # Status display
         status_frame = Frame(self.master, padx=10, pady=10)
         status_frame.pack()
@@ -217,6 +260,11 @@ class QUBEControllerWithRL:
         self.scaling_label = Label(status_frame, text=f"{self.rl_scaling_factor:.1f}")
         self.scaling_label.grid(row=6, column=1, sticky=tk.W)
 
+        # Add actual frequency display
+        Label(status_frame, text="Control Frequency:").grid(row=7, column=0, sticky=tk.W)
+        self.freq_label = Label(status_frame, text=f"{self.actual_frequency:.1f} Hz")
+        self.freq_label.grid(row=7, column=1, sticky=tk.W)
+
         # RGB Control
         rgb_frame = Frame(self.master, padx=10, pady=10)
         rgb_frame.pack()
@@ -229,6 +277,14 @@ class QUBEControllerWithRL:
 
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
+
+    def set_target_frequency(self, value):
+        """Set target control frequency from slider"""
+        self.target_frequency = float(value)
+
+    def set_ui_update_interval(self, value):
+        """Set UI update interval from slider"""
+        self.ui_update_interval = int(value)
 
     def set_rl_scaling_factor(self, value):
         """Set the RL scaling factor from slider"""
@@ -271,7 +327,8 @@ class QUBEControllerWithRL:
         if elapsed < 3.0:
             # Apply voltage to move to corner
             self.motor_voltage = 1.5
-            self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
+            if self.ui_counter == 0:  # Only update UI when counter is 0
+                self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
         else:
             # At corner - set as zero
             self.motor_voltage = 0.0
@@ -354,7 +411,8 @@ class QUBEControllerWithRL:
             self.g_slider.set(0)
             self.b_slider.set(999)
 
-            self.status_label.config(text="Position reached")
+            if self.ui_counter == 0:  # Only update UI when counter is 0
+                self.status_label.config(text="Position reached")
             return
 
         # Simple proportional control
@@ -417,14 +475,13 @@ class QUBEControllerWithRL:
         # Convert normalized action [-1, 1] to voltage using adjustable scaling factor
         self.motor_voltage = float(action) * self.max_voltage / self.rl_scaling_factor
 
-        # Update status
-        upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
-        if upright_angle < 30:
-            self.status_label.config(text=f"RL control active - Near balance ({upright_angle:.1f}° from upright)")
-        else:
-            self.status_label.config(text=f"RL control active - Swinging ({upright_angle:.1f}° from upright)")
-
-    # This function is no longer needed as the RL model handles everything
+        # Update status - but only during UI updates
+        if self.ui_counter == 0:
+            upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
+            if upright_angle < 30:
+                self.status_label.config(text=f"RL control active - Near balance ({upright_angle:.1f}° from upright)")
+            else:
+                self.status_label.config(text=f"RL control active - Swinging ({upright_angle:.1f}° from upright)")
 
     def stop_motor(self):
         """Stop the motor"""
@@ -446,6 +503,21 @@ class QUBEControllerWithRL:
 
     def update_gui(self):
         """Update the GUI and control the hardware - called continuously"""
+        # Increment iteration counter
+        self.iteration_count += 1
+
+        # Calculate current control frequency (every 50 iterations)
+        now = time.time()
+        elapsed = now - self.last_loop_time
+        self.last_loop_time = now
+
+        # Smooth frequency calculation (moving average)
+        alpha = 0.1  # Smoothing factor
+        self.actual_frequency = (1 - alpha) * self.actual_frequency + alpha * (1.0 / max(elapsed, 0.001))
+
+        # Update UI counter
+        self.ui_counter = (self.ui_counter + 1) % self.ui_update_interval
+
         # Update automatic control modes if active
         if self.calibrating:
             self.update_calibration()
@@ -460,29 +532,39 @@ class QUBEControllerWithRL:
         # Apply RGB values
         self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
 
-        # Update display information
-        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
-        pendulum_angle_deg = self.qube.getPendulumAngle()
+        # Only update display information when UI counter is 0
+        if self.ui_counter == 0:
+            # Update display information
+            motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
+            pendulum_angle_deg = self.qube.getPendulumAngle()
 
-        # Convert to radians for normalized angle calculation
-        pendulum_angle_rad = np.radians(pendulum_angle_deg)
-        pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)  # For display
+            # Convert to radians for normalized angle calculation
+            pendulum_angle_rad = np.radians(pendulum_angle_deg)
+            pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)  # For display
 
-        rpm = self.qube.getMotorRPM()
+            rpm = self.qube.getMotorRPM()
 
-        self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
-        self.pendulum_label.config(
-            text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
-        self.rpm_label.config(text=f"{rpm:.1f}")
-        self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+            self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
+            self.pendulum_label.config(
+                text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
+            self.rpm_label.config(text=f"{rpm:.1f}")
+            self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+            self.freq_label.config(text=f"{self.actual_frequency:.1f} Hz")
 
-        if self.rl_model:
-            self.model_label.config(text=f"Using: {os.path.basename(self.rl_model)}")
+            if self.rl_model:
+                self.model_label.config(text=f"Using: {os.path.basename(self.rl_model)}")
+
+            # Log performance stats every 500 iterations
+            if self.iteration_count % 500 == 0:
+                avg_freq = self.iteration_count / (now - self.start_time)
+                print(
+                    f"Performance: {self.iteration_count} iterations, Avg frequency: {avg_freq:.1f} Hz, Current: {self.actual_frequency:.1f} Hz")
 
 
 def main():
     print("Starting QUBE Controller with RL...")
     print("Will set corner position as zero")
+    print("OPTIMIZED VERSION - Reduced UI updates, dynamic timing")
 
     try:
         # Initialize QUBE
@@ -499,12 +581,33 @@ def main():
         root = tk.Tk()
         app = QUBEControllerWithRL(root, qube)
 
-        # Main loop
+        # For frequency calculation
+        target_period = 1.0 / app.target_frequency
+        last_time = time.time()
+
+        # Main loop with dynamic timing
         while True:
+            loop_start = time.time()
+
+            # Update hardware
             qube.update()
+
+            # Update controller
             app.update_gui()
-            root.update()
-            time.sleep(0.01)
+
+            # Update Tkinter - reduced frequency based on UI counter
+            if app.ui_counter == 0:
+                root.update()
+
+            # Dynamic sleep calculation to maintain target frequency
+            elapsed = time.time() - loop_start
+            sleep_time = max(0.0, target_period - elapsed)
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+            # Update target period based on current slider value
+            target_period = 1.0 / app.target_frequency
 
     except tk.TclError:
         # Window closed
