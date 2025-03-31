@@ -3,10 +3,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from time import time
 import numba as nb
-from scipy import signal
+from numpy.ma.core import arctan2
 
 # System Parameters from the system identification document (Table 3)
-Rm = 8.4  # Motor resistance (Ohm)
+Rm = 8.94  # Motor resistance (Ohm)
 Km = 0.042  # Motor back-emf constant
 Jm = 6e-5  # Total moment of inertia acting on motor shaft (kg·m^2)
 bm = 3e-4  # Viscous damping coefficient (Nm/rad/s)
@@ -16,12 +16,13 @@ mA = 0.095  # Weight of pendulum arm (kg)
 mL = 0.024  # Weight of pendulum link (kg)
 LA = 0.085  # Length of pendulum arm (m)
 LL = 0.129  # Length of pendulum link (m)
-JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
-JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
+#JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
+#JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
 g = 9.81  # Gravity constant (m/s^2)
 JA = mA * LA ** 2 * 7 / 48  # Pendulum arm moment of inertia (kg·m²)
 JL = mL * LL ** 2 / 3  # Pendulum link moment of inertia (kg·m²)
-
+l_1 = LL / 2
+k = 0.002
 # Pre-compute constants for optimization
 half_mL_LL_g = 0.5 * mL * LL * g
 half_mL_LL_LA = 0.5 * mL * LL * LA
@@ -87,50 +88,55 @@ def enforce_theta_limits(state):
 
 @nb.njit(fastmath=True, cache=True)
 def dynamics_step(state, t, vm):
-    """Dynamics calculation for pendulum system"""
-    theta_m, theta_L, theta_m_dot, theta_L_dot = state[0], state[1], state[2], state[3]
+    """Updated dynamics calculation to match the new simulation model"""
+    theta_0, theta_1, theta_0_dot, theta_1_dot = state
+
+    # Calculate sines and cosines for dynamics
+    s0, c0 = np.sin(theta_0), np.cos(theta_0)
+    s1, c1 = np.sin(theta_1), np.cos(theta_1)
 
     # Check theta limits - implement hard stops
-    if (theta_m >= THETA_MAX and theta_m_dot > 0) or (theta_m <= THETA_MIN and theta_m_dot < 0):
-        theta_m_dot = 0.0  # Stop the arm motion at the limits
+    if (theta_0 >= THETA_MAX and theta_0_dot > 0) or (theta_0 <= THETA_MIN and theta_0_dot < 0):
+        theta_0_dot = 0.0  # Stop the arm motion at the limits
 
     # Apply dead zone and calculate motor torque
     vm = apply_voltage_deadzone(vm)
 
     # Motor torque calculation
-    im = (vm - Km * theta_m_dot) / Rm
-    Tm = Km * im
+    torque = Km * (vm - Km * theta_0_dot) / Rm
 
-    # Equations of motion coefficients
-    # For theta_m equation:
-    M11 = mL * LA ** 2 + quarter_mL_LL_squared - quarter_mL_LL_squared * np.cos(theta_L) ** 2 + JA
-    M12 = -half_mL_LL_LA * np.cos(theta_L)
-    C1 = 0.5 * mL * LL ** 2 * np.sin(theta_L) * np.cos(theta_L) * theta_m_dot * theta_L_dot
-    C2 = half_mL_LL_LA * np.sin(theta_L) * theta_L_dot ** 2
+    # Set up the mass matrix and force vector according to the new model
+    alpha = JA + mL * LA ** 2 + mL * l_1 ** 2 * s1 ** 2
+    beta = -mL * l_1 ** 2 * (2 * s1 * c1)
+    gamma = -mL * LA * l_1 * c1
+    sigma = mL * LA * l_1 * s1
 
-    # For theta_L equation:
-    M21 = -half_mL_LL_LA * np.cos(theta_L)  # Signe was wrong in the original code
-    M22 = JL + quarter_mL_LL_squared
-    C3 = -quarter_mL_LL_squared * np.cos(theta_L) * np.sin(theta_L) * theta_m_dot ** 2
-    G = half_mL_LL_g * np.sin(theta_L)
+    # Set up the mass matrix (with sign adjustments to match file 2)
+    M = np.array([
+        [-alpha, -gamma],
+        [-gamma, -(JL + mL * l_1 ** 2)]
+    ])
 
-    # Calculate determinant for matrix inversion
-    det_M = M11 * M22 - M12 * M21
+    # Right-hand side force vector (matching file 2)
+    f = np.array([
+        -torque + DA * theta_0_dot + k * arctan2(s0, c0) + sigma * theta_1_dot ** 2 - beta * theta_0_dot * theta_1_dot,
+        DL * theta_1_dot + mL * g * l_1 * s1 + 0.5 * beta * theta_0_dot ** 2
+    ])
+
+    # Solve for accelerations using numpy's solve
+    # For numba compatibility, we'll solve manually
+    det_M = M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0]
 
     # Handle near-singular matrix
     if abs(det_M) < 1e-10:
-        theta_m_ddot = 0
-        theta_L_ddot = 0
+        theta_0_ddot = 0
+        theta_1_ddot = 0
     else:
-        # Right-hand side of equations
-        RHS1 = Tm - C1 - C2 - DA * theta_m_dot
-        RHS2 = -G - DL * theta_L_dot - C3
+        # Solve for accelerations (Cramer's rule)
+        theta_0_ddot = (M[1, 1] * f[0] - M[0, 1] * f[1]) / det_M
+        theta_1_ddot = (M[0, 0] * f[1] - M[1, 0] * f[0]) / det_M
 
-        # Solve for accelerations
-        theta_m_ddot = (M22 * RHS1 - M12 * RHS2) / det_M
-        theta_L_ddot = (-M21 * RHS1 + M11 * RHS2) / det_M
-
-    return np.array([theta_m_dot, theta_L_dot, theta_m_ddot, theta_L_ddot])
+    return np.array([theta_0_dot, theta_1_dot, theta_0_ddot, theta_1_ddot])
 
 
 def rk4_integration(state0, t_span, dt, voltage_data, time_data):
@@ -328,6 +334,13 @@ def main():
 
     # List of datasets to process
     datasets = ['df1.csv', 'df2.csv', 'df3.csv', 'df4.csv', 'df5.csv', 'df6.csv']
+
+    """datasets = ['processed_qube_data_20250329_111906.csv',
+                'processed_qube_data_20250329_113057.csv',
+                'processed_qube_data_20250329_122651.csv',
+                'processed_qube_data_20250329_132333.csv',
+                'processed_qube_data_20250329_132635.csv',
+                'processed_qube_data_20250329_145238.csv']"""
 
     # Summary data for final report
     summary_data = []
