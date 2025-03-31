@@ -23,7 +23,7 @@ JA = 5.72e-5  # Inertia moment of pendulum arm (kg·m^2)
 JL = 1.31e-4  # Inertia moment of pendulum link (kg·m^2)
 g = 9.81  # Gravity constant (m/s^2)
 
-max_voltage = 10.0  # Maximum motor voltage
+max_voltage = 8.0  # Maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -134,7 +134,7 @@ def dynamics_step(state, t, vm):
 
 # Simulation environment with RK4 integration like in SAC code
 class PendulumEnv:
-    def __init__(self, dt=0.0115, max_steps=1300):
+    def __init__(self, dt=0.014, max_steps=1300):
         self.dt = dt
         self.max_steps = max_steps
         self.step_count = 0
@@ -693,7 +693,7 @@ def train():
         avg_rewards.append(mean_reward)
 
         # Log progress
-        if (epoch + 1) % 100 == 0:
+        if (epoch + 1) % 50 == 0:
             print(f"Episode {epoch + 1}/{max_episodes} | Reward: {last_completed_reward:.2f} | "
                   f"Avg Reward: {mean_reward:.2f} | Policy Loss: {update_info['policy_loss']:.4f} | "
                   f"Value Loss: {update_info['value_loss']:.4f} | KL Div: {update_info['kl_div']:.4f}")
@@ -702,15 +702,15 @@ def train():
             if plot_this_episode:
                 plot_training_episode(epoch, episode_states, episode_actions, env.dt, last_completed_reward)
 
-            if (epoch + 1) % 1000 == 0:
+            if (epoch + 1) % 100 == 0:
                 # Save trained model
                 timestamp = int(time())
                 agent.save(f"{epoch + 1}_ppo_{timestamp}.pth")
 
         # Early stopping if well trained
-        """if mean_reward > 5000 and epoch > 50:
+        if mean_reward > 4900 and epoch > 250:
             print(f"Environment solved in {epoch + 1} episodes!")
-            break"""
+            break
 
     training_time = time() - start_time
     print(f"Training completed in {training_time:.2f} seconds!")
