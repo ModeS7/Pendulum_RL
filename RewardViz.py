@@ -34,25 +34,25 @@ def compute_reward(state, voltage_change=0.0, params=None):
     p = params if params else Params()
 
     # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
-    upright_reward = 2.0 * np.cos(alpha_norm)
+    upright_reward = 1.0 * np.cos(alpha_norm)
 
     # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
     velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0
-    velocity_penalty = -0.3 * np.tanh(velocity_norm) * 0.0
+    velocity_penalty = -0.3 * np.tanh(velocity_norm)
 
     # COMPONENT 3: Smooth penalty for arm position away from center
-    pos_penalty = -0.5 * np.tanh(theta ** 2 / 2.0)
+    pos_penalty = 2.0 * np.cos(normalize_angle(theta)) - 1.0
 
     # COMPONENT 4: Smoother bonus for being close to upright position
     upright_closeness = np.exp(-10.0 * alpha_norm ** 2)
-    stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.2 * alpha_dot ** 2)
     bonus = 3.0 * upright_closeness * stability_factor
 
     # COMPONENT 4.5: Smoother cost for being close to downright position
     # For new convention, downright is at π
     downright_alpha = normalize_angle(alpha - np.pi)
     downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-    stability_factor = np.exp(-1.0 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.2 * alpha_dot ** 2)
     bonus += -3.0 * downright_closeness * stability_factor
 
     # COMPONENT 5: Smoother penalty for approaching limits
