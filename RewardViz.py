@@ -38,21 +38,21 @@ def compute_reward(state, voltage_change=0.0, params=None):
 
     # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
     velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0
-    velocity_penalty = -0.3 * np.tanh(velocity_norm)
+    velocity_penalty = -0.0 * np.tanh(velocity_norm)
 
     # COMPONENT 3: Smooth penalty for arm position away from center
-    pos_penalty = 2.0 * np.cos(normalize_angle(theta)) - 1.0
+    pos_penalty = 3.0 * np.cos(normalize_angle(theta)) - 1.0
 
     # COMPONENT 4: Smoother bonus for being close to upright position
     upright_closeness = np.exp(-10.0 * alpha_norm ** 2)
-    stability_factor = np.exp(-0.2 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.1 * alpha_dot ** 2)
     bonus = 3.0 * upright_closeness * stability_factor
 
     # COMPONENT 4.5: Smoother cost for being close to downright position
     # For new convention, downright is at π
     downright_alpha = normalize_angle(alpha - np.pi)
     downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-    stability_factor = np.exp(-0.2 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.1 * alpha_dot ** 2)
     bonus += -3.0 * downright_closeness * stability_factor
 
     # COMPONENT 5: Smoother penalty for approaching limits
@@ -229,12 +229,12 @@ class RewardExplorerGUI:
         )
         alpha_slider.pack(fill=tk.X, pady=(0, 10))
 
-        # Theta dot slider
+        # Theta dot slider - UPDATED RANGE
         ttk.Label(slider_frame, text="Theta Dot (Arm Velocity):").pack(anchor=tk.W, pady=(10, 0))
         theta_dot_slider = ttk.Scale(
             slider_frame,
-            from_=-5.0,
-            to=5.0,
+            from_=-8.0,  # Modified from -5.0 to -8.0
+            to=8.0,      # Modified from 5.0 to 8.0
             orient=tk.HORIZONTAL,
             variable=self.theta_dot,
             command=lambda _: self.update_explorer_visualization(),
@@ -242,12 +242,12 @@ class RewardExplorerGUI:
         )
         theta_dot_slider.pack(fill=tk.X, pady=(0, 10))
 
-        # Alpha dot slider
+        # Alpha dot slider - UPDATED RANGE
         ttk.Label(slider_frame, text="Alpha Dot (Pendulum Velocity):").pack(anchor=tk.W, pady=(10, 0))
         alpha_dot_slider = ttk.Scale(
             slider_frame,
-            from_=-5.0,
-            to=5.0,
+            from_=-8.0,  # Modified from -5.0 to -8.0
+            to=8.0,      # Modified from 5.0 to 8.0
             orient=tk.HORIZONTAL,
             variable=self.alpha_dot,
             command=lambda _: self.update_explorer_visualization(),
@@ -717,9 +717,9 @@ class RewardExplorerGUI:
         self.heatmap_fig.clear()
         ax = self.heatmap_fig.add_subplot(111)
 
-        # Create meshgrid for alpha and alpha_dot
+        # Create meshgrid for alpha and alpha_dot - UPDATED RANGE
         alpha_values = np.linspace(-np.pi, np.pi, 100)
-        alpha_dot_values = np.linspace(-5, 5, 100)
+        alpha_dot_values = np.linspace(-8, 8, 100)  # Modified from -5, 5 to -8, 8
         alpha_grid, alpha_dot_grid = np.meshgrid(alpha_values, alpha_dot_values)
 
         # Fixed values for other variables
@@ -768,9 +768,9 @@ class RewardExplorerGUI:
         self.surface_fig.clear()
         ax = self.surface_fig.add_subplot(111, projection='3d')
 
-        # Create meshgrid
+        # Create meshgrid - UPDATED RANGE
         alpha_values = np.linspace(-np.pi, np.pi, 50)
-        alpha_dot_values = np.linspace(-5, 5, 50)
+        alpha_dot_values = np.linspace(-8, 8, 50)  # Modified from -5, 5 to -8, 8
         alpha_grid, alpha_dot_grid = np.meshgrid(alpha_values, alpha_dot_values)
 
         # Fixed values
@@ -820,9 +820,9 @@ class RewardExplorerGUI:
         axs = self.component_fig.subplots(2, 4)
         axs = axs.flatten()
 
-        # Create meshgrid for alpha and alpha_dot
+        # Create meshgrid for alpha and alpha_dot - UPDATED RANGE
         alpha_values = np.linspace(-np.pi, np.pi, 50)
-        alpha_dot_values = np.linspace(-5, 5, 50)
+        alpha_dot_values = np.linspace(-8, 8, 50)  # Modified from -5, 5 to -8, 8
         alpha_grid, alpha_dot_grid = np.meshgrid(alpha_values, alpha_dot_values)
 
         # Create state grid with fixed values for theta and theta_dot
