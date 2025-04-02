@@ -197,10 +197,10 @@ class VariableTimeGenerator:
 
     def __init__(
             self,
-            mean=0.014,
+            mean=0.005,
             std_dev=0.002,
-            min_dt=0.010,
-            max_dt=0.040
+            min_dt=0.0025,
+            max_dt=0.01
     ):
         self.mean = mean
         self.std_dev = std_dev
@@ -292,8 +292,8 @@ class PendulumEnv:
 
     def __init__(
             self,
-            dt=0.01,
-            max_steps=1000,
+            dt=0.005,
+            max_steps=2000,
             variable_dt=False,
             param_variation=0.1,
             fixed_params=False,
@@ -388,6 +388,9 @@ class PendulumEnv:
         max_voltage = self.params['max_voltage']
         voltage = float(action) * max_voltage
 
+        # Store the voltage for reward calculation
+        self.last_voltage = voltage
+
         # Record current dt value
         self.time_history.append(self.dt)
 
@@ -432,27 +435,31 @@ class PendulumEnv:
         """Calculate reward based on current state."""
         theta_0, theta_1, theta_0_dot, theta_1_dot = self.state
 
+        # Save the last action (voltage) for reward calculation
+        # This assumes the action has been stored during the step() method
+        last_voltage = getattr(self, 'last_voltage', 0.0)
+
         # Normalize theta_1 for reward calculation
         theta_1_norm = normalize_angle(theta_1 + np.pi)
 
         # ===== Reward Components =====
         # 1. Base reward for pendulum being upright (range: -1 to 1)
-        upright_reward = 2.0 * np.cos(theta_1_norm)
+        upright_reward = 1.0 * np.cos(theta_1_norm)
 
         # 2. Penalty for high velocities
         velocity_norm = (theta_0_dot ** 2 + theta_1_dot ** 2) / 10.0
         velocity_penalty = -0.05 * np.tanh(velocity_norm)
 
         # 3. Penalty for arm position away from center
-        pos_penalty = -0.1 * np.tanh(theta_0 ** 2 / 2.0)
+        pos_penalty = 3.0 * np.cos(theta_0) - 1.0
 
         # 4. Bonus for being close to upright position
         upright_closeness = np.exp(-10.0 * theta_1_norm ** 2)
-        stability_factor = np.exp(-1.0 * theta_1_dot ** 2)
+        stability_factor = np.exp(-0.1 * theta_1_dot ** 2)
         bonus = 3.0 * upright_closeness * stability_factor
 
         # 5. Penalty for being close to downward position
-        downright_theta_1 = normalize_angle(theta_1 - np.pi)
+        downright_theta_1 = normalize_angle(theta_1)
         downright_closeness = np.exp(-10.0 * downright_theta_1 ** 2)
         bonus += -3.0 * downright_closeness * stability_factor
 
@@ -472,14 +479,22 @@ class PendulumEnv:
             mL * g * l_1
         )
 
+        # 8. Cost for high voltage usage
+        max_voltage = self.params['max_voltage']
+        # Using squared voltage to penalize higher voltages more
+        upright_closeness = np.exp(-10.0 * theta_1_norm ** 2)
+        stability_factor = np.exp(-0.1 * theta_1_dot ** 2)
+        voltage_cost = 1.0 - 1.0 * (last_voltage / max_voltage) ** 2 * upright_closeness * stability_factor
+
         # Combine all components
         reward = (
                 upright_reward +
-                velocity_penalty +
+                #velocity_penalty +
                 pos_penalty +
                 bonus +
                 limit_penalty +
                 energy_reward
+                #voltage_cost
         )
 
         return reward
@@ -782,7 +797,7 @@ def train(
     # Setup parameters
     state_dim = 6  # Observation space dimension
     action_dim = 1  # Motor voltage (normalized)
-    max_steps = 1000  # Max steps per episode
+    max_steps = 2000  # Max steps per episode
     batch_size = 256  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
     updates_per_step = 1  # Updates per environment step
@@ -815,9 +830,10 @@ def train(
         alpha_values = []
 
         # Prepare for episode visualization if needed
-        plot_this_episode = (episode + 1) % eval_interval == 0
+        plot_this_episode = ((episode + 1) % eval_interval == 0) or (episode <= 1)
         episode_states = [] if plot_this_episode else None
         episode_actions = [] if plot_this_episode else None
+        step_rewards = [] if plot_this_episode else None  # Track rewards per step
 
         # Episode loop
         for step in range(max_steps):
@@ -828,10 +844,11 @@ def train(
             # Store transition in replay buffer
             replay_buffer.push(state, action, reward, next_state, done)
 
-            # Store state and action if plotting
+            # Store state, action, and reward if plotting
             if plot_this_episode:
                 episode_states.append(env.state.copy())
                 episode_actions.append(action)
+                step_rewards.append(reward)  # Store individual step rewards
 
             # Move to next state
             state = next_state
@@ -859,7 +876,7 @@ def train(
         avg_alpha = np.mean(alpha_values) if alpha_values else 0.0
 
         # Periodic reporting and visualization
-        if (episode + 1) % eval_interval == 0:
+        if (episode + 1) % eval_interval == 0 or episode <= 1:
             print(
                 f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | "
                 f"Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | "
@@ -875,15 +892,28 @@ def train(
             )
 
             # Plot simulation for visual progress tracking
-            if plot_this_episode:
-                plot_training_episode(
-                    episode,
-                    episode_states,
-                    episode_actions,
-                    env.time_history if variable_dt else [env.dt] * len(episode_states),
-                    episode_reward,
-                    env.params['max_voltage']  # Pass current max_voltage to plotting function
-                )
+            if plot_this_episode and episode_states and len(episode_states) > 0:
+                # Make sure we have rewards to plot
+                if step_rewards and len(step_rewards) > 0:
+                    plot_training_episode(
+                        episode,
+                        episode_states,
+                        episode_actions,
+                        env.time_history if variable_dt else [env.dt] * len(episode_states),
+                        episode_reward,
+                        env.params['max_voltage'],
+                        step_rewards  # Pass the recorded step rewards
+                    )
+                else:
+                    # If no rewards recorded, call without rewards_history
+                    plot_training_episode(
+                        episode,
+                        episode_states,
+                        episode_actions,
+                        env.time_history if variable_dt else [env.dt] * len(episode_states),
+                        episode_reward,
+                        env.params['max_voltage']
+                    )
 
             # Plot parameter variation history
             if not fixed_params and episode > 10:
@@ -895,9 +925,9 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 3500 and episode > 50:
+        """if avg_reward > 3500 and episode > 50:
             print(f"Environment solved in {episode + 1} episodes!")
-            break
+            break"""
 
     # Report training time
     training_time = time() - start_time
@@ -966,11 +996,14 @@ def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hid
 
 # ====== Visualization Helper ======
 def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward,
-                          max_voltage=base_max_voltage):
+                          max_voltage=base_max_voltage, rewards_history=None):
     """Plot the pendulum state evolution for a training episode."""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
     actions_history = np.array(actions_history)
+
+    # Always use 5 subplots
+    num_plots = 5
 
     # Extract components
     thetas = states_history[:, 0]  # theta_0 (arm angle)
@@ -1003,11 +1036,14 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
             balanced_time += dt_value
             num_upright_points += 1
 
-    # Plot results
-    plt.figure(figsize=(12, 9))
+    # Calculate voltage values
+    voltage_values = actions_history * max_voltage
 
-    # Plot arm angle
-    plt.subplot(3, 1, 1)
+    # Plot results
+    plt.figure(figsize=(12, 15))
+
+    # 1. Plot arm angle
+    plt.subplot(num_plots, 1, 1)
     plt.plot(t, thetas, 'b-')
     plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Limits')
     plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
@@ -1017,22 +1053,63 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
     plt.legend()
     plt.grid(True)
 
-    # Plot pendulum angle
-    plt.subplot(3, 1, 2)
-    plt.plot(t, alpha_normalized, 'g-')
+    # 2. Plot pendulum angle
+    plt.subplot(num_plots, 1, 2)
+    plt.scatter(t, alpha_normalized, color='g', s=10)
     plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Upright position
     plt.axhline(y=upright_threshold, color='r', linestyle=':', alpha=0.5)  # Threshold
     plt.axhline(y=-upright_threshold, color='r', linestyle=':', alpha=0.5)
     plt.ylabel('Pendulum angle (rad)')
     plt.grid(True)
 
-    # Plot control actions
-    plt.subplot(3, 1, 3)
-    plt.plot(t, actions_history * max_voltage, 'r-')  # Use current max_voltage value
-    plt.xlabel('Time (s)')
+    # 3. Plot control actions/voltage
+    plt.subplot(num_plots, 1, 3)
+    plt.plot(t, voltage_values, 'r-')  # Use current max_voltage value
     plt.ylabel('Control voltage (V)')
     plt.ylim([-max_voltage * 1.1, max_voltage * 1.1])
     plt.grid(True)
+
+    # 4. Plot angular velocities
+    plt.subplot(num_plots, 1, 4)
+    plt.plot(t, theta_dots, 'b-', label='Arm velocity')
+    plt.plot(t, alpha_dots, 'g-', label='Pendulum velocity')
+    plt.ylabel('Angular velocity (rad/s)')
+    plt.legend()
+    plt.grid(True)
+
+    # 5. Plot rewards with dual y-axis
+    ax1 = plt.subplot(num_plots, 1, 5)
+    if rewards_history is not None and len(rewards_history) > 0:
+        # Make sure we don't try to plot more rewards than we have time points
+        plot_length = min(len(t), len(rewards_history))
+
+        # Step rewards on primary y-axis
+        ax1.plot(t[:plot_length], rewards_history[:plot_length], 'purple', label='Step reward')
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel('Step Reward', color='purple')
+        ax1.tick_params(axis='y', labelcolor='purple')
+        ax1.grid(True)
+
+        # Cumulative rewards on secondary y-axis
+        ax2 = ax1.twinx()
+        cumulative_rewards = np.cumsum(rewards_history[:plot_length])
+        if len(cumulative_rewards) > 0:
+            ax2.plot(t[:plot_length], cumulative_rewards, 'g--', linewidth=1.5, alpha=0.8,
+                     label='Cumulative reward')
+            ax2.set_ylabel('Cumulative Reward', color='green')
+            ax2.tick_params(axis='y', labelcolor='green')
+
+            # Add cumulative episode reward to the last point
+            if len(cumulative_rewards) > 0:
+                ax2.annotate(f'{cumulative_rewards[-1]:.1f}',
+                             xy=(t[plot_length - 1], cumulative_rewards[-1]),
+                             xytext=(0, 5), textcoords='offset points',
+                             ha='center', va='bottom', color='green')
+
+        # Create a combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
     plt.tight_layout()
     plt.savefig(f"training_episode_{episode + 1}.png")
@@ -1067,6 +1144,7 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
         # Data collection for visualization
         states_history = []
         actions_history = []
+        step_rewards = []  # Track per-step rewards for visualization
 
         for step in range(env.max_steps):
             # Select action without exploration
@@ -1078,6 +1156,7 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
             # Record data
             states_history.append(env.state.copy())
             actions_history.append(action)
+            step_rewards.append(reward)  # Store individual step rewards
 
             total_reward += reward
             state = next_state
@@ -1093,7 +1172,7 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
         if not fixed_params:
             print(f"  Parameters: Rm={current_params['Rm']:.4f}, Km={current_params['Km']:.6f}, "
                   f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}, "
-                  f"max_voltage={current_params['max_voltage']:.2f}V")  # Added max_voltage
+                  f"max_voltage={current_params['max_voltage']:.2f}V")
 
         if render:
             # Calculate evaluation metrics and create visualizations
@@ -1131,11 +1210,14 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
 
             all_balance_times.append(balanced_time)
 
-            # Create evaluation plot
-            plt.figure(figsize=(14, 12))
+            # Calculate voltage values
+            voltage_values = actions_history * current_params['max_voltage']
 
-            # Plot arm angle
-            plt.subplot(4, 1, 1)
+            # Create evaluation plot - same structure as training plots
+            plt.figure(figsize=(12, 15))
+
+            # 1. Plot arm angle
+            plt.subplot(5, 1, 1)
             plt.plot(t, thetas, 'b-')
             plt.axhline(y=THETA_MAX, color='r', linestyle='--', alpha=0.7, label='Limits')
             plt.axhline(y=THETA_MIN, color='r', linestyle='--', alpha=0.7)
@@ -1152,30 +1234,59 @@ def evaluate(agent, num_episodes=5, render=True, variable_dt=False, param_variat
             plt.legend()
             plt.grid(True)
 
-            # Plot pendulum angle
-            plt.subplot(4, 1, 2)
-            plt.plot(t, alpha_normalized, 'g-')
+            # 2. Plot pendulum angle
+            plt.subplot(5, 1, 2)
+            plt.scatter(t, alpha_normalized, color='g', s=10)
             plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)  # Upright position
             plt.axhline(y=upright_threshold, color='r', linestyle=':', alpha=0.5)
             plt.axhline(y=-upright_threshold, color='r', linestyle=':', alpha=0.5)
             plt.ylabel('Pendulum angle (rad)')
             plt.grid(True)
 
-            # Plot motor voltage
-            plt.subplot(4, 1, 3)
-            plt.plot(t, actions_history * current_params['max_voltage'], 'r-')  # Use current max_voltage
+            # 3. Plot motor voltage
+            plt.subplot(5, 1, 3)
+            plt.plot(t, voltage_values, 'r-')
             plt.ylabel('Control voltage (V)')
             plt.ylim([-current_params['max_voltage'] * 1.1, current_params['max_voltage'] * 1.1])
             plt.grid(True)
 
-            # Plot angular velocities
-            plt.subplot(4, 1, 4)
+            # 4. Plot angular velocities
+            plt.subplot(5, 1, 4)
             plt.plot(t, theta_dots, 'b-', label='Arm velocity')
             plt.plot(t, alpha_dots, 'g-', label='Pendulum velocity')
-            plt.xlabel('Time (s)')
             plt.ylabel('Angular velocity (rad/s)')
             plt.legend()
             plt.grid(True)
+
+            # 5. Plot rewards with dual y-axis
+            ax1 = plt.subplot(5, 1, 5)
+            # Step rewards on primary y-axis
+            ax1.plot(t[:len(step_rewards)], step_rewards, 'purple', label='Step reward')
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Step Reward', color='purple')
+            ax1.tick_params(axis='y', labelcolor='purple')
+            ax1.grid(True)
+
+            # Cumulative rewards on secondary y-axis
+            ax2 = ax1.twinx()
+            cumulative_rewards = np.cumsum(step_rewards)
+            if len(cumulative_rewards) > 0:
+                ax2.plot(t[:len(step_rewards)], cumulative_rewards, 'g--', linewidth=1.5, alpha=0.8,
+                         label='Cumulative reward')
+                ax2.set_ylabel('Cumulative Reward', color='green')
+                ax2.tick_params(axis='y', labelcolor='green')
+
+                # Add cumulative episode reward to the last point
+                if len(cumulative_rewards) > 0:
+                    ax2.annotate(f'{cumulative_rewards[-1]:.1f}',
+                                 xy=(t[len(step_rewards) - 1], cumulative_rewards[-1]),
+                                 xytext=(0, 5), textcoords='offset points',
+                                 ha='center', va='bottom', color='green')
+
+            # Create a combined legend
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
             plt.tight_layout()
             plt.savefig(f"evaluation_episode_{episode + 1}.png")
@@ -1231,30 +1342,31 @@ if __name__ == "__main__":
     # Choose one training configuration
 
     # Option 1: Train a new agent from scratch with variable voltage range
-    agent = train(
+    """agent = train(
         variable_dt=True,
         param_variation=0.2,
-        voltage_range=(1.0, 18.0),
+        voltage_range=(3.0, 18.0),
         max_episodes=1000,
+        eval_interval=10
+    )"""
+
+    # Option 2: Continue training from pre-trained model
+    agent = train(
+        actor_path="actor_final_1743528264.pth",
+        critic_path="critic_final_1743528264.pth",
+        variable_dt=True,
+        param_variation=0.25,
+        voltage_range=(2.0, 18.0),
+        max_episodes=300,
         eval_interval=10
     )
 
-    # Option 2: Continue training from pre-trained model
-    # agent = train(
-    #     actor_path="actor_final_12345.pth",
-    #     critic_path="critic_final_12345.pth",
-    #     variable_dt=True,
-    #     param_variation=0.15,
-    #     voltage_range=(2.0, 10.0),  # Set voltage range from 2.0V to 10.0V
-    #     max_episodes=100
-    # )
-
     # Evaluate trained agent with different parameter variations
     print("\n--- Standard Evaluation ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.1, voltage_range=(2.0, 5.0))
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.3, voltage_range=(2.0, 8.0))
 
     print("\n--- Robustness Test (High Variation) ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.3, voltage_range=(2.0, 10.0))
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.5, voltage_range=(2.0, 20.0))
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")
