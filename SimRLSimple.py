@@ -11,7 +11,7 @@ from numpy.ma.core import arctan2
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
-base_max_voltage = 3.0  # Base maximum motor voltage
+base_max_voltage = 4.0  # Base maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -451,12 +451,13 @@ class PendulumEnv:
         velocity_penalty = -0.05 * np.tanh(velocity_norm)
 
         # 3. Penalty for arm position away from center
-        pos_penalty = 3.0 * np.cos(theta_0) - 1.0
+        pos_penalty = np.cos(theta_0)
 
         # 4. Bonus for being close to upright position
+        arm_center = np.exp(-1.0 * theta_0 ** 2)
         upright_closeness = np.exp(-10.0 * theta_1_norm ** 2)
-        stability_factor = np.exp(-0.1 * theta_1_dot ** 2)
-        bonus = 3.0 * upright_closeness * stability_factor
+        stability_factor = np.exp(-0.6 * theta_1_dot ** 2)
+        bonus = 3.0 * upright_closeness * stability_factor * arm_center
 
         # 5. Penalty for being close to downward position
         downright_theta_1 = normalize_angle(theta_1)
@@ -490,7 +491,7 @@ class PendulumEnv:
         reward = (
                 upright_reward +
                 #velocity_penalty +
-                pos_penalty +
+                #pos_penalty +
                 bonus +
                 limit_penalty +
                 energy_reward
@@ -925,9 +926,9 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        """if avg_reward > 3500 and episode > 50:
+        if avg_reward > 10000 and episode > 500:
             print(f"Environment solved in {episode + 1} episodes!")
-            break"""
+            break
 
     # Report training time
     training_time = time() - start_time
@@ -1342,31 +1343,31 @@ if __name__ == "__main__":
     # Choose one training configuration
 
     # Option 1: Train a new agent from scratch with variable voltage range
-    """agent = train(
+    agent = train(
         variable_dt=True,
-        param_variation=0.2,
-        voltage_range=(3.0, 18.0),
+        param_variation=0.15,
+        # voltage_range=(2.0, 18.0),
         max_episodes=1000,
         eval_interval=10
-    )"""
+    )
 
     # Option 2: Continue training from pre-trained model
-    agent = train(
+    """agent = train(
         actor_path="actor_final_1743528264.pth",
         critic_path="critic_final_1743528264.pth",
         variable_dt=True,
         param_variation=0.25,
-        voltage_range=(2.0, 18.0),
+        #voltage_range=(2.0, 18.0),
         max_episodes=300,
         eval_interval=10
-    )
+    )"""
 
     # Evaluate trained agent with different parameter variations
     print("\n--- Standard Evaluation ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.3, voltage_range=(2.0, 8.0))
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.15)
 
     print("\n--- Robustness Test (High Variation) ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.5, voltage_range=(2.0, 20.0))
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.25)
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")

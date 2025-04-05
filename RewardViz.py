@@ -41,12 +41,13 @@ def compute_reward(state, voltage_change=0.0, params=None):
     velocity_penalty = -0.0 * np.tanh(velocity_norm)
 
     # COMPONENT 3: Smooth penalty for arm position away from center
-    pos_penalty = 3.0 * np.cos(normalize_angle(theta)) - 1.0
+    pos_penalty = np.cos(theta)
 
     # COMPONENT 4: Smoother bonus for being close to upright position
+    arm_center = np.exp(-5.0 * theta ** 2)
     upright_closeness = np.exp(-10.0 * alpha_norm ** 2)
     stability_factor = np.exp(-0.1 * alpha_dot ** 2)
-    bonus = 3.0 * upright_closeness * stability_factor
+    bonus = 3.0 * upright_closeness * stability_factor * arm_center
 
     # COMPONENT 4.5: Smoother cost for being close to downright position
     # For new convention, downright is at π
