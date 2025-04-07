@@ -37,7 +37,7 @@ base_JL = 0.0000235  # Pendulum inertia about pivot (kg·m²)
 base_k = 0.002  # Torsional spring constant (N·m/rad)
 
 # ====== Hyperparameters ======
-batch_size = 256 * 8  # Batch size for training
+batch_size = 256 * 32  # Batch size for training
 
 
 # ====== Helper Functions ======
