@@ -1024,7 +1024,8 @@ def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hid
 
 # ====== Visualization Helper ======
 def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward,
-                          max_voltage=base_max_voltage, rewards_history=None):
+                          max_voltage=base_max_voltage, rewards_history=None, is_eval=False,
+                          save_path=None):
     """Plot the pendulum state evolution for a training episode."""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
@@ -1140,7 +1141,11 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
     plt.tight_layout()
-    plt.savefig(f"training_episode_{episode + 1}.png")
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.savefig(f"{'eval' if is_eval else 'training'}_episode_{episode + 1}.png")
+
     plt.close()
 
 
