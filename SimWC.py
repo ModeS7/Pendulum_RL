@@ -449,7 +449,7 @@ def main():
     # Add legend and labels
     plt.xlabel('Time (s)')
     plt.ylabel('Controller Mode')
-    plt.yticks([0.25, 0.5, 0.75], ['Emergency', 'Bang-Bang', 'LQR/Energy'])
+    plt.yticks([])
     plt.legend(title='Controller Modes', loc='upper right')
     plt.grid(True)
 
