@@ -36,9 +36,6 @@ base_JA = 0.0000572 + 0.00006  # Arm inertia about pivot (kg·m²)
 base_JL = 0.0000235  # Pendulum inertia about pivot (kg·m²)
 base_k = 0.002  # Torsional spring constant (N·m/rad)
 
-# ====== Hyperparameters ======
-batch_size = 256 * 8  # Batch size for training
-
 
 # ====== Helper Functions ======
 @nb.njit(fastmath=True, cache=True)
@@ -387,7 +384,7 @@ class PendulumEnv:
         """Take a step in the environment with the given action."""
         # Convert normalized action [-1, 1] to voltage using current max_voltage
         max_voltage = self.params['max_voltage']
-        voltage = float(action) * max_voltage
+        voltage = float(action[0]) * max_voltage
 
         # Store the voltage for reward calculation
         self.last_voltage = voltage
@@ -632,7 +629,7 @@ class SACAgent:
             tau=0.005,
             alpha=0.2,
             automatic_entropy_tuning=True,
-            max_episodes=1000  # Added for LR scheduler
+            max_episodes=1000
     ):
         self.gamma = gamma
         self.tau = tau
@@ -954,7 +951,7 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 1000 and episode > 50:
+        if avg_reward > 10000 and episode > 500:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
@@ -1368,35 +1365,26 @@ if __name__ == "__main__":
     print("Inverted Pendulum Control with Soft Actor-Critic")
     print("=" * 60)
 
-    # Choose one training configuration
-
-    # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
+        # actor_path="actor_final_1743528264.pth",
+        # critic_path="critic_final_1743528264.pth",
         variable_dt=True,
-        # param_variation=0.1,
-        fixed_params=True,
-        # voltage_range=(2.0, 18.0),
+        param_variation=0.2,
+        # fixed_params=True,
+        voltage_range=(4.0, 18.0),
         max_episodes=1000,
         eval_interval=10
     )
 
-    # Option 2: Continue training from pre-trained model
-    """agent = train(
-        actor_path="actor_final_1743528264.pth",
-        critic_path="critic_final_1743528264.pth",
-        variable_dt=True,
-        param_variation=0.25,
-        #voltage_range=(2.0, 18.0),
-        max_episodes=300,
-        eval_interval=10
-    )"""
-
     # Evaluate trained agent with different parameter variations
     print("\n--- Standard Evaluation ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.15)
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.0)
 
     print("\n--- Robustness Test (High Variation) ---")
     evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.25)
+
+    print("\n--- Robustness Test (High Variation) ---")
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.35)
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")
