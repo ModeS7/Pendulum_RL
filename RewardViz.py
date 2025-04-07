@@ -44,16 +44,16 @@ def compute_reward(state, voltage_change=0.0, params=None):
     pos_penalty = np.cos(theta)
 
     # COMPONENT 4: Smoother bonus for being close to upright position
-    arm_center = np.exp(-5.0 * theta ** 2)
+    arm_center = np.exp(-1.0 * theta ** 2)
     upright_closeness = np.exp(-10.0 * alpha_norm ** 2)
-    stability_factor = np.exp(-0.1 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.6 * alpha_dot ** 2)
     bonus = 3.0 * upright_closeness * stability_factor * arm_center
 
     # COMPONENT 4.5: Smoother cost for being close to downright position
     # For new convention, downright is at π
     downright_alpha = normalize_angle(alpha - np.pi)
     downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-    stability_factor = np.exp(-0.1 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.6 * alpha_dot ** 2)
     bonus += -3.0 * downright_closeness * stability_factor
 
     # COMPONENT 5: Smoother penalty for approaching limits
@@ -685,12 +685,12 @@ class RewardExplorerGUI:
 
         # Create the plot
         ax.plot(alpha_values, upright_rewards, label='Upright Reward')
-        ax.plot(alpha_values, velocity_penalties, label='Velocity Penalty')
-        ax.plot(alpha_values, pos_penalties, label='Position Penalty')
+        #ax.plot(alpha_values, velocity_penalties, label='Velocity Penalty')
+        #ax.plot(alpha_values, pos_penalties, label='Position Penalty')
         ax.plot(alpha_values, bonuses, label='Upright Bonus')
-        ax.plot(alpha_values, limit_penalties, label='Limit Penalty')
+        #ax.plot(alpha_values, limit_penalties, label='Limit Penalty')
         ax.plot(alpha_values, energy_rewards, label='Energy Reward')
-        ax.plot(alpha_values, voltage_penalties, label='Voltage Change')
+        #ax.plot(alpha_values, voltage_penalties, label='Voltage Change')
         ax.plot(alpha_values, total_rewards, 'k--', linewidth=2, label='Total Reward')
 
         # Annotate key positions
@@ -801,7 +801,7 @@ class RewardExplorerGUI:
 
         # Add text annotations for key positions - in 3D space
         ax.text(-np.pi, 0, np.min(rewards), "Down Position (α=-π)", color='red')
-        ax.text(0, 0, np.min(rewards), "Up Position (α=0)", color='green')
+        ax.text(0, 0, np.max(rewards), "Up Position (α=0)", color='green')
         ax.text(np.pi, 0, np.min(rewards), "Down Position (α=π)", color='red')
 
         # Update the figure
@@ -818,7 +818,7 @@ class RewardExplorerGUI:
         self.component_fig.clear()
 
         # Create a grid of subplots
-        axs = self.component_fig.subplots(2, 4)
+        axs = self.component_fig.subplots(2, 2)
         axs = axs.flatten()
 
         # Create meshgrid for alpha and alpha_dot - UPDATED RANGE
@@ -834,12 +834,12 @@ class RewardExplorerGUI:
         # Component names and titles
         components = [
             "Upright Reward",
-            "Velocity Penalty",
-            "Position Penalty",
+        #    "Velocity Penalty",
+        #    "Position Penalty",
             "Upright Bonus",
-            "Limit Penalty",
+        #    "Limit Penalty",
             "Energy Reward",
-            "Voltage Change"
+        #    "Voltage Change"
         ]
 
         # Compute and plot each component
@@ -863,15 +863,15 @@ class RewardExplorerGUI:
                 total_rewards[i, j], _ = compute_reward(state, 0.0, self.params)
 
         # Plot total reward
-        im = axs[7].contourf(alpha_grid, alpha_dot_grid, total_rewards, 50, cmap='coolwarm')
-        axs[7].set_title('Total Reward')
-        axs[7].set_xlabel('Alpha')
-        axs[7].set_ylabel('Alpha Dot')
-        axs[7].axvline(x=0, color='w', linestyle='--', alpha=0.3, label='Up')
-        axs[7].axvline(x=np.pi, color='k', linestyle='--', alpha=0.3, label='Down')
-        axs[7].axvline(x=-np.pi, color='k', linestyle='--', alpha=0.3)
-        axs[7].axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        self.component_fig.colorbar(im, ax=axs[7])
+        im = axs[3].contourf(alpha_grid, alpha_dot_grid, total_rewards, 50, cmap='coolwarm')
+        axs[3].set_title('Total Reward')
+        axs[3].set_xlabel('Alpha')
+        axs[3].set_ylabel('Alpha Dot')
+        axs[3].axvline(x=0, color='w', linestyle='--', alpha=0.3, label='Up')
+        axs[3].axvline(x=np.pi, color='k', linestyle='--', alpha=0.3, label='Down')
+        axs[3].axvline(x=-np.pi, color='k', linestyle='--', alpha=0.3)
+        axs[3].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        self.component_fig.colorbar(im, ax=axs[3])
 
         # Update the figure
         self.component_fig.tight_layout()
