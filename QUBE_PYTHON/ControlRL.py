@@ -1,20 +1,23 @@
 import tkinter as tk
-from tkinter import Button, Label, Frame, Scale, Entry, filedialog
+from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox
 from QUBE import QUBE
 import time
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributions import Normal
 import os
 
 # Update with your COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 
-# Actor Network - same architecture as in training script
-class Actor(nn.Module):
+# Actor Networks - supporting both original and modern versions
+class ActorReLU(nn.Module):
+    """Original policy network that outputs action distribution with ReLU activation."""
+
     def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(Actor, self).__init__()
+        super(ActorReLU, self).__init__()
 
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -27,6 +30,9 @@ class Actor(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
+        # Identify model type
+        self.model_type = "relu"
+
     def forward(self, state):
         features = self.network(state)
 
@@ -38,6 +44,59 @@ class Actor(nn.Module):
         action_log_std = torch.clamp(action_log_std, -20, 2)
 
         return action_mean, action_log_std
+
+
+class ActorSiLU(nn.Module):
+    """Modern policy network that outputs action distribution with SiLU activation."""
+
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(ActorSiLU, self).__init__()
+
+        # Improved network with SiLU activation
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Mean and log std for continuous action
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+
+        # Identify model type
+        self.model_type = "silu"
+
+    def forward(self, state):
+        """Forward pass to get action mean and log std."""
+        features = self.network(state)
+
+        # Get mean and constrain it to [-1, 1]
+        action_mean = torch.tanh(self.mean(features))
+
+        # Get log standard deviation and clamp it
+        action_log_std = self.log_std(features)
+        action_log_std = torch.clamp(action_log_std, -20, 2)
+
+        return action_mean, action_log_std
+
+    def sample(self, state):
+        """Sample action from the distribution and compute log probability."""
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+
+        # Sample from normal distribution with reparameterization trick
+        normal = Normal(mean, std)
+        x = normal.rsample()
+
+        # Constrain to [-1, 1]
+        action = torch.tanh(x)
+
+        # Calculate log probability with squashing correction
+        log_prob = normal.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+
+        return action, log_prob
 
 
 # Helper functions
@@ -62,11 +121,11 @@ class QUBEControllerWithRL:
         self.rl_mode = False
         self.moving_to_position = False
         self.rl_model = None
-        self.max_voltage = 10.0  # Use full voltage range as in training
-        self.rl_scaling_factor = 4.0  # Default scaling factor, now adjustable
+        self.system_max_voltage = 18.0  # Increased maximum hardware voltage to 18.0V
+        self.max_voltage = 5.0  # Default max voltage for RL control (replaces scaling factor)
 
         # Performance optimization settings
-        self.target_frequency = 200  # Target control frequency in Hz (was ~60Hz with sleep)
+        self.target_frequency = 1000  # Increased target control frequency to 1000 Hz (max)
         self.ui_update_interval = 5  # Update UI every N iterations (was every iteration)
         self.ui_counter = 0
         self.last_loop_time = time.time()
@@ -86,7 +145,14 @@ class QUBEControllerWithRL:
         """Initialize the RL model architecture"""
         state_dim = 6  # Our observation space (same as in training)
         action_dim = 1  # Motor voltage (normalized)
-        self.actor = Actor(state_dim, action_dim)
+
+        # Initialize both model types
+        self.actor_relu = ActorReLU(state_dim, action_dim)
+        self.actor_silu = ActorSiLU(state_dim, action_dim)
+
+        # Default to the original ReLU model initially
+        self.actor = self.actor_relu
+        self.model_type = "relu"
 
         # Set device (CPU or GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,10 +169,60 @@ class QUBEControllerWithRL:
 
         if filename:
             try:
-                # Load the model
-                self.actor.load_state_dict(torch.load(filename, map_location=self.device))
+                # Load the model state dict
+                state_dict = torch.load(filename, map_location=self.device)
+
+                # Try to determine model type automatically
+                # First attempt: Try loading into both models and check which one works
+                try_relu = True
+                try_silu = True
+
+                # Try loading into ReLU model
+                try:
+                    self.actor_relu.load_state_dict(state_dict)
+                    self.actor_relu.to(self.device)
+                    self.actor_relu.eval()
+                except Exception:
+                    try_relu = False
+
+                # Try loading into SiLU model
+                try:
+                    self.actor_silu.load_state_dict(state_dict)
+                    self.actor_silu.to(self.device)
+                    self.actor_silu.eval()
+                except Exception:
+                    try_silu = False
+
+                # Decide which model to use based on auto-detection
+                if try_relu and try_silu:
+                    # If both succeed, show dialog to select
+                    model_choice = messagebox.askquestion(
+                        "Model Type",
+                        "Model can load with either architecture. Use SiLU model (newer, recommended)? Select 'No' for ReLU model."
+                    )
+                    if model_choice == 'yes':
+                        self.actor = self.actor_silu
+                        self.model_type = "silu"
+                    else:
+                        self.actor = self.actor_relu
+                        self.model_type = "relu"
+                elif try_relu:
+                    self.actor = self.actor_relu
+                    self.model_type = "relu"
+                elif try_silu:
+                    self.actor = self.actor_silu
+                    self.model_type = "silu"
+                else:
+                    raise ValueError("Model is not compatible with either architecture")
+
+                # Confirm model loaded
+                model_type_str = "SiLU" if self.model_type == "silu" else "ReLU"
                 self.status_label.config(text=f"Model loaded: {os.path.basename(filename)}")
                 self.rl_model = filename
+
+                # Update model type displays
+                self.model_type_label.config(text=f"Model Type: {model_type_str}")
+                self.architecture_label.config(text=f"Using {model_type_str} activation network")
 
                 # Enable RL control button
                 self.rl_control_btn.config(state=tk.NORMAL)
@@ -118,6 +234,7 @@ class QUBEControllerWithRL:
 
             except Exception as e:
                 self.status_label.config(text=f"Error loading model: {str(e)}")
+                messagebox.showerror("Load Error", f"Could not load model: {str(e)}")
 
     def create_gui(self):
         # Main control frame
@@ -144,22 +261,26 @@ class QUBEControllerWithRL:
                                      width=15, state=tk.DISABLED)
         self.rl_control_btn.grid(row=0, column=1, padx=5)
 
-        # ADD RL SCALING FACTOR SLIDER
-        rl_scaling_frame = Frame(control_frame)
-        rl_scaling_frame.grid(row=2, column=0, pady=5)
+        # Model Type Indicator (added to show current model type)
+        self.model_type_label = Label(rl_frame, text="Model Type: Not Loaded", width=20)
+        self.model_type_label.grid(row=0, column=2, padx=5)
 
-        self.rl_scaling_slider = Scale(
-            rl_scaling_frame,
-            from_=1.0,
-            to=10.0,
+        # CHANGED: Replace RL scaling factor slider with max voltage slider
+        max_voltage_frame = Frame(control_frame)
+        max_voltage_frame.grid(row=2, column=0, pady=5)
+
+        self.max_voltage_slider = Scale(
+            max_voltage_frame,
+            from_=0.5,
+            to=self.system_max_voltage,  # Now goes up to 18V
             orient=tk.HORIZONTAL,
-            label="RL Voltage Scaling Factor",
+            label="RL Max Voltage",
             length=300,
             resolution=0.1,
-            command=self.set_rl_scaling_factor
+            command=self.set_max_voltage
         )
-        self.rl_scaling_slider.set(self.rl_scaling_factor)  # Default to 4.0
-        self.rl_scaling_slider.pack(padx=5)
+        self.max_voltage_slider.set(self.max_voltage)  # Start with default value
+        self.max_voltage_slider.pack(padx=5)
 
         # Move to position input and button
         position_frame = Frame(control_frame)
@@ -184,8 +305,8 @@ class QUBEControllerWithRL:
         # Manual voltage control
         self.voltage_slider = Scale(
             control_frame,
-            from_=-self.max_voltage,
-            to=self.max_voltage,
+            from_=-self.system_max_voltage,
+            to=self.system_max_voltage,
             orient=tk.HORIZONTAL,
             label="Manual Voltage",
             length=400,
@@ -203,7 +324,7 @@ class QUBEControllerWithRL:
         self.freq_slider = Scale(
             perf_frame,
             from_=60,
-            to=500,
+            to=1000,  # Increased maximum frequency to 1000 Hz
             orient=tk.HORIZONTAL,
             label="Target Control Frequency (Hz)",
             length=300,
@@ -239,6 +360,10 @@ class QUBEControllerWithRL:
         self.model_label = Label(status_frame, text="No model loaded", width=40)
         self.model_label.grid(row=1, column=1, sticky=tk.W)
 
+        Label(status_frame, text="Architecture:").grid(row=2, column=0, sticky=tk.W)
+        self.architecture_label = Label(status_frame, text="Not loaded", width=40)
+        self.architecture_label.grid(row=2, column=1, sticky=tk.W)
+
         Label(status_frame, text="Motor Angle:").grid(row=2, column=0, sticky=tk.W)
         self.angle_label = Label(status_frame, text="0.0°")
         self.angle_label.grid(row=2, column=1, sticky=tk.W)
@@ -255,10 +380,10 @@ class QUBEControllerWithRL:
         self.voltage_label = Label(status_frame, text="0.0 V")
         self.voltage_label.grid(row=5, column=1, sticky=tk.W)
 
-        # Add scaling factor display
-        Label(status_frame, text="RL Scaling Factor:").grid(row=6, column=0, sticky=tk.W)
-        self.scaling_label = Label(status_frame, text=f"{self.rl_scaling_factor:.1f}")
-        self.scaling_label.grid(row=6, column=1, sticky=tk.W)
+        # CHANGED: Update label from scaling factor to max voltage
+        Label(status_frame, text="RL Max Voltage:").grid(row=6, column=0, sticky=tk.W)
+        self.max_voltage_label = Label(status_frame, text=f"{self.max_voltage:.1f} V")
+        self.max_voltage_label.grid(row=6, column=1, sticky=tk.W)
 
         # Add actual frequency display
         Label(status_frame, text="Control Frequency:").grid(row=7, column=0, sticky=tk.W)
@@ -286,10 +411,11 @@ class QUBEControllerWithRL:
         """Set UI update interval from slider"""
         self.ui_update_interval = int(value)
 
-    def set_rl_scaling_factor(self, value):
-        """Set the RL scaling factor from slider"""
-        self.rl_scaling_factor = float(value)
-        self.scaling_label.config(text=f"{self.rl_scaling_factor:.1f}")
+    # CHANGED: Replaced RL scaling factor setter with max voltage setter
+    def set_max_voltage(self, value):
+        """Set the maximum voltage for RL control from slider"""
+        self.max_voltage = float(value)
+        self.max_voltage_label.config(text=f"{self.max_voltage:.1f} V")
 
     def set_manual_voltage(self, value):
         """Set manual voltage from slider"""
@@ -420,10 +546,10 @@ class QUBEControllerWithRL:
         self.motor_voltage = kp * position_error
 
         # Limit voltage for safety
-        self.motor_voltage = max(-self.max_voltage, min(self.max_voltage, self.motor_voltage))
+        self.motor_voltage = max(-self.system_max_voltage, min(self.system_max_voltage, self.motor_voltage))
 
-    def update_rl_control(self):
-        """Update RL control logic - let the model handle everything from the start"""
+    def get_observation(self):
+        """Get the current observation vector (shared between ReLU and SiLU models)"""
         # Get current state
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
@@ -466,14 +592,22 @@ class QUBEControllerWithRL:
             pendulum_velocity / 10.0
         ])
 
+        # Return both the observation and pendulum angle for status updates
+        return obs, pendulum_angle_norm
+
+    def update_rl_control(self):
+        """Update RL control logic using ReLU model"""
+        # Get current state
+        obs, pendulum_angle_norm = self.get_observation()
+
         # Get action from RL model
         with torch.no_grad():
             state_tensor = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
             action_mean, _ = self.actor(state_tensor)
             action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
 
-        # Convert normalized action [-1, 1] to voltage using adjustable scaling factor
-        self.motor_voltage = float(action) * self.max_voltage / self.rl_scaling_factor
+        # Apply max_voltage directly
+        self.motor_voltage = float(action) * self.max_voltage
 
         # Update status - but only during UI updates
         if self.ui_counter == 0:
@@ -482,6 +616,37 @@ class QUBEControllerWithRL:
                 self.status_label.config(text=f"RL control active - Near balance ({upright_angle:.1f}° from upright)")
             else:
                 self.status_label.config(text=f"RL control active - Swinging ({upright_angle:.1f}° from upright)")
+
+    def update_rl_control_silu(self):
+        """Update RL control logic using SiLU model with sampling if available"""
+        # Get current state
+        obs, pendulum_angle_norm = self.get_observation()
+
+        # Get action from RL model - using sample method if available
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
+
+            # Try using the sample method if available (for exploration)
+            try:
+                action, _ = self.actor.sample(state_tensor)
+                action = action.cpu().numpy()[0][0]  # Get action as scalar
+            except (AttributeError, NotImplementedError):
+                # Fall back to standard forward if sample is not implemented
+                action_mean, _ = self.actor(state_tensor)
+                action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
+
+        # Apply max_voltage directly
+        self.motor_voltage = float(action) * self.max_voltage
+
+        # Update status - but only during UI updates
+        if self.ui_counter == 0:
+            upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
+            if upright_angle < 30:
+                self.status_label.config(
+                    text=f"RL control active (SiLU) - Near balance ({upright_angle:.1f}° from upright)")
+            else:
+                self.status_label.config(
+                    text=f"RL control active (SiLU) - Swinging ({upright_angle:.1f}° from upright)")
 
     def stop_motor(self):
         """Stop the motor"""
@@ -524,7 +689,10 @@ class QUBEControllerWithRL:
         elif self.moving_to_position:
             self.update_position_control()
         elif self.rl_mode:
-            self.update_rl_control()
+            if self.model_type == "silu":
+                self.update_rl_control_silu()  # Use SiLU-specific control if applicable
+            else:
+                self.update_rl_control()
 
         # Apply the current motor voltage - THIS IS CRITICAL TO DO ON EVERY LOOP!
         self.qube.setMotorVoltage(self.motor_voltage)
@@ -564,7 +732,7 @@ class QUBEControllerWithRL:
 def main():
     print("Starting QUBE Controller with RL...")
     print("Will set corner position as zero")
-    print("OPTIMIZED VERSION - Reduced UI updates, dynamic timing")
+    print("OPTIMIZED VERSION - High-frequency control, extended voltage range")
 
     try:
         # Initialize QUBE
@@ -580,6 +748,11 @@ def main():
         # Create GUI
         root = tk.Tk()
         app = QUBEControllerWithRL(root, qube)
+
+        # Set initial high-performance values
+        app.freq_slider.set(500)  # Set to max frequency
+        app.max_voltage_slider.set(4.0)  # Set to 18V
+        app.set_max_voltage(4.0)  # Update the internal value
 
         # For frequency calculation
         target_period = 1.0 / app.target_frequency
