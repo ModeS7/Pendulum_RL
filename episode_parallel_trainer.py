@@ -3,266 +3,85 @@ import numpy as np
 import torch
 import os
 import json
+import pickle
 from copy import deepcopy
 from time import time
 import matplotlib.pyplot as plt
+import tempfile
 
-
+# Import your pendulum code
 from SimRL import PendulumEnv, SACAgent, ReplayBuffer, plot_training_episode, normalize_angle
 
 
-class EpisodeParallelTrainer:
+def worker_training_job(worker_id, param_file, result_file, episode_num):
     """
-    Manages parallel training at the episode level with evolutionary hyperparameter selection.
+    This function will be run in a separate process.
+    It doesn't receive any PyTorch tensors directly.
 
-    In this implementation, we maintain a single network architecture for all workers,
-    but train them with different hyperparameters in parallel for each episode.
-    After each episode, we select the best-performing hyperparameters to carry forward.
+    Args:
+        worker_id: ID of this worker
+        param_file: File path containing parameters
+        result_file: File path to write results
+        episode_num: Current episode number
     """
+    try:
+        # Load parameters from file
+        with open(param_file, 'rb') as f:
+            params = pickle.load(f)
 
-    def __init__(
-            self,
-            num_workers=3,
-            max_episodes=500,
-            hidden_dim=256,
-            state_dim=6,
-            action_dim=1,
-            output_dir="episode_parallel_results"
-    ):
-        """
-        Initialize the episode-level parallel trainer.
+        hyperparams = params['hyperparams']
+        env_params = params['env_params']
+        base_model_path = params['base_model_path']
+        replay_buffer_path = params.get('replay_buffer_path')
+        hidden_dim = params['hidden_dim']
+        state_dim = params['state_dim']
+        action_dim = params['action_dim']
 
-        Args:
-            num_workers: Number of parallel processes for each episode
-            max_episodes: Total number of episodes to train
-            hidden_dim: Fixed hidden dimension size for all networks
-            state_dim: State dimension
-            action_dim: Action dimension
-            output_dir: Directory to save results
-        """
-        self.num_workers = num_workers
-        self.max_episodes = max_episodes
-        self.hidden_dim = hidden_dim
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
 
-        # Create output directory
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        # Set the seed for reproducibility
+        seed = hyperparams.get('seed', 42)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        # Tracking the best hyperparameters
-        self.best_hyperparams = None
-        self.best_reward = -float('inf')
+        # Create environment
+        env = PendulumEnv(**env_params)
 
-        # Base agent with consistent architecture - we'll clone this for each worker
-        # but with different hyperparameters
-        self.base_agent = None
-
-        # Results tracking
-        self.episode_results = []
-
-        # Replay buffer - shared across episodes for continuity
-        self.replay_buffer = None
-
-        # Environment parameters - will change each episode
-        self.current_env_params = None
-
-        # Ensure reproducibility
-        self.base_seed = 42
-
-    def initialize_base_agent(self):
-        """Initialize the base agent with consistent architecture."""
-        # Create agent with default hyperparameters - we'll modify these for workers
-        self.base_agent = SACAgent(
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            hidden_dim=self.hidden_dim,
-            max_episodes=self.max_episodes
+        # Create a new agent
+        agent = SACAgent(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            lr=hyperparams.get('lr', 3e-4),
+            gamma=hyperparams.get('gamma', 0.99),
+            tau=hyperparams.get('tau', 0.005),
+            alpha=hyperparams.get('alpha', 0.2),
+            automatic_entropy_tuning=hyperparams.get('automatic_entropy_tuning', True),
+            max_episodes=1000
         )
 
-        # Initialize replay buffer
-        self.replay_buffer = ReplayBuffer(100000)
+        # Load base model if available
+        if base_model_path and os.path.exists(base_model_path):
+            agent.actor.load_state_dict(torch.load(base_model_path, map_location='cpu'))
 
-        return self.base_agent
-
-    def generate_hyperparameters(self, include_best=False):
-        """
-        Generate a list of hyperparameter sets for the episode.
-        If include_best is True and we have best_hyperparams, include it as the first set.
-        """
-        hyperparams_list = []
-
-        # Include the best hyperparameters from previous episode if available
-        if include_best and self.best_hyperparams is not None:
-            hyperparams_list.append(deepcopy(self.best_hyperparams))
-
-        # Generate random hyperparameters for the remaining workers
-        remaining = self.num_workers - len(hyperparams_list)
-        for i in range(remaining):
-            # Generate random hyperparameters with reasonable ranges
-            # Note: hidden_dim is NOT included since all workers use the same architecture
-            params = {
-                # Learning rates (log scale between 1e-4 and 5e-3)
-                'lr': 10 ** np.random.uniform(-4, -2.3),
-
-                # RL algorithm parameters
-                'gamma': np.random.uniform(0.97, 0.995),  # Discount factor
-                'tau': np.random.uniform(0.001, 0.01),  # Soft update rate
-
-                # Entropy settings
-                'automatic_entropy_tuning': bool(np.random.choice([True, False], p=[0.8, 0.2])),
-                'alpha': np.random.uniform(0.05, 0.3),
-
-                # Updates per step
-                'updates_per_step': np.random.choice([1, 2, 3]),
-            }
-
-            # Add a unique seed for reproducibility
-            params['seed'] = self.base_seed + i + 1
-
-            hyperparams_list.append(params)
-
-        return hyperparams_list
-
-    def generate_environment_params(self):
-        """Generate random environment parameters for this episode."""
-        params = {
-            'variable_dt': True,  # Always use variable time steps
-            'param_variation': 0.2,  # Random parameter variation
-            'fixed_params': False,  # Always vary parameters between episodes
-            # Random voltage range (higher upper bound = harder problem)
-            'voltage_range': (4.0, 18.0)
-        }
-
-        self.current_env_params = params
-        return params
-
-    def worker_process(self, worker_id, base_state_dict, hyperparam_queue, result_queue, episode_num):
-        """
-        Worker process function that trains an agent for one episode.
-
-        Args:
-            worker_id: ID of this worker
-            base_state_dict: State dict of the base agent to clone (with detached tensors)
-            hyperparam_queue: Queue to receive hyperparameters
-            result_queue: Queue to send results back
-            episode_num: Current episode number
-        """
-        try:
-            # Get hyperparameters and environment params from queue
-            hyperparams, env_params, replay_buffer_data = hyperparam_queue.get()
-
-            print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
-
-            # Set the seed for reproducibility
-            torch.manual_seed(hyperparams.get('seed', 42))
-            np.random.seed(hyperparams.get('seed', 42))
-
-            # Create environment with the given parameters
-            env = PendulumEnv(**env_params)
-
-            # Create a new agent with the specified hyperparameters but same architecture
-            agent = SACAgent(
-                state_dim=self.state_dim,
-                action_dim=self.action_dim,
-                hidden_dim=self.hidden_dim,  # Same hidden dim for all workers
-                lr=hyperparams.get('lr', 3e-4),
-                gamma=hyperparams.get('gamma', 0.99),
-                tau=hyperparams.get('tau', 0.005),
-                alpha=hyperparams.get('alpha', 0.2),
-                automatic_entropy_tuning=hyperparams.get('automatic_entropy_tuning', True),
-                max_episodes=self.max_episodes
-            )
-
-            # Load the base agent state dict to ensure architectural consistency
-            agent.actor.load_state_dict(base_state_dict)
-
-            # Reconstruct replay buffer from the data
-            replay_buffer = ReplayBuffer(100000)
-            if replay_buffer_data:
-                for transition in replay_buffer_data:
+        # Reconstruct replay buffer if available
+        replay_buffer = ReplayBuffer(100000)
+        if replay_buffer_path and os.path.exists(replay_buffer_path):
+            try:
+                with open(replay_buffer_path, 'rb') as f:
+                    replay_data = pickle.load(f)
+                for transition in replay_data:
                     replay_buffer.push(*transition)
+            except Exception as e:
+                print(f"Error loading replay buffer: {e}")
 
-            # Train for one episode
-            episode_result = self._train_single_episode(
-                env=env,
-                agent=agent,
-                replay_buffer=replay_buffer,
-                hyperparams=hyperparams,
-                episode_num=episode_num,
-                worker_id=worker_id
-            )
-
-            # Get the agent's state dict and ensure all tensors are detached
-            agent_state_dict = {}
-            for key, tensor in agent.actor.state_dict().items():
-                agent_state_dict[key] = tensor.detach().cpu().clone()
-
-            # Return the results along with the agent state dict
-            result = {
-                'worker_id': worker_id,
-                'episode_num': episode_num,
-                'hyperparams': hyperparams,
-                'env_params': env_params,
-                'reward': episode_result['episode_reward'],
-                'agent_state_dict': agent_state_dict,
-                'replay_buffer_data': self._sample_replay_buffer(replay_buffer, max_samples=5000),
-                'metrics': episode_result
-            }
-
-            result_queue.put(result)
-            print(
-                f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_result['episode_reward']:.2f}")
-
-        except Exception as e:
-            import traceback
-            print(f"Episode {episode_num}, Worker {worker_id} encountered an error: {str(e)}")
-            print(traceback.format_exc())
-
-            # Send error information to the result queue
-            result_queue.put({
-                'worker_id': worker_id,
-                'episode_num': episode_num,
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            })
-
-    def _sample_replay_buffer(self, replay_buffer, max_samples=5000):
-        """Sample experiences from replay buffer to share between workers."""
-        # Return a subset of the replay buffer to avoid excessive serialization
-        if len(replay_buffer) == 0:
-            return []
-
-        indices = np.random.choice(
-            len(replay_buffer),
-            min(max_samples, len(replay_buffer)),
-            replace=False
-        )
-
-        # Create a list of sampled transitions
-        transitions = []
-        for i in indices:
-            transitions.append(replay_buffer.buffer[i])
-
-        return transitions
-
-    def _train_single_episode(self, env, agent, replay_buffer, hyperparams, episode_num, worker_id):
-        """
-        Train an agent for a single episode.
-
-        Args:
-            env: The environment to train in
-            agent: The agent to train
-            replay_buffer: Replay buffer to use
-            hyperparams: Hyperparameters for training
-            episode_num: Current episode number
-            worker_id: Worker ID for logging
-        """
-        # Extract hyperparameters
-        batch_size = 256  # Fixed batch size
+        # Train for one episode
+        batch_size = 256
         updates_per_step = hyperparams.get('updates_per_step', 1)
+        output_dir = f"episode_parallel_results/episode_{episode_num}/worker_{worker_id}"
+        os.makedirs(output_dir, exist_ok=True)
 
-        # Prepare for episode
+        # Run a single episode
         state = env.reset()
         episode_reward = 0
 
@@ -271,12 +90,12 @@ class EpisodeParallelTrainer:
         actor_losses = []
         alpha_values = []
 
-        # Prepare for episode visualization
+        # Store states and actions for visualization
         episode_states = []
         episode_actions = []
         step_rewards = []
 
-        # Episode loop - run for the full number of steps
+        # Episode loop
         for step in range(env.max_steps):
             # Select and perform action
             action = agent.select_action(state)
@@ -305,77 +124,205 @@ class EpisodeParallelTrainer:
             if done:
                 break
 
+        # Plot the episode results
+        plot_path = os.path.join(output_dir, "episode_plot.png")
+        plot_training_episode(
+            episode_num,
+            np.array(episode_states),
+            np.array(episode_actions),
+            env.time_history if env.variable_dt else [env.dt] * len(episode_states),
+            episode_reward,
+            env.params['max_voltage'],
+            step_rewards,
+            save_path=plot_path
+        )
+
         # Calculate average losses
         avg_critic_loss = np.mean(critic_losses) if critic_losses else 0.0
         avg_actor_loss = np.mean(actor_losses) if actor_losses else 0.0
         avg_alpha = np.mean(alpha_values) if alpha_values else 0.0
 
-        # Create plots for visualization
-        if episode_states and len(episode_states) > 0:
-            plot_path = os.path.join(self.output_dir, f"episode_{episode_num}_worker_{worker_id}.png")
-            plot_training_episode(
-                episode_num,
-                np.array(episode_states),
-                np.array(episode_actions),
-                env.time_history if env.variable_dt else [env.dt] * len(episode_states),
-                episode_reward,
-                env.params['max_voltage'],
-                step_rewards,
-                save_path=plot_path
-            )
+        # Save model and sample of replay buffer
+        model_path = os.path.join(output_dir, "actor_model.pth")
+        torch.save(agent.actor.state_dict(), model_path)
 
-        return {
-            'episode_reward': episode_reward,
+        # Sample a subset of replay buffer to save
+        replay_sample = []
+        if len(replay_buffer) > 0:
+            indices = np.random.choice(len(replay_buffer), min(5000, len(replay_buffer)), replace=False)
+            for i in indices:
+                replay_sample.append(replay_buffer.buffer[i])
+
+        replay_path = os.path.join(output_dir, "replay_buffer.pkl")
+        with open(replay_path, 'wb') as f:
+            pickle.dump(replay_sample, f)
+
+        # Prepare results
+        results = {
+            'worker_id': worker_id,
+            'episode_num': episode_num,
+            'hyperparams': hyperparams,
+            'reward': episode_reward,
             'critic_loss': avg_critic_loss,
             'actor_loss': avg_actor_loss,
-            'alpha': avg_alpha,
-            'steps': step + 1,
-            'max_voltage': env.params['max_voltage']
+            'alpha': avg_alpha if isinstance(avg_alpha, float) else float(avg_alpha),
+            'model_path': model_path,
+            'replay_buffer_path': replay_path
         }
 
+        # Save results to file
+        with open(result_file, 'wb') as f:
+            pickle.dump(results, f)
+
+        print(f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}")
+        return True
+
+    except Exception as e:
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(f"Episode {episode_num}, Worker {worker_id} encountered an error: {str(e)}")
+        print(error_traceback)
+
+        # Save error information to result file
+        error_results = {
+            'worker_id': worker_id,
+            'episode_num': episode_num,
+            'error': str(e),
+            'traceback': error_traceback
+        }
+
+        with open(result_file, 'wb') as f:
+            pickle.dump(error_results, f)
+
+        return False
+
+
+class SimpleParallelTrainer:
+    """A simplified parallel trainer that avoids passing tensors between processes."""
+
+    def __init__(
+            self,
+            num_workers=3,
+            max_episodes=500,
+            hidden_dim=256,
+            state_dim=6,
+            action_dim=1,
+            output_dir="episode_parallel_results"
+    ):
+        self.num_workers = num_workers
+        self.max_episodes = max_episodes
+        self.hidden_dim = hidden_dim
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # Create output directory
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Temporary directory for parameter and result files
+        self.temp_dir = os.path.join(output_dir, "temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+        # Tracking the best hyperparameters
+        self.best_hyperparams = None
+        self.best_reward = -float('inf')
+        self.best_model_path = None
+
+        # Results tracking
+        self.episode_results = []
+
+        # Base model path - will be updated as we find better models
+        self.current_model_path = None
+
+        # Current replay buffer path
+        self.current_replay_path = None
+
+        # Ensure reproducibility
+        self.base_seed = 42
+
+    def generate_hyperparameters(self, include_best=False):
+        """Generate hyperparameter sets for workers."""
+        hyperparams_list = []
+
+        # Include the best hyperparameters from previous episode if available
+        if include_best and self.best_hyperparams is not None:
+            hyperparams_list.append(deepcopy(self.best_hyperparams))
+
+        # Generate random hyperparameters for remaining workers
+        remaining = self.num_workers - len(hyperparams_list)
+        for i in range(remaining):
+            params = {
+                'lr': 10 ** np.random.uniform(-4, -2.3),
+                'gamma': np.random.uniform(0.97, 0.995),
+                'tau': np.random.uniform(0.001, 0.01),
+                'automatic_entropy_tuning': bool(np.random.choice([True, False], p=[0.8, 0.2])),
+                'alpha': np.random.uniform(0.05, 0.3),
+                'updates_per_step': np.random.choice([1, 2, 3]),
+                'seed': self.base_seed + i + 1
+            }
+            hyperparams_list.append(params)
+
+        return hyperparams_list
+
+    def generate_environment_params(self):
+        """Generate environment parameters."""
+        params = {
+            'variable_dt': True,
+            'param_variation': 0.2,
+            'fixed_params': False,
+            'voltage_range': (4.0, 18.0)
+        }
+        return params
+
     def run(self):
-        """Run the episode-level parallel training process."""
+        """Run the parallel training process."""
         start_time = time()
 
-        # Initialize the base agent with consistent architecture
-        base_agent = self.initialize_base_agent()
-
-        # Prepare to track rewards
+        # Track rewards
         all_rewards = []
         best_rewards = []
 
         for episode in range(self.max_episodes):
             print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
 
-            # Generate environment parameters for this episode
+            # Generate environment parameters
             env_params = self.generate_environment_params()
             print(f"Environment params: {env_params}")
 
-            # Generate hyperparameters for each worker (include best from previous episode)
+            # Generate hyperparameters for workers
             hyperparams_list = self.generate_hyperparameters(include_best=(episode > 0))
 
-            # Create queues for communication with workers
-            hyperparam_queue = mp.Queue()
-            result_queue = mp.Queue()
+            # Create parameter files and result files for each worker
+            param_files = []
+            result_files = []
+            for worker_id in range(self.num_workers):
+                param_file = os.path.join(self.temp_dir, f"params_ep{episode}_worker{worker_id}.pkl")
+                result_file = os.path.join(self.temp_dir, f"results_ep{episode}_worker{worker_id}.pkl")
 
-            # Sample the replay buffer
-            replay_buffer_sample = self._sample_replay_buffer(self.replay_buffer) if self.replay_buffer else []
+                # Package parameters
+                params = {
+                    'hyperparams': hyperparams_list[worker_id],
+                    'env_params': env_params,
+                    'base_model_path': self.current_model_path,
+                    'replay_buffer_path': self.current_replay_path,
+                    'hidden_dim': self.hidden_dim,
+                    'state_dim': self.state_dim,
+                    'action_dim': self.action_dim
+                }
 
-            # Put hyperparameters, environment params, and sampled replay buffer in queue for each worker
-            for hyperparams in hyperparams_list:
-                hyperparam_queue.put((hyperparams, env_params, replay_buffer_sample))
+                # Save parameters to file
+                with open(param_file, 'wb') as f:
+                    pickle.dump(params, f)
 
-            # Get the base agent's state dict and DETACH all tensors
-            base_state_dict = {}
-            for key, tensor in base_agent.actor.state_dict().items():
-                base_state_dict[key] = tensor.detach().cpu().clone()
+                param_files.append(param_file)
+                result_files.append(result_file)
 
             # Start worker processes
             processes = []
             for worker_id in range(self.num_workers):
                 p = mp.Process(
-                    target=self.worker_process,
-                    args=(worker_id, base_state_dict, hyperparam_queue, result_queue, episode)
+                    target=worker_training_job,
+                    args=(worker_id, param_files[worker_id], result_files[worker_id], episode)
                 )
                 p.start()
                 processes.append(p)
@@ -386,17 +333,21 @@ class EpisodeParallelTrainer:
 
             # Collect results
             episode_results = []
-            for _ in range(self.num_workers):
-                if not result_queue.empty():
-                    result = result_queue.get()
-                    if 'error' not in result:
-                        episode_results.append(result)
-                    else:
-                        print(f"Worker {result['worker_id']} failed with error: {result['error']}")
+            for result_file in result_files:
+                if os.path.exists(result_file):
+                    try:
+                        with open(result_file, 'rb') as f:
+                            result = pickle.load(f)
+                        if 'error' not in result:
+                            episode_results.append(result)
+                        else:
+                            print(f"Worker {result['worker_id']} failed with error: {result['error']}")
+                    except Exception as e:
+                        print(f"Error loading result file {result_file}: {e}")
 
-            # Find the best performer in this episode
+            # Find the best performer
             if episode_results:
-                # Sort by episode reward (higher is better)
+                # Sort by episode reward
                 episode_results.sort(key=lambda x: x['reward'], reverse=True)
                 best_result = episode_results[0]
 
@@ -404,7 +355,7 @@ class EpisodeParallelTrainer:
                 print(f"Episode reward: {best_result['reward']:.2f}")
                 print(f"Hyperparameters: {best_result['hyperparams']}")
 
-                # Track all rewards and best reward
+                # Track rewards
                 episode_rewards = [r['reward'] for r in episode_results]
                 all_rewards.append(episode_rewards)
                 best_rewards.append(best_result['reward'])
@@ -413,27 +364,20 @@ class EpisodeParallelTrainer:
                 if best_result['reward'] > self.best_reward:
                     self.best_reward = best_result['reward']
                     self.best_hyperparams = deepcopy(best_result['hyperparams'])
+                    self.best_model_path = best_result['model_path']
 
-                    # Update the base agent to use the best agent's state dict
-                    base_agent.actor.load_state_dict(best_result['agent_state_dict'])
+                    # Update current model path for next episode
+                    self.current_model_path = best_result['model_path']
+                    self.current_replay_path = best_result['replay_buffer_path']
 
                     print(f"New best performance found! Reward: {self.best_reward:.2f}")
                 else:
                     print(f"No improvement over previous best: {self.best_reward:.2f}")
 
-                # Initialize replay buffer if needed
-                if self.replay_buffer is None:
-                    self.replay_buffer = ReplayBuffer(100000)
-
-                # Get replay buffer data from best performer and add to our buffer
-                if 'replay_buffer_data' in best_result and best_result['replay_buffer_data']:
-                    for transition in best_result['replay_buffer_data']:
-                        self.replay_buffer.push(*transition)
-
-            # Store results for this episode
+            # Store results
             self.episode_results.append(episode_results)
 
-            # Plot progress so far
+            # Plot progress
             self._plot_training_progress(best_rewards, all_rewards, episode)
 
             # Save intermediate state
@@ -449,33 +393,45 @@ class EpisodeParallelTrainer:
         # Save final results
         self.save_results(os.path.join(self.output_dir, "results_final.json"))
 
-        # Final evaluation of the best agent
-        self._final_evaluation(base_agent)
-
-        return base_agent, self.best_hyperparams, self.best_reward
+        # Load the best model for return
+        if self.best_model_path and os.path.exists(self.best_model_path):
+            best_agent = SACAgent(
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                hidden_dim=self.hidden_dim
+            )
+            best_agent.actor.load_state_dict(torch.load(self.best_model_path, map_location='cpu'))
+            self._final_evaluation(best_agent)
+            return best_agent, self.best_hyperparams, self.best_reward
+        else:
+            print("Warning: Best model not found. Returning None.")
+            return None, self.best_hyperparams, self.best_reward
 
     def _plot_training_progress(self, best_rewards, all_rewards, episode):
         """Plot training progress across episodes."""
-        # Plot best rewards over episodes
-        plt.figure(figsize=(12, 8))
+        try:
+            # Plot best rewards over episodes
+            plt.figure(figsize=(12, 8))
 
-        # Plot 1: Best reward for each episode
-        plt.subplot(2, 1, 1)
-        plt.plot(range(1, len(best_rewards) + 1), best_rewards, 'b-', marker='o')
-        plt.ylabel('Best Reward per Episode')
-        plt.title('Training Progress')
-        plt.grid(True)
+            # Plot 1: Best reward for each episode
+            plt.subplot(2, 1, 1)
+            plt.plot(range(1, len(best_rewards) + 1), best_rewards, 'b-', marker='o')
+            plt.ylabel('Best Reward per Episode')
+            plt.title('Training Progress')
+            plt.grid(True)
 
-        # Plot 2: Box plot of rewards for all workers
-        plt.subplot(2, 1, 2)
-        plt.boxplot(all_rewards)
-        plt.xlabel('Episode')
-        plt.ylabel('Worker Rewards')
-        plt.grid(True)
+            # Plot 2: Box plot of rewards for all workers
+            plt.subplot(2, 1, 2)
+            plt.boxplot(all_rewards)
+            plt.xlabel('Episode')
+            plt.ylabel('Worker Rewards')
+            plt.grid(True)
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, f"training_progress_ep{episode + 1}.png"))
-        plt.close()
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, f"training_progress_ep{episode + 1}.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Error plotting training progress: {e}")
 
     def _final_evaluation(self, agent, num_episodes=5):
         """Perform final evaluation of the best agent."""
@@ -602,17 +558,17 @@ class EpisodeParallelTrainer:
             else:
                 return obj
 
-        # Extract relevant results, excluding the actual replay buffer data and state dicts
+        # Extract relevant results, excluding paths to files
         simplified_episode_results = []
         for episode_data in self.episode_results:
             simplified_data = []
             for worker_data in episode_data:
                 worker_data_copy = worker_data.copy()
-                # Remove large binary data
-                if 'agent_state_dict' in worker_data_copy:
-                    worker_data_copy.pop('agent_state_dict')
-                if 'replay_buffer_data' in worker_data_copy:
-                    worker_data_copy.pop('replay_buffer_data')
+                # Remove file paths
+                if 'model_path' in worker_data_copy:
+                    worker_data_copy['model_path'] = os.path.basename(worker_data_copy['model_path'])
+                if 'replay_buffer_path' in worker_data_copy:
+                    worker_data_copy['replay_buffer_path'] = os.path.basename(worker_data_copy['replay_buffer_path'])
                 simplified_data.append(worker_data_copy)
             simplified_episode_results.append(simplified_data)
 
@@ -622,6 +578,7 @@ class EpisodeParallelTrainer:
             'hidden_dim': self.hidden_dim,
             'num_workers': self.num_workers,
             'max_episodes': self.max_episodes,
+            'best_model_path': os.path.basename(self.best_model_path) if self.best_model_path else None,
             'episode_results': convert_to_serializable(simplified_episode_results)
         }
 

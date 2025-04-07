@@ -6,7 +6,8 @@ import numpy as np
 from time import time
 
 
-from episode_parallel_trainer import EpisodeParallelTrainer
+from episode_parallel_trainer import SimpleParallelTrainer
+
 
 if __name__ == "__main__":
     # Set up argument parser for command line options
@@ -39,8 +40,8 @@ if __name__ == "__main__":
     # Start measuring total time
     start_time = time()
 
-    # Initialize and run the episode-level parallel trainer
-    trainer = EpisodeParallelTrainer(
+    # Initialize and run the simplified parallel trainer
+    trainer = SimpleParallelTrainer(
         num_workers=args.workers,
         max_episodes=args.episodes,
         hidden_dim=args.hidden_dim,
