@@ -8,6 +8,7 @@ from tqdm import tqdm
 import numba as nb
 from time import time
 from numpy.ma.core import arctan2
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
@@ -386,7 +387,7 @@ class PendulumEnv:
         """Take a step in the environment with the given action."""
         # Convert normalized action [-1, 1] to voltage using current max_voltage
         max_voltage = self.params['max_voltage']
-        voltage = float(action) * max_voltage
+        voltage = float(action[0]) * max_voltage
 
         # Store the voltage for reward calculation
         self.last_voltage = voltage
@@ -878,10 +879,11 @@ def train(
 
         # Periodic reporting and visualization
         if (episode + 1) % eval_interval == 0 or episode <= 1:
+            training_time = time() - start_time
             print(
                 f"Episode {episode + 1}/{max_episodes} | Reward: {episode_reward:.2f} | "
-                f"Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.4f} | "
-                f"A_Loss: {avg_actor_loss:.4f} | Alpha: {avg_alpha:.4f}"
+                f"Avg Reward: {avg_reward:.2f} | C_Loss: {avg_critic_loss:.3f} | "
+                f"A_Loss: {avg_actor_loss:.3f} | Alpha: {avg_alpha:.3f} | Time: {training_time:.1f}s"
             )
 
             # Print sample parameter values
@@ -1345,7 +1347,7 @@ if __name__ == "__main__":
     # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
         variable_dt=True,
-        param_variation=0.15,
+        param_variation=0.0,
         # voltage_range=(2.0, 18.0),
         max_episodes=1000,
         eval_interval=10
