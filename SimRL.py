@@ -894,7 +894,7 @@ def train(
 
         # Log progress
         episode_rewards.append(episode_reward)
-        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
         avg_rewards.append(avg_reward)
 
         # Calculate average losses for reporting

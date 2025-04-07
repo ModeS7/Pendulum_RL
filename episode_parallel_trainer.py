@@ -8,6 +8,7 @@ from copy import deepcopy
 from time import time
 import matplotlib.pyplot as plt
 import tempfile
+from datetime import datetime, timedelta
 
 # Import your pendulum code
 from SimRL import PendulumEnv, SACAgent, ReplayBuffer, plot_training_episode, normalize_angle
@@ -95,6 +96,9 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         episode_actions = []
         step_rewards = []
 
+        # Start timing the episode
+        episode_start_time = time()
+
         # Episode loop
         for step in range(env.max_steps):
             # Select and perform action
@@ -123,6 +127,9 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
 
             if done:
                 break
+
+        # Calculate episode duration
+        episode_duration = time() - episode_start_time
 
         # Plot the episode results
         plot_path = os.path.join(output_dir, "episode_plot.png")
@@ -157,24 +164,50 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         with open(replay_path, 'wb') as f:
             pickle.dump(replay_sample, f)
 
+        # Calculate balanced time metric
+        balanced_time = 0.0
+        if len(episode_states) > 0:
+            states_array = np.array(episode_states)
+            alphas = states_array[:, 1]  # theta_1 (pendulum angle)
+            alpha_normalized = np.array([normalize_angle(a + np.pi) for a in alphas])
+            upright_threshold = 0.17  # about 10 degrees
+
+            for i in range(len(alpha_normalized)):
+                if abs(alpha_normalized[i]) < upright_threshold:
+                    dt_value = env.time_history[i] if env.variable_dt and i < len(env.time_history) else env.dt
+                    balanced_time += dt_value
+
+        # Get current environment parameters
+        current_params = env.get_current_parameters()
+
         # Prepare results
         results = {
             'worker_id': worker_id,
             'episode_num': episode_num,
             'hyperparams': hyperparams,
             'reward': episode_reward,
+            'balanced_time': balanced_time,
             'critic_loss': avg_critic_loss,
             'actor_loss': avg_actor_loss,
             'alpha': avg_alpha if isinstance(avg_alpha, float) else float(avg_alpha),
             'model_path': model_path,
-            'replay_buffer_path': replay_path
+            'replay_buffer_path': replay_path,
+            'episode_duration': episode_duration,
+            'env_params': current_params,
+            'episode_length': len(episode_states),
+            'plot_path': plot_path,
+            'episode_states': np.array(episode_states) if len(episode_states) < 500 else None,
+            # Only store if not too large
+            'episode_actions': np.array(episode_actions) if len(episode_actions) < 500 else None,
+            'step_rewards': step_rewards if len(step_rewards) < 500 else None
         }
 
         # Save results to file
         with open(result_file, 'wb') as f:
             pickle.dump(results, f)
 
-        print(f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}")
+        print(
+            f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}, Balanced: {balanced_time:.2f}s, Time: {episode_duration:.1f}s")
         return True
 
     except Exception as e:
@@ -215,21 +248,29 @@ class SimpleParallelTrainer:
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        # Create output directory
-        self.output_dir = output_dir
+        # Create output directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = f"run_{timestamp}"
+        self.output_dir = os.path.join(output_dir, self.run_id)
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Temporary directory for parameter and result files
-        self.temp_dir = os.path.join(output_dir, "temp")
+        # Create subdirectories
+        self.temp_dir = os.path.join(self.output_dir, "temp")
+        self.best_episodes_dir = os.path.join(self.output_dir, "best_episodes")
         os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(self.best_episodes_dir, exist_ok=True)
 
         # Tracking the best hyperparameters
         self.best_hyperparams = None
         self.best_reward = -float('inf')
         self.best_model_path = None
 
+        # Track hyperparameter evolution
+        self.hyperparameter_history = []
+
         # Results tracking
         self.episode_results = []
+        self.best_episode_results = []
 
         # Base model path - will be updated as we find better models
         self.current_model_path = None
@@ -239,6 +280,11 @@ class SimpleParallelTrainer:
 
         # Ensure reproducibility
         self.base_seed = 42
+
+        # Training metrics
+        self.start_time = None
+        self.total_training_time = 0
+        self.iteration_times = []
 
     def generate_hyperparameters(self, include_best=False):
         """Generate hyperparameter sets for workers."""
@@ -276,13 +322,16 @@ class SimpleParallelTrainer:
 
     def run(self):
         """Run the parallel training process."""
-        start_time = time()
+        self.start_time = time()
 
         # Track rewards
         all_rewards = []
         best_rewards = []
+        all_balanced_times = []
 
         for episode in range(self.max_episodes):
+            episode_start_time = time()
+
             print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
 
             # Generate environment parameters
@@ -345,6 +394,16 @@ class SimpleParallelTrainer:
                     except Exception as e:
                         print(f"Error loading result file {result_file}: {e}")
 
+            # Calculate episode duration
+            episode_duration = time() - episode_start_time
+            self.iteration_times.append(episode_duration)
+
+            # Calculate elapsed and estimated time
+            elapsed_time = time() - self.start_time
+            avg_iteration_time = np.mean(self.iteration_times)
+            estimated_total_time = avg_iteration_time * self.max_episodes
+            remaining_time = estimated_total_time - elapsed_time
+
             # Find the best performer
             if episode_results:
                 # Sort by episode reward
@@ -353,11 +412,20 @@ class SimpleParallelTrainer:
 
                 print(f"\nBest performer: Worker {best_result['worker_id']}")
                 print(f"Episode reward: {best_result['reward']:.2f}")
+                print(f"Balanced time: {best_result['balanced_time']:.2f}s")
                 print(f"Hyperparameters: {best_result['hyperparams']}")
 
-                # Track rewards
+                # Print environment parameters of the best result
+                env_params = best_result['env_params']
+                print(f"Environment parameters: Rm={env_params['Rm']:.4f}, Km={env_params['Km']:.6f}, "
+                      f"mL={env_params['mL']:.6f}, k={env_params['k']:.6f}, "
+                      f"max_voltage={env_params['max_voltage']:.2f}V")
+
+                # Track rewards and balanced times
                 episode_rewards = [r['reward'] for r in episode_results]
+                episode_balanced_times = [r.get('balanced_time', 0) for r in episode_results]
                 all_rewards.append(episode_rewards)
+                all_balanced_times.append(episode_balanced_times)
                 best_rewards.append(best_result['reward'])
 
                 # Update overall best if this is better
@@ -370,28 +438,60 @@ class SimpleParallelTrainer:
                     self.current_model_path = best_result['model_path']
                     self.current_replay_path = best_result['replay_buffer_path']
 
+                    # Copy the best episode plot to the best_episodes directory
+                    if 'plot_path' in best_result and os.path.exists(best_result['plot_path']):
+                        best_plot_dest = os.path.join(self.best_episodes_dir, f"best_episode_{episode + 1}.png")
+                        import shutil
+                        shutil.copy2(best_result['plot_path'], best_plot_dest)
+
                     print(f"New best performance found! Reward: {self.best_reward:.2f}")
                 else:
                     print(f"No improvement over previous best: {self.best_reward:.2f}")
 
-            # Store results
+                # Store the best result for this episode
+                self.best_episode_results.append(best_result)
+
+                # Track hyperparameter evolution
+                self.hyperparameter_history.append({
+                    'episode': episode,
+                    'hyperparams': best_result['hyperparams'],
+                    'reward': best_result['reward'],
+                    'balanced_time': best_result.get('balanced_time', 0)
+                })
+
+            # Store all results for this episode
             self.episode_results.append(episode_results)
 
             # Plot progress
-            self._plot_training_progress(best_rewards, all_rewards, episode)
+            self._plot_training_progress(best_rewards, all_rewards, episode, all_balanced_times)
+
+            # Plot hyperparameter evolution
+            self._plot_hyperparameter_evolution(episode)
 
             # Save intermediate state
             self.save_results(os.path.join(self.output_dir, f"results_ep{episode + 1}.json"))
 
+            # Print timing information
+            elapsed_time_str = str(timedelta(seconds=int(elapsed_time)))
+            remaining_time_str = str(timedelta(seconds=int(remaining_time)))
+            print(f"\nEpisode duration: {episode_duration:.1f}s")
+            print(f"Elapsed time: {elapsed_time_str}")
+            print(f"Estimated remaining time: {remaining_time_str}")
+            print(f"Estimated completion: {datetime.now() + timedelta(seconds=int(remaining_time))}")
+
         # Training complete
-        total_time = time() - start_time
+        total_time = time() - self.start_time
+        self.total_training_time = total_time
         print(f"\n=== Training Complete ===")
-        print(f"Total time: {total_time:.2f} seconds")
+        print(f"Total time: {str(timedelta(seconds=int(total_time)))}")
         print(f"Best reward: {self.best_reward:.2f}")
         print(f"Best hyperparameters: {self.best_hyperparams}")
 
         # Save final results
         self.save_results(os.path.join(self.output_dir, "results_final.json"))
+
+        # Create final hyperparameter plots
+        self._plot_final_hyperparameter_analysis()
 
         # Load the best model for return
         if self.best_model_path and os.path.exists(self.best_model_path):
@@ -407,31 +507,231 @@ class SimpleParallelTrainer:
             print("Warning: Best model not found. Returning None.")
             return None, self.best_hyperparams, self.best_reward
 
-    def _plot_training_progress(self, best_rewards, all_rewards, episode):
+    def _plot_training_progress(self, best_rewards, all_rewards, episode, all_balanced_times=None):
         """Plot training progress across episodes."""
         try:
             # Plot best rewards over episodes
-            plt.figure(figsize=(12, 8))
+            plt.figure(figsize=(15, 12))
 
             # Plot 1: Best reward for each episode
-            plt.subplot(2, 1, 1)
+            plt.subplot(3, 1, 1)
             plt.plot(range(1, len(best_rewards) + 1), best_rewards, 'b-', marker='o')
             plt.ylabel('Best Reward per Episode')
             plt.title('Training Progress')
             plt.grid(True)
 
             # Plot 2: Box plot of rewards for all workers
-            plt.subplot(2, 1, 2)
+            plt.subplot(3, 1, 2)
             plt.boxplot(all_rewards)
             plt.xlabel('Episode')
             plt.ylabel('Worker Rewards')
             plt.grid(True)
+
+            # Plot 3: Balanced time (if available)
+            if all_balanced_times and len(all_balanced_times) > 0:
+                plt.subplot(3, 1, 3)
+                # Extract the best balanced time from each episode
+                best_balanced_times = [max(times) if times else 0 for times in all_balanced_times]
+                plt.plot(range(1, len(best_balanced_times) + 1), best_balanced_times, 'g-', marker='s')
+                plt.xlabel('Episode')
+                plt.ylabel('Best Balanced Time (s)')
+                plt.grid(True)
 
             plt.tight_layout()
             plt.savefig(os.path.join(self.output_dir, f"training_progress_ep{episode + 1}.png"))
             plt.close()
         except Exception as e:
             print(f"Error plotting training progress: {e}")
+
+    def _plot_hyperparameter_evolution(self, episode):
+        """Plot the evolution of hyperparameters."""
+        if len(self.hyperparameter_history) < 2:
+            return  # Need at least 2 points to plot evolution
+
+        try:
+            # Extract hyperparameter values over episodes
+            episodes = [h['episode'] + 1 for h in self.hyperparameter_history]  # +1 for 1-based indexing
+            rewards = [h['reward'] for h in self.hyperparameter_history]
+
+            # Continuous hyperparameters
+            lr_values = [h['hyperparams']['lr'] for h in self.hyperparameter_history]
+            gamma_values = [h['hyperparams']['gamma'] for h in self.hyperparameter_history]
+            tau_values = [h['hyperparams']['tau'] for h in self.hyperparameter_history]
+            alpha_values = [h['hyperparams']['alpha'] for h in self.hyperparameter_history]
+
+            # Discrete hyperparameters
+            auto_entropy = [int(h['hyperparams']['automatic_entropy_tuning']) for h in self.hyperparameter_history]
+            updates_per_step = [h['hyperparams']['updates_per_step'] for h in self.hyperparameter_history]
+
+            # Create the figure
+            plt.figure(figsize=(15, 15))
+
+            # Plot rewards
+            plt.subplot(5, 2, 1)
+            plt.plot(episodes, rewards, 'b-', marker='o')
+            plt.title('Best Reward')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            plt.grid(True)
+
+            # Plot continuous hyperparameters
+            plt.subplot(5, 2, 3)
+            plt.plot(episodes, lr_values, 'r-', marker='s')
+            plt.title('Learning Rate')
+            plt.xlabel('Episode')
+            plt.ylabel('LR')
+            plt.yscale('log')  # Use log scale for learning rate
+            plt.grid(True)
+
+            plt.subplot(5, 2, 4)
+            plt.plot(episodes, gamma_values, 'g-', marker='d')
+            plt.title('Discount Factor (gamma)')
+            plt.xlabel('Episode')
+            plt.ylabel('Gamma')
+            plt.grid(True)
+
+            plt.subplot(5, 2, 5)
+            plt.plot(episodes, tau_values, 'm-', marker='*')
+            plt.title('Soft Update Rate (tau)')
+            plt.xlabel('Episode')
+            plt.ylabel('Tau')
+            plt.grid(True)
+
+            plt.subplot(5, 2, 6)
+            plt.plot(episodes, alpha_values, 'c-', marker='^')
+            plt.title('Temperature Parameter (alpha)')
+            plt.xlabel('Episode')
+            plt.ylabel('Alpha')
+            plt.grid(True)
+
+            # Plot discrete hyperparameters
+            plt.subplot(5, 2, 7)
+            plt.plot(episodes, auto_entropy, 'y-', marker='o', drawstyle='steps-post')
+            plt.title('Automatic Entropy Tuning')
+            plt.xlabel('Episode')
+            plt.ylabel('Enabled (1=Yes, 0=No)')
+            plt.yticks([0, 1])
+            plt.grid(True)
+
+            plt.subplot(5, 2, 8)
+            plt.plot(episodes, updates_per_step, 'k-', marker='p', drawstyle='steps-post')
+            plt.title('Updates Per Step')
+            plt.xlabel('Episode')
+            plt.ylabel('Count')
+            plt.yticks([1, 2, 3])
+            plt.grid(True)
+
+            # Add a correlation plot between reward and learning rate
+            plt.subplot(5, 2, 9)
+            plt.scatter(lr_values, rewards)
+            plt.title('Reward vs. Learning Rate')
+            plt.xlabel('Learning Rate')
+            plt.ylabel('Reward')
+            plt.xscale('log')
+            plt.grid(True)
+
+            # Add a correlation plot between reward and gamma
+            plt.subplot(5, 2, 10)
+            plt.scatter(gamma_values, rewards)
+            plt.title('Reward vs. Gamma')
+            plt.xlabel('Gamma')
+            plt.ylabel('Reward')
+            plt.grid(True)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, f"hyperparameter_evolution_ep{episode + 1}.png"))
+            plt.close()
+
+        except Exception as e:
+            print(f"Error plotting hyperparameter evolution: {e}")
+
+    def _plot_final_hyperparameter_analysis(self):
+        """Create comprehensive plots for hyperparameter analysis at the end of training."""
+        if len(self.hyperparameter_history) < 3:
+            return  # Need at least 3 points for meaningful analysis
+
+        try:
+            # Extract data
+            episodes = [h['episode'] + 1 for h in self.hyperparameter_history]  # +1 for 1-based indexing
+            rewards = [h['reward'] for h in self.hyperparameter_history]
+            balanced_times = [h.get('balanced_time', 0) for h in self.hyperparameter_history]
+
+            # Create a figure for hyperparameter importance analysis
+            plt.figure(figsize=(16, 10))
+
+            # Hyperparameters to analyze
+            param_names = ['lr', 'gamma', 'tau', 'alpha', 'automatic_entropy_tuning', 'updates_per_step']
+
+            # Create correlation plots for each hyperparameter vs. reward
+            for i, param in enumerate(param_names):
+                plt.subplot(2, 3, i + 1)
+
+                # Extract parameter values
+                if param == 'automatic_entropy_tuning':
+                    # Convert boolean to int for plotting
+                    values = [int(h['hyperparams'][param]) for h in self.hyperparameter_history]
+                    plt.yticks([0, 1], ['False', 'True'])
+                else:
+                    values = [h['hyperparams'][param] for h in self.hyperparameter_history]
+
+                # Create scatter plot
+                plt.scatter(rewards, values)
+
+                # Add best fit line if the parameter is continuous
+                if param not in ['automatic_entropy_tuning', 'updates_per_step']:
+                    try:
+                        # Only compute correlation if we have enough different values
+                        unique_values = set(values)
+                        if len(unique_values) > 2:
+                            from scipy import stats
+                            slope, intercept, r_value, p_value, std_err = stats.linregress(rewards, values)
+                            line_x = np.array([min(rewards), max(rewards)])
+                            line_y = slope * line_x + intercept
+                            plt.plot(line_x, line_y, 'r-', alpha=0.7)
+                            plt.title(f'{param} vs. Reward (r={r_value:.2f}, p={p_value:.3f})')
+                        else:
+                            plt.title(f'{param} vs. Reward')
+                    except:
+                        plt.title(f'{param} vs. Reward')
+                else:
+                    plt.title(f'{param} vs. Reward')
+
+                plt.xlabel('Reward')
+                plt.ylabel(param)
+                plt.grid(True)
+
+                # Use log scale for learning rate
+                if param == 'lr':
+                    plt.yscale('log')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, "hyperparameter_importance.png"))
+            plt.close()
+
+            # Create evolution over time plots
+            plt.figure(figsize=(15, 10))
+
+            # Plot the rewards and balanced times
+            plt.subplot(2, 1, 1)
+            plt.plot(episodes, rewards, 'b-', marker='o', label='Reward')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            plt.title('Reward Evolution')
+            plt.grid(True)
+
+            plt.subplot(2, 1, 2)
+            plt.plot(episodes, balanced_times, 'g-', marker='s', label='Balanced Time')
+            plt.xlabel('Episode')
+            plt.ylabel('Balanced Time (s)')
+            plt.title('Balance Performance Evolution')
+            plt.grid(True)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, "performance_evolution.png"))
+            plt.close()
+
+        except Exception as e:
+            print(f"Error creating final hyperparameter analysis: {e}")
 
     def _final_evaluation(self, agent, num_episodes=5):
         """Perform final evaluation of the best agent."""
@@ -452,6 +752,9 @@ class SimpleParallelTrainer:
              "voltage_range": (4.0, 16.0), "num_episodes": num_episodes}
         ]
 
+        # Store results for comparison
+        scenario_results = {}
+
         for scenario in eval_scenarios:
             scenario_name = scenario.pop("name")
             scenario_dir = os.path.join(eval_dir, scenario_name)
@@ -459,7 +762,16 @@ class SimpleParallelTrainer:
 
             print(f"\n--- {scenario_name.replace('_', ' ').title()} Evaluation ---")
 
-            self._evaluate_scenario(agent, scenario, scenario_dir)
+            rewards, times = self._evaluate_scenario(agent, scenario, scenario_dir)
+            scenario_results[scenario_name] = {
+                'rewards': rewards,
+                'balance_times': times,
+                'avg_reward': np.mean(rewards),
+                'avg_balance_time': np.mean(times) if times else 0
+            }
+
+        # Create comparison plot of different scenarios
+        self._plot_scenario_comparison(scenario_results, os.path.join(eval_dir, "scenario_comparison.png"))
 
     def _evaluate_scenario(self, agent, scenario_params, output_dir):
         """Evaluate the agent on a specific scenario."""
@@ -540,6 +852,59 @@ class SimpleParallelTrainer:
         if balance_times:
             print(f"Average balanced time: {np.mean(balance_times):.2f} ± {np.std(balance_times):.2f} seconds")
 
+        return rewards, balance_times
+
+    def _plot_scenario_comparison(self, scenario_results, save_path):
+        """Create a comparison plot of different evaluation scenarios."""
+        if not scenario_results:
+            return
+
+        try:
+            # Create figure
+            plt.figure(figsize=(15, 10))
+
+            # Get scenario names and sort them in a sensible order
+            scenario_names = list(scenario_results.keys())
+            if 'standard' in scenario_names:
+                # Put standard first, then sort others by name
+                scenario_names.remove('standard')
+                scenario_names.sort()
+                scenario_names = ['standard'] + scenario_names
+            else:
+                scenario_names.sort()
+
+            # Plot average rewards
+            plt.subplot(2, 1, 1)
+            avg_rewards = [scenario_results[name]['avg_reward'] for name in scenario_names]
+            std_rewards = [np.std(scenario_results[name]['rewards']) for name in scenario_names]
+
+            x = np.arange(len(scenario_names))
+            plt.bar(x, avg_rewards, yerr=std_rewards, capsize=8)
+            plt.xticks(x, [name.replace('_', ' ').title() for name in scenario_names])
+            plt.ylabel('Average Reward')
+            plt.title('Performance Across Scenarios - Reward')
+            plt.grid(axis='y')
+
+            # Plot average balance times
+            plt.subplot(2, 1, 2)
+            avg_times = [scenario_results[name]['avg_balance_time'] for name in scenario_names]
+            std_times = [
+                np.std(scenario_results[name]['balance_times']) if scenario_results[name]['balance_times'] else 0
+                for name in scenario_names]
+
+            plt.bar(x, avg_times, yerr=std_times, capsize=8)
+            plt.xticks(x, [name.replace('_', ' ').title() for name in scenario_names])
+            plt.ylabel('Average Balance Time (s)')
+            plt.title('Performance Across Scenarios - Balance Time')
+            plt.grid(axis='y')
+
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close()
+
+        except Exception as e:
+            print(f"Error creating scenario comparison plot: {e}")
+
     def save_results(self, filename):
         """Save training results to a JSON file."""
 
@@ -558,27 +923,43 @@ class SimpleParallelTrainer:
             else:
                 return obj
 
-        # Extract relevant results, excluding paths to files
+        # Extract relevant results, excluding paths to files and large arrays
         simplified_episode_results = []
         for episode_data in self.episode_results:
             simplified_data = []
             for worker_data in episode_data:
                 worker_data_copy = worker_data.copy()
-                # Remove file paths
+                # Remove file paths and large arrays
                 if 'model_path' in worker_data_copy:
                     worker_data_copy['model_path'] = os.path.basename(worker_data_copy['model_path'])
                 if 'replay_buffer_path' in worker_data_copy:
                     worker_data_copy['replay_buffer_path'] = os.path.basename(worker_data_copy['replay_buffer_path'])
+                if 'plot_path' in worker_data_copy:
+                    worker_data_copy['plot_path'] = os.path.basename(worker_data_copy['plot_path'])
+                if 'episode_states' in worker_data_copy:
+                    worker_data_copy.pop('episode_states')
+                if 'episode_actions' in worker_data_copy:
+                    worker_data_copy.pop('episode_actions')
+                if 'step_rewards' in worker_data_copy:
+                    worker_data_copy.pop('step_rewards')
                 simplified_data.append(worker_data_copy)
             simplified_episode_results.append(simplified_data)
 
+        # Prepare hyperparameter history for serialization
+        serialized_hyperparameter_history = convert_to_serializable(self.hyperparameter_history)
+
         results = {
+            'run_id': self.run_id,
             'best_reward': float(self.best_reward),
             'best_hyperparams': convert_to_serializable(self.best_hyperparams),
             'hidden_dim': self.hidden_dim,
             'num_workers': self.num_workers,
             'max_episodes': self.max_episodes,
+            'episodes_completed': len(self.episode_results),
             'best_model_path': os.path.basename(self.best_model_path) if self.best_model_path else None,
+            'total_training_time': self.total_training_time,
+            'iteration_times': convert_to_serializable(self.iteration_times),
+            'hyperparameter_history': serialized_hyperparameter_history,
             'episode_results': convert_to_serializable(simplified_episode_results)
         }
 
