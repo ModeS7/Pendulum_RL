@@ -513,9 +513,9 @@ class Actor(nn.Module):
         # Improved network with SiLU activation and LayerNorm
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
         )
 
         # Mean and log std for continuous action
@@ -564,18 +564,20 @@ class Critic(nn.Module):
         # Improved Q1 network with SiLU and LayerNorm
         self.q1 = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-        # Improved Q2 network
+        # Q2 network to reducing overestimation bias,
+        # later in the code the min of these two networks
+        # are chosen. Initially popularized in TD3.
         self.q2 = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
