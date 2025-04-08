@@ -15,16 +15,6 @@ from SimRL import PendulumEnv, SACAgent, ReplayBuffer, plot_training_episode, no
 
 
 def worker_training_job(worker_id, param_file, result_file, episode_num):
-    """
-    This function will be run in a separate process.
-    It doesn't receive any PyTorch tensors directly.
-
-    Args:
-        worker_id: ID of this worker
-        param_file: File path containing parameters
-        result_file: File path to write results
-        episode_num: Current episode number
-    """
     try:
         # Load parameters from file
         with open(param_file, 'rb') as f:
@@ -32,6 +22,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
 
         hyperparams = params['hyperparams']
         env_params = params['env_params']
+        episode_seed = params.get('episode_seed', 42 + episode_num)
         base_model_path = params['base_model_path']
         replay_buffer_path = params.get('replay_buffer_path')
         hidden_dim = params['hidden_dim']
@@ -40,13 +31,39 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
 
         print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
 
-        # Set the seed for reproducibility
-        seed = hyperparams.get('seed', 42)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        # Set the seed for environment parameters
+        np.random.seed(episode_seed)
 
-        # Create environment
+        # Create environment with controlled randomization
         env = PendulumEnv(**env_params)
+
+        # CRITICAL FIX: Call reset() first to initialize the parameters
+        state = env.reset()
+
+        # Now the parameters are available
+        original_params = env.get_current_parameters().copy()
+
+        # Print the actual voltage to verify
+        max_voltage = original_params['max_voltage']
+        print(f"  Using environment with max_voltage={max_voltage:.2f}V")
+
+        # Override the reset method to ensure consistent parameters
+        original_reset = env.reset
+
+        def fixed_reset(*args, **kwargs):
+            # Call the original reset to get state
+            state = original_reset(*args, **kwargs)
+            # Force parameters back to our consistent values
+            env.params = original_params.copy()
+            return state
+
+        # Replace the reset method
+        env.reset = fixed_reset
+
+        # Set the seed for training randomization
+        seed = hyperparams.get('seed', 42)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
         # Create a new agent
         agent = SACAgent(
@@ -60,7 +77,6 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
             automatic_entropy_tuning=hyperparams.get('automatic_entropy_tuning', True),
             max_episodes=1000
         )
-
         # Load base model if available
         if base_model_path and os.path.exists(base_model_path):
             agent.actor.load_state_dict(torch.load(base_model_path, map_location='cpu'))
@@ -133,6 +149,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
 
         # Plot the episode results
         plot_path = os.path.join(output_dir, "episode_plot.png")
+        print(f"  Plot will use max_voltage={env.params['max_voltage']:.2f}V")
         plot_training_episode(
             episode_num,
             np.array(episode_states),
@@ -292,6 +309,7 @@ class SimpleParallelTrainer:
 
         # Include the best hyperparameters from previous episode if available
         if include_best and self.best_hyperparams is not None:
+            print(f"Reusing best hyperparameters from previous episode for Worker 0")
             hyperparams_list.append(deepcopy(self.best_hyperparams))
 
         # Generate random hyperparameters for remaining workers
@@ -334,6 +352,9 @@ class SimpleParallelTrainer:
 
             print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
 
+            # Use a unique seed for this episode
+            episode_seed = self.base_seed + episode * 997  # 997 is a prime number
+
             # Generate environment parameters
             env_params = self.generate_environment_params()
             print(f"Environment params: {env_params}")
@@ -352,6 +373,7 @@ class SimpleParallelTrainer:
                 params = {
                     'hyperparams': hyperparams_list[worker_id],
                     'env_params': env_params,
+                    'episode_seed': episode_seed,  # Pass the episode seed
                     'base_model_path': self.current_model_path,
                     'replay_buffer_path': self.current_replay_path,
                     'hidden_dim': self.hidden_dim,
