@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
-base_max_voltage = 4.0  # Base maximum motor voltage
+base_max_voltage = 6.0  # Base maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -35,10 +35,6 @@ base_LL = 0.128  # Length of pendulum link (m)
 base_JA = 0.0000572 + 0.00006  # Arm inertia about pivot (kg·m²)
 base_JL = 0.0000235  # Pendulum inertia about pivot (kg·m²)
 base_k = 0.002  # Torsional spring constant (N·m/rad)
-
-# ====== Hyperparameters ======
-batch_size = 256 * 32  # Batch size for training
-
 
 # ====== Helper Functions ======
 @nb.njit(fastmath=True, cache=True)
@@ -198,10 +194,10 @@ class VariableTimeGenerator:
 
     def __init__(
             self,
-            mean=0.005,
-            std_dev=0.002,
-            min_dt=0.0025,
-            max_dt=0.01
+            mean=0.01,
+            std_dev=0.005,
+            min_dt=0.0001,
+            max_dt=0.014
     ):
         self.mean = mean
         self.std_dev = std_dev
@@ -293,8 +289,8 @@ class PendulumEnv:
 
     def __init__(
             self,
-            dt=0.005,
-            max_steps=2000,
+            dt=0.01,
+            max_steps=1000,
             variable_dt=False,
             param_variation=0.1,
             fixed_params=False,
@@ -681,7 +677,7 @@ class SACAgent:
 
             return action.cpu().numpy()[0]
 
-    def update_parameters(self, memory, batch_size=batch_size):
+    def update_parameters(self, memory, batch_size=512):
         """Update actor and critic parameters using a batch of experiences."""
         # Sample batch from memory
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
@@ -800,8 +796,8 @@ def train(
     # Setup parameters
     state_dim = 6  # Observation space dimension
     action_dim = 1  # Motor voltage (normalized)
-    max_steps = 2000  # Max steps per episode
-    batch_size = 256  # Batch size
+    max_steps = 1000  # Max steps per episode
+    batch_size = 512  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
     updates_per_step = 1  # Updates per environment step
 
@@ -870,7 +866,7 @@ def train(
 
         # Log progress
         episode_rewards.append(episode_reward)
-        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
         avg_rewards.append(avg_reward)
 
         # Calculate average losses for reporting
@@ -1348,7 +1344,7 @@ if __name__ == "__main__":
     # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
         variable_dt=True,
-        param_variation=0.0,
+        param_variation=0.1,
         # voltage_range=(2.0, 18.0),
         max_episodes=1000,
         eval_interval=10

@@ -93,7 +93,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
                 print(f"Error loading replay buffer: {e}")
 
         # Train for one episode
-        batch_size = 256
+        batch_size = 512
         updates_per_step = hyperparams.get('updates_per_step', 1)
         output_dir = f"episode_parallel_results/episode_{episode_num}/worker_{worker_id}"
         os.makedirs(output_dir, exist_ok=True)
@@ -311,6 +311,19 @@ class SimpleParallelTrainer:
         if include_best and self.best_hyperparams is not None:
             print(f"Reusing best hyperparameters from previous episode for Worker 0")
             hyperparams_list.append(deepcopy(self.best_hyperparams))
+        # For the first episode, include default hyperparameters for one worker
+        elif not include_best:  # This means we're in the first episode
+            print(f"Using default hyperparameters for Worker 0 in first episode")
+            default_params = {
+                'lr': 3e-4,  # Default learning rate
+                'gamma': 0.99,  # Default discount factor
+                'tau': 0.005,  # Default soft update rate
+                'alpha': 0.2,  # Default temperature parameter
+                'automatic_entropy_tuning': True,
+                'updates_per_step': 1,  # Default updates per step
+                'seed': self.base_seed  # Use base seed for default params
+            }
+            hyperparams_list.append(default_params)
 
         # Generate random hyperparameters for remaining workers
         remaining = self.num_workers - len(hyperparams_list)
@@ -797,13 +810,17 @@ class SimpleParallelTrainer:
 
     def _evaluate_scenario(self, agent, scenario_params, output_dir):
         """Evaluate the agent on a specific scenario."""
+        # Extract the num_episodes parameter before passing the rest to PendulumEnv
+        num_episodes = scenario_params.pop("num_episodes")
+
+        # Now create the environment without the num_episodes parameter
         env = PendulumEnv(**scenario_params)
 
         # Results tracking
         rewards = []
         balance_times = []
 
-        for episode in range(scenario_params["num_episodes"]):
+        for episode in range(num_episodes):
             state = env.reset(random_init=False)  # Start from standard position
             total_reward = 0
 
