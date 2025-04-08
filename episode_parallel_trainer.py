@@ -14,7 +14,27 @@ from datetime import datetime, timedelta
 from SimRL import PendulumEnv, SACAgent, ReplayBuffer, plot_training_episode, normalize_angle
 
 
-def worker_training_job(worker_id, param_file, result_file, episode_num):
+def worker_with_affinity(worker_id, param_file, result_file, episode_num, worker_cores):
+    """Worker function wrapper that sets CPU affinity before executing the actual work"""
+    try:
+        # Import psutil here to ensure it's available in the subprocess
+        import psutil
+
+        # Set CPU affinity for this process
+        proc = psutil.Process()
+        print(f"Worker {worker_id} setting CPU affinity to cores: {worker_cores}")
+        proc.cpu_affinity(worker_cores)
+
+        # Run the original worker function
+        return worker_training_job(worker_id, param_file, result_file, episode_num)
+    except Exception as e:
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(f"Error in worker_with_affinity: {str(e)}")
+        print(error_traceback)
+        return False
+
+def worker_training_job(worker_id, param_file, result_file, episode_num, verbose=False):
     try:
         # Load parameters from file
         with open(param_file, 'rb') as f:
@@ -28,8 +48,10 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         hidden_dim = params['hidden_dim']
         state_dim = params['state_dim']
         action_dim = params['action_dim']
+        verbose = params.get('verbose', False)  # Get verbose flag from params
 
-        print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
+        if verbose:
+            print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
 
         # Set the seed for environment parameters
         np.random.seed(episode_seed)
@@ -43,9 +65,10 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         # Now the parameters are available
         original_params = env.get_current_parameters().copy()
 
-        # Print the actual voltage to verify
-        max_voltage = original_params['max_voltage']
-        print(f"  Using environment with max_voltage={max_voltage:.2f}V")
+        # Print the actual voltage only in verbose mode
+        if verbose:
+            max_voltage = original_params['max_voltage']
+            print(f"  Using environment with max_voltage={max_voltage:.2f}V")
 
         # Override the reset method to ensure consistent parameters
         original_reset = env.reset
@@ -90,7 +113,8 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
                 for transition in replay_data:
                     replay_buffer.push(*transition)
             except Exception as e:
-                print(f"Error loading replay buffer: {e}")
+                if verbose:
+                    print(f"Error loading replay buffer: {e}")
 
         # Train for one episode
         batch_size = 512
@@ -147,9 +171,10 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         # Calculate episode duration
         episode_duration = time() - episode_start_time
 
-        # Plot the episode results
+        # Plot the episode results (only in verbose mode)
         plot_path = os.path.join(output_dir, "episode_plot.png")
-        print(f"  Plot will use max_voltage={env.params['max_voltage']:.2f}V")
+        if verbose:
+            print(f"  Plot will use max_voltage={env.params['max_voltage']:.2f}V")
         plot_training_episode(
             episode_num,
             np.array(episode_states),
@@ -223,8 +248,8 @@ def worker_training_job(worker_id, param_file, result_file, episode_num):
         with open(result_file, 'wb') as f:
             pickle.dump(results, f)
 
-        print(
-            f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}, Balanced: {balanced_time:.2f}s, Time: {episode_duration:.1f}s")
+        if verbose:
+            print(f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}, Balanced: {balanced_time:.2f}s, Time: {episode_duration:.1f}s")
         return True
 
     except Exception as e:
@@ -296,7 +321,8 @@ class SimpleParallelTrainer:
         self.current_replay_path = None
 
         # Ensure reproducibility
-        self.base_seed = 42
+        #self.base_seed = 42
+        self.base_seed = 42 + int(time()) % 10000  # Add time-based randomness
 
         # Training metrics
         self.start_time = None
@@ -304,13 +330,37 @@ class SimpleParallelTrainer:
         self.iteration_times = []
 
     def generate_hyperparameters(self, include_best=False):
-        """Generate hyperparameter sets for workers."""
+        """Generate hyperparameter sets for workers with normal distribution around best values."""
         hyperparams_list = []
+
+        # Define parameter ranges and standard deviations for variation
+        param_ranges = {
+            'lr': (0.000001, 0.005),  # Learning rate range
+            'gamma': (0.97, 0.996),  # Discount factor range
+            'tau': (0.001, 0.02),  # Soft update rate range
+            'alpha': (0.02, 0.35)  # Temperature parameter range
+            # updates_per_step is fixed to 1
+            # automatic_entropy_tuning is handled separately
+        }
+
+        # Define standard deviations for each parameter (as percentage of range)
+        param_std_devs = {
+            'lr': 0.3,  # 30% of range for learning rate
+            'gamma': 0.1,  # 10% of range for gamma
+            'tau': 0.2,  # 20% of range for tau
+            'alpha': 0.15  # 15% of range for alpha
+        }
 
         # Include the best hyperparameters from previous episode if available
         if include_best and self.best_hyperparams is not None:
             print(f"Reusing best hyperparameters from previous episode for Worker 0")
-            hyperparams_list.append(deepcopy(self.best_hyperparams))
+            best_params = deepcopy(self.best_hyperparams)
+
+            # Ensure updates_per_step is set to 1 regardless of what was in best_params
+            modified_best_params = deepcopy(best_params)
+            modified_best_params['updates_per_step'] = 1
+
+            hyperparams_list.append(modified_best_params)
         # For the first episode, include default hyperparameters for one worker
         elif not include_best:  # This means we're in the first episode
             print(f"Using default hyperparameters for Worker 0 in first episode")
@@ -320,23 +370,61 @@ class SimpleParallelTrainer:
                 'tau': 0.005,  # Default soft update rate
                 'alpha': 0.2,  # Default temperature parameter
                 'automatic_entropy_tuning': True,
-                'updates_per_step': 1,  # Default updates per step
+                'updates_per_step': 1,  # Fixed to 1
                 'seed': self.base_seed  # Use base seed for default params
             }
             hyperparams_list.append(default_params)
+            best_params = default_params
 
-        # Generate random hyperparameters for remaining workers
+        # Generate variations around the best hyperparameters for remaining workers
         remaining = self.num_workers - len(hyperparams_list)
         for i in range(remaining):
-            params = {
-                'lr': 10 ** np.random.uniform(-4, -2.3),
-                'gamma': np.random.uniform(0.97, 0.995),
-                'tau': np.random.uniform(0.001, 0.01),
-                'automatic_entropy_tuning': bool(np.random.choice([True, False], p=[0.8, 0.2])),
-                'alpha': np.random.uniform(0.05, 0.3),
-                'updates_per_step': np.random.choice([1, 2, 3]),
-                'seed': self.base_seed + i + 1
-            }
+            params = {}
+
+            # Generate variation for each parameter
+            for param_name, range_vals in param_ranges.items():
+                min_val, max_val = range_vals
+
+                # Get the best value as the mean
+                best_value = best_params[param_name]
+
+                # Calculate the absolute standard deviation
+                std_dev = param_std_devs[param_name] * (max_val - min_val)
+
+                # Special case for learning rate - use log scale
+                if param_name == 'lr':
+                    # Convert to log space
+                    log_min, log_max = np.log10(min_val), np.log10(max_val)
+                    log_best = np.log10(best_value)
+                    log_std = param_std_devs[param_name] * (log_max - log_min)
+
+                    # Sample in log space
+                    log_value = np.random.normal(log_best, log_std)
+
+                    # Convert back and clip
+                    value = 10 ** np.clip(log_value, log_min, log_max)
+                else:
+                    # Sample with normal distribution around best value
+                    value = np.random.normal(best_value, std_dev)
+
+                    # Clip to valid range
+                    value = np.clip(value, min_val, max_val)
+
+                params[param_name] = value
+
+            # Handle boolean parameter separately
+            # 80% chance to use the same value as best, 20% to flip
+            if np.random.random() < 0.8:
+                params['automatic_entropy_tuning'] = best_params['automatic_entropy_tuning']
+            else:
+                params['automatic_entropy_tuning'] = not best_params['automatic_entropy_tuning']
+
+            # Always set updates_per_step to 1
+            params['updates_per_step'] = 1
+
+            # Set seed
+            params['seed'] = self.base_seed + i + 1
+
             hyperparams_list.append(params)
 
         return hyperparams_list
@@ -351,7 +439,7 @@ class SimpleParallelTrainer:
         }
         return params
 
-    def run(self):
+    def run(self, verbose=False):
         """Run the parallel training process."""
         self.start_time = time()
 
@@ -365,8 +453,10 @@ class SimpleParallelTrainer:
 
             print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
 
-            # Use a unique seed for this episode
-            episode_seed = self.base_seed + episode * 997  # 997 is a prime number
+            # Use a unique seed for this episode with some randomness
+            import time as pytime
+            current_time = int(pytime.time())
+            episode_seed = self.base_seed + episode * 997 + current_time % 1000
 
             # Generate environment parameters
             env_params = self.generate_environment_params()
@@ -391,7 +481,8 @@ class SimpleParallelTrainer:
                     'replay_buffer_path': self.current_replay_path,
                     'hidden_dim': self.hidden_dim,
                     'state_dim': self.state_dim,
-                    'action_dim': self.action_dim
+                    'action_dim': self.action_dim,
+                    'verbose': verbose  # Pass verbose flag
                 }
 
                 # Save parameters to file
@@ -406,7 +497,7 @@ class SimpleParallelTrainer:
             for worker_id in range(self.num_workers):
                 p = mp.Process(
                     target=worker_training_job,
-                    args=(worker_id, param_files[worker_id], result_files[worker_id], episode)
+                    args=(worker_id, param_files[worker_id], result_files[worker_id], episode, verbose)
                 )
                 p.start()
                 processes.append(p)
@@ -463,25 +554,25 @@ class SimpleParallelTrainer:
                 all_balanced_times.append(episode_balanced_times)
                 best_rewards.append(best_result['reward'])
 
-                # Update overall best if this is better
+                # Always use the best performer from the current episode for the next episode
+                # regardless of whether it beat the global best
+                self.best_hyperparams = deepcopy(best_result['hyperparams'])
+                self.current_model_path = best_result['model_path']
+                self.current_replay_path = best_result['replay_buffer_path']
+
+                # Copy the best episode plot to the best_episodes directory
+                if 'plot_path' in best_result and os.path.exists(best_result['plot_path']):
+                    best_plot_dest = os.path.join(self.best_episodes_dir, f"best_episode_{episode + 1}.png")
+                    import shutil
+                    shutil.copy2(best_result['plot_path'], best_plot_dest)
+
+                # Track the global best for reporting purposes only
                 if best_result['reward'] > self.best_reward:
                     self.best_reward = best_result['reward']
-                    self.best_hyperparams = deepcopy(best_result['hyperparams'])
                     self.best_model_path = best_result['model_path']
-
-                    # Update current model path for next episode
-                    self.current_model_path = best_result['model_path']
-                    self.current_replay_path = best_result['replay_buffer_path']
-
-                    # Copy the best episode plot to the best_episodes directory
-                    if 'plot_path' in best_result and os.path.exists(best_result['plot_path']):
-                        best_plot_dest = os.path.join(self.best_episodes_dir, f"best_episode_{episode + 1}.png")
-                        import shutil
-                        shutil.copy2(best_result['plot_path'], best_plot_dest)
-
                     print(f"New best performance found! Reward: {self.best_reward:.2f}")
                 else:
-                    print(f"No improvement over previous best: {self.best_reward:.2f}")
+                    print(f"Current episode best: {best_result['reward']:.2f} (Global best: {self.best_reward:.2f})")
 
                 # Store the best result for this episode
                 self.best_episode_results.append(best_result)
@@ -648,16 +739,8 @@ class SimpleParallelTrainer:
             plt.yticks([0, 1])
             plt.grid(True)
 
-            plt.subplot(5, 2, 8)
-            plt.plot(episodes, updates_per_step, 'k-', marker='p', drawstyle='steps-post')
-            plt.title('Updates Per Step')
-            plt.xlabel('Episode')
-            plt.ylabel('Count')
-            plt.yticks([1, 2, 3])
-            plt.grid(True)
-
             # Add a correlation plot between reward and learning rate
-            plt.subplot(5, 2, 9)
+            plt.subplot(5, 2, 8)
             plt.scatter(lr_values, rewards)
             plt.title('Reward vs. Learning Rate')
             plt.xlabel('Learning Rate')
@@ -666,7 +749,7 @@ class SimpleParallelTrainer:
             plt.grid(True)
 
             # Add a correlation plot between reward and gamma
-            plt.subplot(5, 2, 10)
+            plt.subplot(5, 2, 9)
             plt.scatter(gamma_values, rewards)
             plt.title('Reward vs. Gamma')
             plt.xlabel('Gamma')
