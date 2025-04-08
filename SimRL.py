@@ -460,6 +460,7 @@ class PendulumEnv:
         # 5. Penalty for being close to downward position
         downright_theta_1 = normalize_angle(theta_1)
         downright_closeness = np.exp(-10.0 * downright_theta_1 ** 2)
+        stability_factor = np.exp(-0.2 * theta_1_dot ** 2)
         bonus += -3.0 * downright_closeness * stability_factor
 
         # 6. Penalty for approaching arm angle limits
@@ -472,11 +473,11 @@ class PendulumEnv:
         JL = self.params['JL']
         mL = self.params['mL']
         l_1 = self.params['l_1']
-        energy_reward = 2 - 0.15 * abs(
+        energy_reward = 2 - 0.007 * (
             mL * g * l_1 * (np.cos(theta_1_norm)) +
             0.5 * JL * theta_1_dot ** 2 -
             mL * g * l_1
-        )
+        ) ** 2
 
         # 8. Cost for high voltage usage
         max_voltage = self.params['max_voltage']

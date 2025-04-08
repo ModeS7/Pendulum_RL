@@ -53,7 +53,7 @@ def compute_reward(state, voltage_change=0.0, params=None):
     # For new convention, downright is at π
     downright_alpha = normalize_angle(alpha - np.pi)
     downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-    stability_factor = np.exp(-0.6 * alpha_dot ** 2)
+    stability_factor = np.exp(-0.2 * alpha_dot ** 2)
     bonus += -3.0 * downright_closeness * stability_factor
 
     # COMPONENT 5: Smoother penalty for approaching limits
@@ -67,7 +67,7 @@ def compute_reward(state, voltage_change=0.0, params=None):
     # COMPONENT 6: Energy management reward
     E = p.Mp_g_Lp * (np.cos(alpha_norm)) + 0.5 * p.Jp * alpha_dot ** 2
     E_ref = p.Mp_g_Lp
-    energy_reward = 2 - 0.15 * abs(E_ref - E)
+    energy_reward = 2 - 0.007 * (E_ref - E) ** 2
 
     # COMPONENT 7: Stronger penalty for fast voltage changes
     voltage_change_penalty = -0.01 * voltage_change ** 2
