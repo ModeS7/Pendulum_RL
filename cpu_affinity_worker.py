@@ -7,16 +7,16 @@ import psutil
 from time import time
 
 # Import the original worker function
-from episode_parallel_trainer import worker_training_job, plot_training_episode, normalize_angle
-from SimRL import PendulumEnv, SACAgent, ReplayBuffer
+from episode_parallel_trainer import worker_training_job
 
 
-def affinity_worker_training_job(worker_id, param_file, result_file, episode_num, cpu_cores):
+def affinity_worker_training_job(worker_id, param_file, result_file, episode_num, cpu_cores, verbose=False):
     """Worker function that sets CPU affinity before running the original job"""
     try:
         # Set CPU affinity for this process
         proc = psutil.Process()
-        print(f"Worker {worker_id} setting CPU affinity to cores: {cpu_cores}")
+        if verbose:
+            print(f"Worker {worker_id} setting CPU affinity to cores: {cpu_cores}")
         proc.cpu_affinity(cpu_cores)
 
         # Call the original worker function
