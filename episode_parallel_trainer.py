@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from multiprocessing import Manager
 import numpy as np
 import torch
 import os
@@ -7,7 +8,6 @@ import pickle
 from copy import deepcopy
 from time import time
 import matplotlib.pyplot as plt
-import tempfile
 import psutil
 from datetime import datetime, timedelta
 
@@ -15,7 +15,8 @@ from datetime import datetime, timedelta
 from SimRL import PendulumEnv, SACAgent, ReplayBuffer, plot_training_episode, normalize_angle
 
 
-def worker_with_affinity(worker_id, param_file, result_file, episode_num, worker_cores):
+# Modified worker function that returns results directly instead of saving to disk
+def worker_with_affinity(worker_id, params, episode_num, worker_cores, result_queue, verbose=False):
     """Worker function wrapper that sets CPU affinity before executing the actual work"""
     try:
         # Import psutil here to ensure it's available in the subprocess
@@ -23,24 +24,29 @@ def worker_with_affinity(worker_id, param_file, result_file, episode_num, worker
 
         # Set CPU affinity for this process
         proc = psutil.Process()
-        print(f"Worker {worker_id} setting CPU affinity to cores: {worker_cores}")
+        if verbose:
+            print(f"Worker {worker_id} setting CPU affinity to cores: {worker_cores}")
         proc.cpu_affinity(worker_cores)
 
-        # Run the original worker function
-        return worker_training_job(worker_id, param_file, result_file, episode_num)
+        # Run the modified worker function that returns results directly
+        return worker_training_job(worker_id, params, episode_num, result_queue, verbose)
     except Exception as e:
         import traceback
         error_traceback = traceback.format_exc()
         print(f"Error in worker_with_affinity: {str(e)}")
         print(error_traceback)
+        # Put error in queue
+        result_queue.put({
+            'worker_id': worker_id,
+            'episode_num': episode_num,
+            'error': str(e),
+            'traceback': error_traceback
+        })
         return False
 
-def worker_training_job(worker_id, param_file, result_file, episode_num, verbose=False):
-    try:
-        # Load parameters from file
-        with open(param_file, 'rb') as f:
-            params = pickle.load(f)
 
+def worker_training_job(worker_id, params, episode_num, result_queue, verbose=False):
+    try:
         hyperparams = params['hyperparams']
         env_params = params['env_params']
         episode_seed = params.get('episode_seed', 42 + episode_num)
@@ -49,7 +55,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         hidden_dim = params['hidden_dim']
         state_dim = params['state_dim']
         action_dim = params['action_dim']
-        verbose = params.get('verbose', False)  # Get verbose flag from params
+        output_dir = params['output_dir']
 
         if verbose:
             print(f"Episode {episode_num}, Worker {worker_id} starting with hyperparams: {hyperparams}")
@@ -60,7 +66,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         # Create environment with controlled randomization
         env = PendulumEnv(**env_params)
 
-        # CRITICAL FIX: Call reset() first to initialize the parameters
+        # Call reset() first to initialize the parameters
         state = env.reset()
 
         # Now the parameters are available
@@ -101,6 +107,7 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
             automatic_entropy_tuning=hyperparams.get('automatic_entropy_tuning', True),
             max_episodes=1000
         )
+
         # Load base model if available
         if base_model_path and os.path.exists(base_model_path):
             agent.actor.load_state_dict(torch.load(base_model_path, map_location='cpu'))
@@ -120,8 +127,10 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         # Train for one episode
         batch_size = 512
         updates_per_step = hyperparams.get('updates_per_step', 1)
-        output_dir = f"episode_parallel_results/episode_{episode_num}/worker_{worker_id}"
-        os.makedirs(output_dir, exist_ok=True)
+
+        # Create a directory for this worker's output
+        worker_dir = os.path.join(output_dir, f"episode_{episode_num}", f"worker_{worker_id}")
+        os.makedirs(worker_dir, exist_ok=True)
 
         # Run a single episode
         state = env.reset()
@@ -172,10 +181,24 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         # Calculate episode duration
         episode_duration = time() - episode_start_time
 
-        # Plot the episode results (only in verbose mode)
-        plot_path = os.path.join(output_dir, "episode_plot.png")
-        if verbose:
-            print(f"  Plot will use max_voltage={env.params['max_voltage']:.2f}V")
+        # Only save the model if we have good performance - this reduces disk I/O
+        # Save to a temporary file that will be replaced if this worker's model is best
+        model_path = os.path.join(worker_dir, "actor_model.pth")
+        torch.save(agent.actor.state_dict(), model_path)
+
+        # Sample a subset of replay buffer to save
+        replay_sample = []
+        if len(replay_buffer) > 0:
+            indices = np.random.choice(len(replay_buffer), min(5000, len(replay_buffer)), replace=False)
+            for i in indices:
+                replay_sample.append(replay_buffer.buffer[i])
+
+        replay_path = os.path.join(worker_dir, "replay_buffer.pkl")
+        with open(replay_path, 'wb') as f:
+            pickle.dump(replay_sample, f)
+
+        # Generate plot for this episode
+        plot_path = os.path.join(worker_dir, "episode_plot.png")
         plot_training_episode(
             episode_num,
             np.array(episode_states),
@@ -191,21 +214,6 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         avg_critic_loss = np.mean(critic_losses) if critic_losses else 0.0
         avg_actor_loss = np.mean(actor_losses) if actor_losses else 0.0
         avg_alpha = np.mean(alpha_values) if alpha_values else 0.0
-
-        # Save model and sample of replay buffer
-        model_path = os.path.join(output_dir, "actor_model.pth")
-        torch.save(agent.actor.state_dict(), model_path)
-
-        # Sample a subset of replay buffer to save
-        replay_sample = []
-        if len(replay_buffer) > 0:
-            indices = np.random.choice(len(replay_buffer), min(5000, len(replay_buffer)), replace=False)
-            for i in indices:
-                replay_sample.append(replay_buffer.buffer[i])
-
-        replay_path = os.path.join(output_dir, "replay_buffer.pkl")
-        with open(replay_path, 'wb') as f:
-            pickle.dump(replay_sample, f)
 
         # Calculate balanced time metric
         balanced_time = 0.0
@@ -239,18 +247,19 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
             'env_params': current_params,
             'episode_length': len(episode_states),
             'plot_path': plot_path,
-            'episode_states': np.array(episode_states) if len(episode_states) < 500 else None,
-            # Only store if not too large
-            'episode_actions': np.array(episode_actions) if len(episode_actions) < 500 else None,
-            'step_rewards': step_rewards if len(step_rewards) < 500 else None
+            # Only store sample data for metrics, not full trajectories
+            'episode_states_sample': np.array(episode_states[:100]) if len(episode_states) > 0 else None,
+            'episode_actions_sample': np.array(episode_actions[:100]) if len(episode_actions) > 0 else None,
+            'step_rewards_sample': step_rewards[:100] if len(step_rewards) > 0 else None
         }
 
-        # Save results to file
-        with open(result_file, 'wb') as f:
-            pickle.dump(results, f)
+        # Put results in the queue for the main process to process
+        result_queue.put(results)
 
         if verbose:
-            print(f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}, Balanced: {balanced_time:.2f}s, Time: {episode_duration:.1f}s")
+            print(
+                f"Episode {episode_num}, Worker {worker_id} completed. Reward: {episode_reward:.2f}, Balanced: {balanced_time:.2f}s, Time: {episode_duration:.1f}s")
+
         return True
 
     except Exception as e:
@@ -259,24 +268,19 @@ def worker_training_job(worker_id, param_file, result_file, episode_num, verbose
         print(f"Episode {episode_num}, Worker {worker_id} encountered an error: {str(e)}")
         print(error_traceback)
 
-        # Save error information to result file
-        error_results = {
+        # Put error information in the queue
+        result_queue.put({
             'worker_id': worker_id,
             'episode_num': episode_num,
             'error': str(e),
             'traceback': error_traceback
-        }
-
-        with open(result_file, 'wb') as f:
-            pickle.dump(error_results, f)
+        })
 
         return False
 
 
-
-
-class SimpleParallelTrainer:
-    """A simplified parallel trainer that avoids passing tensors between processes."""
+class OptimizedCPUAffinityTrainer:
+    """Trainer that keeps only the best episode in RAM and assigns specific CPU cores to workers."""
 
     def __init__(
             self,
@@ -285,13 +289,16 @@ class SimpleParallelTrainer:
             hidden_dim=256,
             state_dim=6,
             action_dim=1,
-            output_dir="episode_parallel_results"
+            output_dir="episode_parallel_results",
+            reserved_cores=None,
+            verbose=False
     ):
         self.num_workers = num_workers
         self.max_episodes = max_episodes
         self.hidden_dim = hidden_dim
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.verbose = verbose
 
         # Create output directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -300,10 +307,18 @@ class SimpleParallelTrainer:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Create subdirectories
-        self.temp_dir = os.path.join(self.output_dir, "temp")
         self.best_episodes_dir = os.path.join(self.output_dir, "best_episodes")
-        os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.best_episodes_dir, exist_ok=True)
+
+        # Reserve CPU cores
+        self.reserved_cores = reserved_cores if reserved_cores else []
+
+        # Get available cores
+        all_cores = list(range(psutil.cpu_count(logical=True)))
+        self.worker_available_cores = [c for c in all_cores if c not in self.reserved_cores]
+
+        # Distribute cores among workers
+        self.worker_core_assignments = self._distribute_cores_to_workers()
 
         # Tracking the best hyperparameters
         self.best_hyperparams = None
@@ -323,14 +338,46 @@ class SimpleParallelTrainer:
         # Current replay buffer path
         self.current_replay_path = None
 
-        # Ensure reproducibility
-        #self.base_seed = 42
-        self.base_seed = 42 + int(time()) % 10000  # Add time-based randomness
+        # Ensure reproducibility with some randomness
+        self.base_seed = 42 + int(time()) % 10000
 
         # Training metrics
         self.start_time = None
         self.total_training_time = 0
         self.iteration_times = []
+
+    def _distribute_cores_to_workers(self):
+        """Distribute available cores among workers"""
+        worker_core_assignments = []
+
+        # Special case: if we have the same number of workers as available cores,
+        # each worker gets one core
+        if self.num_workers == len(self.worker_available_cores):
+            return [[core] for core in self.worker_available_cores]
+
+        # Special case: if we have fewer workers than available cores,
+        # distribute cores evenly among workers
+        if self.num_workers <= len(self.worker_available_cores):
+            cores_per_worker = len(self.worker_available_cores) // self.num_workers
+            extra_cores = len(self.worker_available_cores) % self.num_workers
+
+            start_idx = 0
+            for i in range(self.num_workers):
+                # Assign an extra core to early workers if there are extras
+                worker_core_count = cores_per_worker + (1 if i < extra_cores else 0)
+                worker_cores = self.worker_available_cores[start_idx:start_idx + worker_core_count]
+                worker_core_assignments.append(worker_cores)
+                start_idx += worker_core_count
+
+            return worker_core_assignments
+
+        # Case: more workers than cores - each worker gets assigned to a core
+        # in a round-robin fashion
+        for i in range(self.num_workers):
+            core_idx = i % len(self.worker_available_cores)
+            worker_core_assignments.append([self.worker_available_cores[core_idx]])
+
+        return worker_core_assignments
 
     def generate_hyperparameters(self, include_best=False):
         """Generate hyperparameter sets for workers with normal distribution around best values."""
@@ -342,8 +389,6 @@ class SimpleParallelTrainer:
             'gamma': (0.97, 0.999),  # Discount factor range
             'tau': (0.001, 0.02),  # Soft update rate range
             'alpha': (0.02, 0.35)  # Temperature parameter range
-            # updates_per_step is fixed to 1
-            # automatic_entropy_tuning is handled separately
         }
 
         # Define standard deviations for each parameter (as percentage of range)
@@ -442,8 +487,8 @@ class SimpleParallelTrainer:
         }
         return params
 
-    def run(self, verbose=False):
-        """Run the parallel training process."""
+    def run(self):
+        """Run the parallel training process, keeping only the best episode in RAM."""
         self.start_time = time()
 
         # Track rewards
@@ -451,15 +496,16 @@ class SimpleParallelTrainer:
         best_rewards = []
         all_balanced_times = []
 
+        # Create a manager for sharing data between processes
+        manager = Manager()
+
         for episode in range(self.max_episodes):
             episode_start_time = time()
 
             print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
 
-            # Use a unique seed for this episode with some randomness
-            import time as pytime
-            current_time = int(pytime.time())
-            episode_seed = self.base_seed + episode * 997 + current_time % 1000
+            # Use a unique seed for this episode
+            episode_seed = self.base_seed + episode * 997
 
             # Generate environment parameters
             env_params = self.generate_environment_params()
@@ -468,77 +514,82 @@ class SimpleParallelTrainer:
             # Generate hyperparameters for workers
             hyperparams_list = self.generate_hyperparameters(include_best=(episode > 0))
 
-            # Create parameter files and result files for each worker
-            param_files = []
-            result_files = []
+            # Create a shared queue for results
+            result_queue = manager.Queue()
+
+            # Start worker processes with CPU affinity
+            processes = []
             for worker_id in range(self.num_workers):
-                param_file = os.path.join(self.temp_dir, f"params_ep{episode}_worker{worker_id}.pkl")
-                result_file = os.path.join(self.temp_dir, f"results_ep{episode}_worker{worker_id}.pkl")
+                # Get assigned cores for this worker
+                worker_cores = self.worker_core_assignments[worker_id]
 
                 # Package parameters
                 params = {
                     'hyperparams': hyperparams_list[worker_id],
                     'env_params': env_params,
-                    'episode_seed': episode_seed,  # Pass the episode seed
+                    'episode_seed': episode_seed,
                     'base_model_path': self.current_model_path,
                     'replay_buffer_path': self.current_replay_path,
                     'hidden_dim': self.hidden_dim,
                     'state_dim': self.state_dim,
                     'action_dim': self.action_dim,
-                    'verbose': verbose  # Pass verbose flag
+                    'output_dir': self.output_dir
                 }
 
-                # Save parameters to file
-                with open(param_file, 'wb') as f:
-                    pickle.dump(params, f)
-
-                param_files.append(param_file)
-                result_files.append(result_file)
-
-            # Start worker processes
-            processes = []
-            for worker_id in range(self.num_workers):
                 p = mp.Process(
-                    target=worker_training_job,
-                    args=(worker_id, param_files[worker_id], result_files[worker_id], episode, verbose)
+                    target=worker_with_affinity,
+                    args=(worker_id, params, episode, worker_cores, result_queue, self.verbose)
                 )
                 p.start()
                 processes.append(p)
 
-            # Wait for all processes to complete
+            # Process results as they arrive, keeping track of the best
+            episode_results = []
+            episode_rewards = []
+            episode_balanced_times = []
+            best_result = None
+            best_result_reward = -float('inf')
+
+            # Collect results as they come in
+            completed_workers = 0
+            while completed_workers < self.num_workers:
+                # Get result from queue (blocking until a result is available)
+                result = result_queue.get()
+
+                if 'error' not in result:
+                    # Valid result
+                    episode_results.append(result)
+
+                    # Track metrics
+                    episode_rewards.append(result['reward'])
+                    episode_balanced_times.append(result.get('balanced_time', 0))
+
+                    # Check if this is the best result so far
+                    if result['reward'] > best_result_reward:
+                        best_result = result
+                        best_result_reward = result['reward']
+
+                        print(
+                            f"New best for this episode: Worker {result['worker_id']} with reward {result['reward']:.2f}")
+                else:
+                    print(f"Worker {result['worker_id']} failed with error: {result['error']}")
+
+                completed_workers += 1
+
+            # Make sure all processes are finished
             for p in processes:
                 p.join()
-
-            # Collect results
-            episode_results = []
-            for result_file in result_files:
-                if os.path.exists(result_file):
-                    try:
-                        with open(result_file, 'rb') as f:
-                            result = pickle.load(f)
-                        if 'error' not in result:
-                            episode_results.append(result)
-                        else:
-                            print(f"Worker {result['worker_id']} failed with error: {result['error']}")
-                    except Exception as e:
-                        print(f"Error loading result file {result_file}: {e}")
 
             # Calculate episode duration
             episode_duration = time() - episode_start_time
             self.iteration_times.append(episode_duration)
 
-            # Calculate elapsed and estimated time
-            elapsed_time = time() - self.start_time
-            avg_iteration_time = np.mean(self.iteration_times)
-            estimated_total_time = avg_iteration_time * self.max_episodes
-            remaining_time = estimated_total_time - elapsed_time
+            # Store episode results for plotting
+            all_rewards.append(episode_rewards)
+            all_balanced_times.append(episode_balanced_times)
 
-            # Find the best performer
-            if episode_results:
-                # Sort by episode reward
-                episode_results.sort(key=lambda x: x['reward'], reverse=True)
-                best_result = episode_results[0]
-
+            # Process the best result (if any valid results were returned)
+            if best_result:
                 print(f"\nBest performer: Worker {best_result['worker_id']}")
                 print(f"Episode reward: {best_result['reward']:.2f}")
                 print(f"Balanced time: {best_result['balanced_time']:.2f}s")
@@ -550,18 +601,7 @@ class SimpleParallelTrainer:
                       f"mL={env_params['mL']:.6f}, k={env_params['k']:.6f}, "
                       f"max_voltage={env_params['max_voltage']:.2f}V")
 
-                # Track rewards and balanced times
-                episode_rewards = [r['reward'] for r in episode_results]
-                episode_balanced_times = [r.get('balanced_time', 0) for r in episode_results]
-                all_rewards.append(episode_rewards)
-                all_balanced_times.append(episode_balanced_times)
                 best_rewards.append(best_result['reward'])
-
-                # Always use the best performer from the current episode for the next episode
-                # regardless of whether it beat the global best
-                self.best_hyperparams = deepcopy(best_result['hyperparams'])
-                self.current_model_path = best_result['model_path']
-                self.current_replay_path = best_result['replay_buffer_path']
 
                 # Copy the best episode plot to the best_episodes directory
                 if 'plot_path' in best_result and os.path.exists(best_result['plot_path']):
@@ -569,13 +609,18 @@ class SimpleParallelTrainer:
                     import shutil
                     shutil.copy2(best_result['plot_path'], best_plot_dest)
 
-                # Track the global best for reporting purposes only
+                # Update overall best if this episode's best is better than the global best
                 if best_result['reward'] > self.best_reward:
                     self.best_reward = best_result['reward']
+                    self.best_hyperparams = deepcopy(best_result['hyperparams'])
                     self.best_model_path = best_result['model_path']
-                    print(f"New best performance found! Reward: {self.best_reward:.2f}")
+                    print(f"New global best performance! Reward: {self.best_reward:.2f}")
                 else:
-                    print(f"Current episode best: {best_result['reward']:.2f} (Global best: {self.best_reward:.2f})")
+                    print(f"No improvement over previous global best: {self.best_reward:.2f}")
+
+                # Always use the best from the current episode for the next episode
+                self.current_model_path = best_result['model_path']
+                self.current_replay_path = best_result['replay_buffer_path']
 
                 # Store the best result for this episode
                 self.best_episode_results.append(best_result)
@@ -588,8 +633,21 @@ class SimpleParallelTrainer:
                     'balanced_time': best_result.get('balanced_time', 0)
                 })
 
-            # Store all results for this episode
-            self.episode_results.append(episode_results)
+            # Store summarized results for this episode - only keep metrics, not full trajectories
+            # This reduces memory usage compared to storing all worker results
+            summarized_results = []
+            for result in episode_results:
+                result_copy = result.copy()
+                # Remove large objects
+                if 'episode_states_sample' in result_copy:
+                    del result_copy['episode_states_sample']
+                if 'episode_actions_sample' in result_copy:
+                    del result_copy['episode_actions_sample']
+                if 'step_rewards_sample' in result_copy:
+                    del result_copy['step_rewards_sample']
+                summarized_results.append(result_copy)
+
+            self.episode_results.append(summarized_results)
 
             # Plot progress
             self._plot_training_progress(best_rewards, all_rewards, episode, all_balanced_times)
@@ -597,8 +655,11 @@ class SimpleParallelTrainer:
             # Plot hyperparameter evolution
             self._plot_hyperparameter_evolution(episode)
 
-            # Save intermediate state
-            self.save_results(os.path.join(self.output_dir, f"results_ep{episode + 1}.json"))
+            # Calculate elapsed and estimated time
+            elapsed_time = time() - self.start_time
+            avg_iteration_time = np.mean(self.iteration_times)
+            estimated_total_time = avg_iteration_time * self.max_episodes
+            remaining_time = estimated_total_time - elapsed_time
 
             # Print timing information
             elapsed_time_str = str(timedelta(seconds=int(elapsed_time)))
@@ -607,6 +668,10 @@ class SimpleParallelTrainer:
             print(f"Elapsed time: {elapsed_time_str}")
             print(f"Estimated remaining time: {remaining_time_str}")
             print(f"Estimated completion: {datetime.now() + timedelta(seconds=int(remaining_time))}")
+
+            # Save just the hyperparameter history and best results to disk periodically
+            if (episode + 1) % 10 == 0:
+                self.save_results(os.path.join(self.output_dir, f"results_snapshot_ep{episode + 1}.json"))
 
         # Training complete
         total_time = time() - self.start_time
@@ -630,7 +695,6 @@ class SimpleParallelTrainer:
                 hidden_dim=self.hidden_dim
             )
             best_agent.actor.load_state_dict(torch.load(self.best_model_path, map_location='cpu'))
-            self._final_evaluation(best_agent)
             return best_agent, self.best_hyperparams, self.best_reward
         else:
             print("Warning: Best model not found. Returning None.")
@@ -854,184 +918,8 @@ class SimpleParallelTrainer:
         except Exception as e:
             print(f"Error creating final hyperparameter analysis: {e}")
 
-    def _final_evaluation(self, agent, num_episodes=5):
-        """Perform final evaluation of the best agent."""
-        print("\n=== Final Evaluation of Best Agent ===")
-
-        eval_dir = os.path.join(self.output_dir, "final_evaluation")
-        os.makedirs(eval_dir, exist_ok=True)
-
-        # Different evaluation scenarios
-        eval_scenarios = [
-            {"name": "standard", "variable_dt": True, "param_variation": 0.0,
-             "voltage_range": (4.0, 4.0), "num_episodes": num_episodes},
-            {"name": "low_variation", "variable_dt": True, "param_variation": 0.1,
-             "voltage_range": (4.0, 8.0), "num_episodes": num_episodes},
-            {"name": "med_variation", "variable_dt": True, "param_variation": 0.2,
-             "voltage_range": (4.0, 12.0), "num_episodes": num_episodes},
-            {"name": "high_variation", "variable_dt": True, "param_variation": 0.3,
-             "voltage_range": (4.0, 16.0), "num_episodes": num_episodes}
-        ]
-
-        # Store results for comparison
-        scenario_results = {}
-
-        for scenario in eval_scenarios:
-            scenario_name = scenario.pop("name")
-            scenario_dir = os.path.join(eval_dir, scenario_name)
-            os.makedirs(scenario_dir, exist_ok=True)
-
-            print(f"\n--- {scenario_name.replace('_', ' ').title()} Evaluation ---")
-
-            rewards, times = self._evaluate_scenario(agent, scenario, scenario_dir)
-            scenario_results[scenario_name] = {
-                'rewards': rewards,
-                'balance_times': times,
-                'avg_reward': np.mean(rewards),
-                'avg_balance_time': np.mean(times) if times else 0
-            }
-
-        # Create comparison plot of different scenarios
-        self._plot_scenario_comparison(scenario_results, os.path.join(eval_dir, "scenario_comparison.png"))
-
-    def _evaluate_scenario(self, agent, scenario_params, output_dir):
-        """Evaluate the agent on a specific scenario."""
-        # Extract the num_episodes parameter before passing the rest to PendulumEnv
-        num_episodes = scenario_params.pop("num_episodes")
-
-        # Now create the environment without the num_episodes parameter
-        env = PendulumEnv(**scenario_params)
-
-        # Results tracking
-        rewards = []
-        balance_times = []
-
-        for episode in range(num_episodes):
-            state = env.reset(random_init=False)  # Start from standard position
-            total_reward = 0
-
-            # Data collection for visualization
-            states_history = []
-            actions_history = []
-            step_rewards = []
-
-            for step in range(env.max_steps):
-                # Select action without exploration
-                action = agent.select_action(state, evaluate=True)
-
-                # Perform action
-                next_state, reward, done, _ = env.step(action)
-
-                # Record data
-                states_history.append(env.state.copy())
-                actions_history.append(action)
-                step_rewards.append(reward)
-
-                total_reward += reward
-                state = next_state
-
-                if done:
-                    break
-
-            rewards.append(total_reward)
-            print(f"Evaluation episode {episode + 1}: Reward = {total_reward:.2f}")
-
-            # Calculate balance metrics
-            if len(states_history) > 0:
-                states_history = np.array(states_history)
-                alphas = states_history[:, 1]  # theta_1 (pendulum angle)
-
-                # Normalize angles
-                alpha_normalized = np.array([normalize_angle(a + np.pi) for a in alphas])
-
-                # Calculate balance time
-                balanced_time = 0.0
-                upright_threshold = 0.17  # about 10 degrees
-
-                for i in range(len(alpha_normalized)):
-                    if abs(alpha_normalized[i]) < upright_threshold:
-                        dt_value = env.time_history[i] if env.variable_dt and i < len(env.time_history) else env.dt
-                        balanced_time += dt_value
-
-                balance_times.append(balanced_time)
-                print(f"  Time balanced: {balanced_time:.2f} seconds")
-
-            # Create evaluation plot
-            plot_path = os.path.join(output_dir, f"eval_ep{episode + 1}.png")
-            if len(states_history) > 0:
-                plot_training_episode(
-                    episode,
-                    np.array(states_history),
-                    np.array(actions_history),
-                    env.time_history if env.variable_dt else [env.dt] * len(states_history),
-                    total_reward,
-                    env.params['max_voltage'],
-                    step_rewards,
-                    is_eval=True,
-                    save_path=plot_path
-                )
-
-        # Print summary
-        print("\n--- Scenario Evaluation Summary ---")
-        print(f"Average reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
-        if balance_times:
-            print(f"Average balanced time: {np.mean(balance_times):.2f} ± {np.std(balance_times):.2f} seconds")
-
-        return rewards, balance_times
-
-    def _plot_scenario_comparison(self, scenario_results, save_path):
-        """Create a comparison plot of different evaluation scenarios."""
-        if not scenario_results:
-            return
-
-        try:
-            # Create figure
-            plt.figure(figsize=(15, 10))
-
-            # Get scenario names and sort them in a sensible order
-            scenario_names = list(scenario_results.keys())
-            if 'standard' in scenario_names:
-                # Put standard first, then sort others by name
-                scenario_names.remove('standard')
-                scenario_names.sort()
-                scenario_names = ['standard'] + scenario_names
-            else:
-                scenario_names.sort()
-
-            # Plot average rewards
-            plt.subplot(2, 1, 1)
-            avg_rewards = [scenario_results[name]['avg_reward'] for name in scenario_names]
-            std_rewards = [np.std(scenario_results[name]['rewards']) for name in scenario_names]
-
-            x = np.arange(len(scenario_names))
-            plt.bar(x, avg_rewards, yerr=std_rewards, capsize=8)
-            plt.xticks(x, [name.replace('_', ' ').title() for name in scenario_names])
-            plt.ylabel('Average Reward')
-            plt.title('Performance Across Scenarios - Reward')
-            plt.grid(axis='y')
-
-            # Plot average balance times
-            plt.subplot(2, 1, 2)
-            avg_times = [scenario_results[name]['avg_balance_time'] for name in scenario_names]
-            std_times = [
-                np.std(scenario_results[name]['balance_times']) if scenario_results[name]['balance_times'] else 0
-                for name in scenario_names]
-
-            plt.bar(x, avg_times, yerr=std_times, capsize=8)
-            plt.xticks(x, [name.replace('_', ' ').title() for name in scenario_names])
-            plt.ylabel('Average Balance Time (s)')
-            plt.title('Performance Across Scenarios - Balance Time')
-            plt.grid(axis='y')
-
-            plt.tight_layout()
-            plt.savefig(save_path)
-            plt.close()
-
-        except Exception as e:
-            print(f"Error creating scenario comparison plot: {e}")
-
     def save_results(self, filename):
-        """Save training results to a JSON file."""
+        """Save only essential training results to a JSON file."""
 
         # Convert numpy values to Python types for JSON serialization
         def convert_to_serializable(obj):
@@ -1048,30 +936,22 @@ class SimpleParallelTrainer:
             else:
                 return obj
 
-        # Extract relevant results, excluding paths to files and large arrays
-        simplified_episode_results = []
-        for episode_data in self.episode_results:
-            simplified_data = []
-            for worker_data in episode_data:
-                worker_data_copy = worker_data.copy()
-                # Remove file paths and large arrays
-                if 'model_path' in worker_data_copy:
-                    worker_data_copy['model_path'] = os.path.basename(worker_data_copy['model_path'])
-                if 'replay_buffer_path' in worker_data_copy:
-                    worker_data_copy['replay_buffer_path'] = os.path.basename(worker_data_copy['replay_buffer_path'])
-                if 'plot_path' in worker_data_copy:
-                    worker_data_copy['plot_path'] = os.path.basename(worker_data_copy['plot_path'])
-                if 'episode_states' in worker_data_copy:
-                    worker_data_copy.pop('episode_states')
-                if 'episode_actions' in worker_data_copy:
-                    worker_data_copy.pop('episode_actions')
-                if 'step_rewards' in worker_data_copy:
-                    worker_data_copy.pop('step_rewards')
-                simplified_data.append(worker_data_copy)
-            simplified_episode_results.append(simplified_data)
-
-        # Prepare hyperparameter history for serialization
+        # Extract only the essential information
         serialized_hyperparameter_history = convert_to_serializable(self.hyperparameter_history)
+
+        # Only store summaries of the best results, not all worker results
+        best_episode_summaries = []
+        for result in self.best_episode_results:
+            summary = {
+                'episode': result['episode_num'],
+                'worker_id': result['worker_id'],
+                'reward': result['reward'],
+                'balanced_time': result.get('balanced_time', 0),
+                'hyperparams': result['hyperparams'],
+                'model_path': os.path.basename(result['model_path']),
+                'plot_path': os.path.basename(result['plot_path']) if 'plot_path' in result else None,
+            }
+            best_episode_summaries.append(summary)
 
         results = {
             'run_id': self.run_id,
@@ -1085,266 +965,8 @@ class SimpleParallelTrainer:
             'total_training_time': self.total_training_time,
             'iteration_times': convert_to_serializable(self.iteration_times),
             'hyperparameter_history': serialized_hyperparameter_history,
-            'episode_results': convert_to_serializable(simplified_episode_results)
+            'best_episode_summaries': best_episode_summaries
         }
 
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2)
-
-
-class CPUAffinityTrainer(SimpleParallelTrainer):
-    """Trainer that assigns specific CPU cores to workers for better resource management."""
-
-    def __init__(
-            self,
-            num_workers=3,
-            max_episodes=500,
-            hidden_dim=256,
-            state_dim=6,
-            action_dim=1,
-            output_dir="episode_parallel_results",
-            reserved_cores=None,
-            verbose=False
-    ):
-        super().__init__(num_workers, max_episodes, hidden_dim, state_dim, action_dim, output_dir)
-        self.reserved_cores = reserved_cores if reserved_cores else []
-        self.verbose = verbose
-
-        # Get available cores
-        all_cores = list(range(psutil.cpu_count(logical=True)))
-        self.worker_available_cores = [c for c in all_cores if c not in self.reserved_cores]
-
-        # Distribute cores among workers
-        self.worker_core_assignments = self._distribute_cores_to_workers()
-
-    def _distribute_cores_to_workers(self):
-        """Distribute available cores among workers"""
-        worker_core_assignments = []
-
-        # Special case: if we have the same number of workers as available cores,
-        # each worker gets one core
-        if self.num_workers == len(self.worker_available_cores):
-            return [[core] for core in self.worker_available_cores]
-
-        # Special case: if we have fewer workers than available cores,
-        # distribute cores evenly among workers
-        if self.num_workers <= len(self.worker_available_cores):
-            cores_per_worker = len(self.worker_available_cores) // self.num_workers
-            extra_cores = len(self.worker_available_cores) % self.num_workers
-
-            start_idx = 0
-            for i in range(self.num_workers):
-                # Assign an extra core to early workers if there are extras
-                worker_core_count = cores_per_worker + (1 if i < extra_cores else 0)
-                worker_cores = self.worker_available_cores[start_idx:start_idx + worker_core_count]
-                worker_core_assignments.append(worker_cores)
-                start_idx += worker_core_count
-
-            return worker_core_assignments
-
-        # Case: more workers than cores - each worker gets assigned to a core
-        # in a round-robin fashion
-        for i in range(self.num_workers):
-            core_idx = i % len(self.worker_available_cores)
-            worker_core_assignments.append([self.worker_available_cores[core_idx]])
-
-        return worker_core_assignments
-
-    def run(self):
-        """Modified run method that assigns CPU cores to workers"""
-        self.start_time = time()
-
-        # Track rewards
-        all_rewards = []
-        best_rewards = []
-        all_balanced_times = []
-
-        for episode in range(self.max_episodes):
-            episode_start_time = time()
-
-            print(f"\n=== Starting Episode {episode + 1}/{self.max_episodes} ===")
-
-            # Use a unique seed for this episode
-            episode_seed = self.base_seed + episode * 997  # 997 is a prime number
-
-            # Generate environment parameters
-            env_params = self.generate_environment_params()
-            print(f"Environment params: {env_params}")
-
-            # Generate hyperparameters for workers
-            hyperparams_list = self.generate_hyperparameters(include_best=(episode > 0))
-
-            # Create parameter files and result files for each worker
-            param_files = []
-            result_files = []
-            for worker_id in range(self.num_workers):
-                param_file = os.path.join(self.temp_dir, f"params_ep{episode}_worker{worker_id}.pkl")
-                result_file = os.path.join(self.temp_dir, f"results_ep{episode}_worker{worker_id}.pkl")
-
-                # Package parameters
-                params = {
-                    'hyperparams': hyperparams_list[worker_id],
-                    'env_params': env_params,
-                    'episode_seed': episode_seed,  # Pass the episode seed
-                    'base_model_path': self.current_model_path,
-                    'replay_buffer_path': self.current_replay_path,
-                    'hidden_dim': self.hidden_dim,
-                    'state_dim': self.state_dim,
-                    'action_dim': self.action_dim
-                }
-
-                # Save parameters to file
-                with open(param_file, 'wb') as f:
-                    pickle.dump(params, f)
-
-                param_files.append(param_file)
-                result_files.append(result_file)
-
-            # Start worker processes with CPU affinity
-            processes = []
-            for worker_id in range(self.num_workers):
-                # Get assigned cores for this worker
-                worker_cores = self.worker_core_assignments[worker_id]
-
-                # Import here to avoid circular imports
-                from cpu_affinity_worker import affinity_worker_training_job
-
-                p = mp.Process(
-                    target=affinity_worker_training_job,
-                    args=(
-                    worker_id, param_files[worker_id], result_files[worker_id], episode, worker_cores, self.verbose)
-                )
-                p.start()
-                processes.append(p)
-
-            # Wait for all processes to complete
-            for p in processes:
-                p.join()
-
-            # Collect results
-            episode_results = []
-            for result_file in result_files:
-                if os.path.exists(result_file):
-                    try:
-                        with open(result_file, 'rb') as f:
-                            result = pickle.load(f)
-                        if 'error' not in result:
-                            episode_results.append(result)
-                        else:
-                            print(f"Worker {result['worker_id']} failed with error: {result['error']}")
-                    except Exception as e:
-                        print(f"Error loading result file {result_file}: {e}")
-
-            # Calculate episode duration
-            episode_duration = time() - episode_start_time
-            self.iteration_times.append(episode_duration)
-
-            # Calculate elapsed and estimated time
-            elapsed_time = time() - self.start_time
-            avg_iteration_time = np.mean(self.iteration_times)
-            estimated_total_time = avg_iteration_time * self.max_episodes
-            remaining_time = estimated_total_time - elapsed_time
-
-            # Find the best performer
-            if episode_results:
-                # Sort by episode reward
-                episode_results.sort(key=lambda x: x['reward'], reverse=True)
-                best_result = episode_results[0]
-
-                print(f"\nBest performer: Worker {best_result['worker_id']}")
-                print(f"Episode reward: {best_result['reward']:.2f}")
-                print(f"Balanced time: {best_result['balanced_time']:.2f}s")
-                print(f"Hyperparameters: {best_result['hyperparams']}")
-
-                # Print environment parameters of the best result
-                env_params = best_result['env_params']
-                print(f"Environment parameters: Rm={env_params['Rm']:.4f}, Km={env_params['Km']:.6f}, "
-                      f"mL={env_params['mL']:.6f}, k={env_params['k']:.6f}, "
-                      f"max_voltage={env_params['max_voltage']:.2f}V")
-
-                # Track rewards and balanced times
-                episode_rewards = [r['reward'] for r in episode_results]
-                episode_balanced_times = [r.get('balanced_time', 0) for r in episode_results]
-                all_rewards.append(episode_rewards)
-                all_balanced_times.append(episode_balanced_times)
-                best_rewards.append(best_result['reward'])
-
-                # Update overall best if this is better
-                if best_result['reward'] > self.best_reward:
-                    self.best_reward = best_result['reward']
-                    self.best_hyperparams = deepcopy(best_result['hyperparams'])
-                    self.best_model_path = best_result['model_path']
-
-                    # Update current model path for next episode
-                    self.current_model_path = best_result['model_path']
-                    self.current_replay_path = best_result['replay_buffer_path']
-
-                    # Copy the best episode plot to the best_episodes directory
-                    if 'plot_path' in best_result and os.path.exists(best_result['plot_path']):
-                        best_plot_dest = os.path.join(self.best_episodes_dir, f"best_episode_{episode + 1}.png")
-                        import shutil
-                        shutil.copy2(best_result['plot_path'], best_plot_dest)
-
-                    print(f"New best performance found! Reward: {self.best_reward:.2f}")
-                else:
-                    print(f"No improvement over previous best: {self.best_reward:.2f}")
-
-                # Store the best result for this episode
-                self.best_episode_results.append(best_result)
-
-                # Track hyperparameter evolution
-                self.hyperparameter_history.append({
-                    'episode': episode,
-                    'hyperparams': best_result['hyperparams'],
-                    'reward': best_result['reward'],
-                    'balanced_time': best_result.get('balanced_time', 0)
-                })
-
-            # Store all results for this episode
-            self.episode_results.append(episode_results)
-
-            # Plot progress
-            self._plot_training_progress(best_rewards, all_rewards, episode, all_balanced_times)
-
-            # Plot hyperparameter evolution
-            self._plot_hyperparameter_evolution(episode)
-
-            # Save intermediate state
-            self.save_results(os.path.join(self.output_dir, f"results_ep{episode + 1}.json"))
-
-            # Print timing information
-            elapsed_time_str = str(timedelta(seconds=int(elapsed_time)))
-            remaining_time_str = str(timedelta(seconds=int(remaining_time)))
-            print(f"\nEpisode duration: {episode_duration:.1f}s")
-            print(f"Elapsed time: {elapsed_time_str}")
-            print(f"Estimated remaining time: {remaining_time_str}")
-            print(f"Estimated completion: {datetime.now() + timedelta(seconds=int(remaining_time))}")
-
-        # Training complete
-        total_time = time() - self.start_time
-        self.total_training_time = total_time
-        print(f"\n=== Training Complete ===")
-        print(f"Total time: {str(timedelta(seconds=int(total_time)))}")
-        print(f"Best reward: {self.best_reward:.2f}")
-        print(f"Best hyperparameters: {self.best_hyperparams}")
-
-        # Save final results
-        self.save_results(os.path.join(self.output_dir, "results_final.json"))
-
-        # Create final hyperparameter plots
-        self._plot_final_hyperparameter_analysis()
-
-        # Load the best model for return
-        if self.best_model_path and os.path.exists(self.best_model_path):
-            from SimRL import SACAgent
-            best_agent = SACAgent(
-                state_dim=self.state_dim,
-                action_dim=self.action_dim,
-                hidden_dim=self.hidden_dim
-            )
-            best_agent.actor.load_state_dict(torch.load(self.best_model_path, map_location='cpu'))
-            self._final_evaluation(best_agent)
-            return best_agent, self.best_hyperparams, self.best_reward
-        else:
-            print("Warning: Best model not found. Returning None.")
-            return None, self.best_hyperparams, self.best_reward

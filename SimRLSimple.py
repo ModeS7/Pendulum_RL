@@ -1344,9 +1344,9 @@ if __name__ == "__main__":
     # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
         variable_dt=True,
-        param_variation=0.1,
-        # voltage_range=(2.0, 18.0),
-        max_episodes=1000,
+        param_variation=0.2,
+        voltage_range=(2.0, 18.0),
+        max_episodes=100,
         eval_interval=10
     )
 

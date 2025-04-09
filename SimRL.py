@@ -648,7 +648,6 @@ class SACAgent:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
 
-        # Improved optimizers with weight decay (AdamW)
         self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr, weight_decay=1e-4)
         self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr, weight_decay=1e-4)
 

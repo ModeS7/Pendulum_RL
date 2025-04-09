@@ -7,25 +7,27 @@ from time import time
 import psutil
 
 # Import the custom trainer from episode_parallel_trainer
-from episode_parallel_trainer import CPUAffinityTrainer
+from episode_parallel_trainer import OptimizedCPUAffinityTrainer
+
 
 if __name__ == "__main__":
+
     # Get CPU information
     total_cores = psutil.cpu_count(logical=True)
     physical_cores = psutil.cpu_count(logical=False)
 
     # Set up argument parser for command line options
-    parser = argparse.ArgumentParser(description='Episode-Level Parallel Training for Inverted Pendulum Control')
+    parser = argparse.ArgumentParser(description='Episode-Level Parallel Training with RAM-Only Best Results')
     parser.add_argument('--workers', type=int, default=6,
-                        help=f'Number of parallel workers per episode (default: 6)')
+                      help=f'Number of parallel workers per episode (default: 6)')
     parser.add_argument('--reserve-cores', type=int, default=2,
-                        help='Number of CPU cores to completely reserve (default: 1)')
+                      help='Number of CPU cores to completely reserve (default: 2)')
     parser.add_argument('--reserve-specific', type=str, default=None,
-                        help='Comma-separated list of specific core IDs to reserve (e.g., "0,1")')
+                      help='Comma-separated list of specific core IDs to reserve (e.g., "0,1")')
     parser.add_argument('--episodes', type=int, default=500, help='Total number of episodes to train')
     parser.add_argument('--hidden-dim', type=int, default=256, help='Hidden layer size for all networks')
     parser.add_argument('--output-dir', type=str, default='episode_parallel_results',
-                        help='Directory to save results')
+                      help='Directory to save results')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output including core assignments')
 
@@ -58,15 +60,10 @@ if __name__ == "__main__":
         # Reserve the specified number of cores (from the beginning)
         reserved_cores = all_cores[:args.reserve_cores]
 
-    # The cores available for workers
-    worker_available_cores = [c for c in all_cores if c not in reserved_cores]
-
     print("=" * 80)
-    print("Starting Episode-Level Parallel Training for Inverted Pendulum Control")
+    print("Starting RAM-Only Best Results Parallel Training for Inverted Pendulum Control")
     print(f"CPU: {physical_cores} physical cores, {total_cores} logical processors")
     print(f"Reserved cores: {reserved_cores}")
-    print(f"Available cores for workers: {worker_available_cores}")
-    print(f"Workers per episode: {args.workers}")
     print(f"Verbose mode: {'Enabled' if args.verbose else 'Disabled'}")
     print(f"Total episodes: {args.episodes}")
     print(f"Network architecture: {args.hidden_dim} units per hidden layer")
@@ -76,8 +73,8 @@ if __name__ == "__main__":
     # Start measuring total time
     start_time = time()
 
-    # Initialize the custom trainer
-    trainer = CPUAffinityTrainer(
+    # Initialize the optimized trainer
+    trainer = OptimizedCPUAffinityTrainer(
         num_workers=args.workers,
         max_episodes=args.episodes,
         hidden_dim=args.hidden_dim,
@@ -95,7 +92,7 @@ if __name__ == "__main__":
     minutes, seconds = divmod(remainder, 60)
 
     print("\n" + "=" * 80)
-    print(f"Episode-Level Parallel Training Complete!")
+    print(f"RAM-Only Episode-Level Parallel Training Complete!")
     print(f"Total runtime: {int(hours)}h {int(minutes)}m {seconds:.1f}s")
     print(f"Best reward achieved: {best_reward:.2f}")
     print(f"Best hyperparameters: {best_hyperparams}")
