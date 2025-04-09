@@ -801,7 +801,7 @@ def train(
     state_dim = 6  # Observation space dimension
     action_dim = 1  # Motor voltage (normalized)
     max_steps = 1000  # Max steps per episode
-    batch_size = 512  # Batch size
+    batch_size = 512 * 3  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
     updates_per_step = 3  # Updates per environment step
 
