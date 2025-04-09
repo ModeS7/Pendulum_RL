@@ -51,7 +51,7 @@ def worker_training_job(worker_id, params, episode_num, result_queue, verbose=Fa
         env_params = params['env_params']
         episode_seed = params.get('episode_seed', 42 + episode_num)
         base_model_path = params['base_model_path']
-        replay_buffer_path = params.get('replay_buffer_path')
+        initial_replay_buffer = params.get('replay_buffer', None)  # Get the buffer directly
         hidden_dim = params['hidden_dim']
         state_dim = params['state_dim']
         action_dim = params['action_dim']
@@ -112,17 +112,13 @@ def worker_training_job(worker_id, params, episode_num, result_queue, verbose=Fa
         if base_model_path and os.path.exists(base_model_path):
             agent.actor.load_state_dict(torch.load(base_model_path, map_location='cpu'))
 
-        # Reconstruct replay buffer if available
-        replay_buffer = ReplayBuffer(100000)
-        if replay_buffer_path and os.path.exists(replay_buffer_path):
-            try:
-                with open(replay_buffer_path, 'rb') as f:
-                    replay_data = pickle.load(f)
-                for transition in replay_data:
-                    replay_buffer.push(*transition)
-            except Exception as e:
-                if verbose:
-                    print(f"Error loading replay buffer: {e}")
+        # Initialize replay buffer with full capacity
+        replay_buffer = ReplayBuffer(100000)  # Increase buffer size to 100000
+
+        # Load from initial replay buffer if provided
+        if initial_replay_buffer is not None:
+            for transition in initial_replay_buffer:
+                replay_buffer.push(*transition)
 
         # Train for one episode
         batch_size = 512
@@ -181,21 +177,9 @@ def worker_training_job(worker_id, params, episode_num, result_queue, verbose=Fa
         # Calculate episode duration
         episode_duration = time() - episode_start_time
 
-        # Only save the model if we have good performance - this reduces disk I/O
-        # Save to a temporary file that will be replaced if this worker's model is best
+        # Save the model
         model_path = os.path.join(worker_dir, "actor_model.pth")
         torch.save(agent.actor.state_dict(), model_path)
-
-        # Sample a subset of replay buffer to save
-        replay_sample = []
-        if len(replay_buffer) > 0:
-            indices = np.random.choice(len(replay_buffer), min(5000, len(replay_buffer)), replace=False)
-            for i in indices:
-                replay_sample.append(replay_buffer.buffer[i])
-
-        replay_path = os.path.join(worker_dir, "replay_buffer.pkl")
-        with open(replay_path, 'wb') as f:
-            pickle.dump(replay_sample, f)
 
         # Generate plot for this episode
         plot_path = os.path.join(worker_dir, "episode_plot.png")
@@ -231,6 +215,10 @@ def worker_training_job(worker_id, params, episode_num, result_queue, verbose=Fa
         # Get current environment parameters
         current_params = env.get_current_parameters()
 
+        # Instead of saving the buffer to disk, put it directly in the results
+        # Convert the buffer to a list of tuples for easier serialization
+        buffer_data = replay_buffer.buffer[:len(replay_buffer)]  # Get all transitions
+
         # Prepare results
         results = {
             'worker_id': worker_id,
@@ -242,7 +230,7 @@ def worker_training_job(worker_id, params, episode_num, result_queue, verbose=Fa
             'actor_loss': avg_actor_loss,
             'alpha': avg_alpha if isinstance(avg_alpha, float) else float(avg_alpha),
             'model_path': model_path,
-            'replay_buffer_path': replay_path,
+            'replay_buffer': buffer_data,  # Include the full buffer directly
             'episode_duration': episode_duration,
             'env_params': current_params,
             'episode_length': len(episode_states),
@@ -336,7 +324,7 @@ class OptimizedCPUAffinityTrainer:
         self.current_model_path = None
 
         # Current replay buffer path
-        self.current_replay_path = None
+        self.current_replay_buffer = None
 
         # Ensure reproducibility with some randomness
         self.base_seed = 42 + int(time()) % 10000
@@ -523,13 +511,13 @@ class OptimizedCPUAffinityTrainer:
                 # Get assigned cores for this worker
                 worker_cores = self.worker_core_assignments[worker_id]
 
-                # Package parameters
+                # Package parameters, including the replay buffer directly
                 params = {
                     'hyperparams': hyperparams_list[worker_id],
                     'env_params': env_params,
                     'episode_seed': episode_seed,
                     'base_model_path': self.current_model_path,
-                    'replay_buffer_path': self.current_replay_path,
+                    'replay_buffer': self.current_replay_buffer,  # Pass buffer directly
                     'hidden_dim': self.hidden_dim,
                     'state_dim': self.state_dim,
                     'action_dim': self.action_dim,
@@ -620,7 +608,7 @@ class OptimizedCPUAffinityTrainer:
 
                 # Always use the best from the current episode for the next episode
                 self.current_model_path = best_result['model_path']
-                self.current_replay_path = best_result['replay_buffer_path']
+                self.current_replay_buffer = best_result['replay_buffer']  # Store buffer directly
 
                 # Store the best result for this episode
                 self.best_episode_results.append(best_result)
