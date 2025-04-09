@@ -9,6 +9,10 @@ import numba as nb
 from time import time
 from numpy.ma.core import arctan2
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.utils.tensorboard as tb
+from torch.utils.tensorboard import SummaryWriter
+import os
+from datetime import datetime
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
@@ -644,14 +648,14 @@ class SACAgent:
             target_param.data.copy_(param.data)
 
         # Optimizers
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
+        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
+        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr)
 
         # Automatic entropy tuning
         if automatic_entropy_tuning:
             self.target_entropy = -torch.prod(torch.Tensor([action_dim])).item()
             self.log_alpha = torch.zeros(1, requires_grad=True)
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
+            self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -799,7 +803,7 @@ def train(
     max_steps = 1000  # Max steps per episode
     batch_size = 512  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
-    updates_per_step = 1  # Updates per environment step
+    updates_per_step = 3  # Updates per environment step
 
     # Initialize agent (load pre-trained models if provided)
     if actor_path or critic_path:
@@ -1344,9 +1348,9 @@ if __name__ == "__main__":
     # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
         variable_dt=True,
-        param_variation=0.2,
-        voltage_range=(2.0, 18.0),
-        max_episodes=100,
+        param_variation=0.3,
+        voltage_range=(4.0, 18.0),
+        max_episodes=1000,
         eval_interval=10
     )
 
