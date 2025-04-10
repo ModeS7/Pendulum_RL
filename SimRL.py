@@ -3,16 +3,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 import numba as nb
 from time import time
 from numpy.ma.core import arctan2
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
-base_max_voltage = 4.0  # Base maximum motor voltage
+base_max_voltage = 6.0  # Base maximum motor voltage
 THETA_MIN = -2.2  # Minimum arm angle (radians)
 THETA_MAX = 2.2  # Maximum arm angle (radians)
 
@@ -35,7 +33,6 @@ base_LL = 0.128  # Length of pendulum link (m)
 base_JA = 0.0000572 + 0.00006  # Arm inertia about pivot (kg·m²)
 base_JL = 0.0000235  # Pendulum inertia about pivot (kg·m²)
 base_k = 0.002  # Torsional spring constant (N·m/rad)
-
 
 # ====== Helper Functions ======
 @nb.njit(fastmath=True, cache=True)
@@ -511,12 +508,12 @@ class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Actor, self).__init__()
 
-        # Improved network with SiLU activation and LayerNorm
+
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU()
         )
 
         # Mean and log std for continuous action
@@ -557,12 +554,12 @@ class Actor(nn.Module):
 
 # ====== Critic Network ======
 class Critic(nn.Module):
-    """Value network that estimates Q-values with modern improvements."""
+    """Value network that estimates Q-values."""
 
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Critic, self).__init__()
 
-        # Improved Q1 network with SiLU and LayerNorm
+        # Q1 network
         self.q1 = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
             nn.ReLU(),
@@ -620,7 +617,7 @@ class ReplayBuffer:
 
 # ====== SAC Agent ======
 class SACAgent:
-    """Soft Actor-Critic agent with modern training techniques."""
+    """Soft Actor-Critic agent for continuous control."""
 
     def __init__(
             self,
@@ -631,8 +628,7 @@ class SACAgent:
             gamma=0.99,
             tau=0.005,
             alpha=0.2,
-            automatic_entropy_tuning=True,
-            max_episodes=1000
+            automatic_entropy_tuning=True
     ):
         self.gamma = gamma
         self.tau = tau
@@ -648,19 +644,15 @@ class SACAgent:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
 
-        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr, weight_decay=1e-4)
-        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr, weight_decay=1e-4)
-
-        # Learning rate schedulers
-        self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=max_episodes)
-        self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=max_episodes)
+        # Optimizers
+        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
+        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr)
 
         # Automatic entropy tuning
         if automatic_entropy_tuning:
             self.target_entropy = -torch.prod(torch.Tensor([action_dim])).item()
             self.log_alpha = torch.zeros(1, requires_grad=True)
-            self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr, weight_decay=1e-4)
-            self.alpha_scheduler = CosineAnnealingLR(self.alpha_optimizer, T_max=max_episodes)
+            self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -726,10 +718,6 @@ class SACAgent:
         # Optimize critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-
-        # Apply gradient clipping to critic
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
-
         self.critic_optimizer.step()
 
         # === Update Actor ===
@@ -752,10 +740,6 @@ class SACAgent:
         # Optimize actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-
-        # Apply gradient clipping to actor
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-
         self.actor_optimizer.step()
 
         # === Update Alpha (if automatic entropy tuning) ===
@@ -780,12 +764,6 @@ class SACAgent:
             'alpha': self.alpha.item() if self.automatic_entropy_tuning else self.alpha
         }
 
-    def scheduler_step(self):
-        """Step all learning rate schedulers (call at end of episode)"""
-        self.actor_scheduler.step()
-        self.critic_scheduler.step()
-        if self.automatic_entropy_tuning:
-            self.alpha_scheduler.step()
 
 # ====== Training Function ======
 def train(
@@ -802,8 +780,6 @@ def train(
     print("Starting SAC training for inverted pendulum control...")
     print(f"Using variable time steps: {variable_dt}")
     print(f"Using parameter variation: {param_variation if not fixed_params else 'OFF'}")
-    torch.manual_seed(0)
-    np.random.seed(0)
 
     if voltage_range:
         print(f"Using voltage range: {voltage_range[0]} to {voltage_range[1]} V")
@@ -822,17 +798,17 @@ def train(
     state_dim = 6  # Observation space dimension
     action_dim = 1  # Motor voltage (normalized)
     max_steps = 1000  # Max steps per episode
-    batch_size = 512  # Increased batch size
+    batch_size = 512 * 3  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
-    updates_per_step = 1  # Updates per environment step
+    updates_per_step = 3  # Updates per environment step
 
     # Initialize agent (load pre-trained models if provided)
     if actor_path or critic_path:
-        agent = load_agent(actor_path, critic_path, state_dim, action_dim, max_episodes=max_episodes)
+        agent = load_agent(actor_path, critic_path, state_dim, action_dim)
         print("Loaded pre-trained models")
     else:
-        agent = SACAgent(state_dim, action_dim, max_episodes=max_episodes)
-        print("Initialized new agent with improved architecture")
+        agent = SACAgent(state_dim, action_dim)
+        print("Initialized new agent")
 
     # Initialize replay buffer
     replay_buffer = ReplayBuffer(replay_buffer_size)
@@ -889,9 +865,6 @@ def train(
             if done:
                 break
 
-        # Step the learning rate schedulers at the end of each episode
-        agent.scheduler_step()
-
         # Log progress
         episode_rewards.append(episode_reward)
         avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
@@ -916,7 +889,7 @@ def train(
             print(
                 f"  Parameters: Rm={current_params['Rm']:.4f}, Km={current_params['Km']:.6f}, "
                 f"mL={current_params['mL']:.6f}, k={current_params['k']:.6f}, "
-                f"max_voltage={current_params['max_voltage']:.2f}V"
+                f"max_voltage={current_params['max_voltage']:.2f}V"  # Added max_voltage to log
             )
 
             # Plot simulation for visual progress tracking
@@ -953,7 +926,7 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 10000 and episode > 500:
+        if avg_reward > 5000 and episode > 100:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
@@ -1002,10 +975,10 @@ def train(
 
 
 # ====== Load Agent Helper ======
-def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hidden_dim=256, max_episodes=500):
+def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hidden_dim=256):
     """Load pre-trained actor and critic models."""
-    # Initialize a new agent with improved architecture
-    agent = SACAgent(state_dim, action_dim, hidden_dim, max_episodes=max_episodes)
+    # Initialize a new agent
+    agent = SACAgent(state_dim, action_dim, hidden_dim)
 
     # Load actor if path is provided
     if actor_path:
@@ -1024,8 +997,7 @@ def load_agent(actor_path=None, critic_path=None, state_dim=6, action_dim=1, hid
 
 # ====== Visualization Helper ======
 def plot_training_episode(episode, states_history, actions_history, dt_history, episode_reward,
-                          max_voltage=base_max_voltage, rewards_history=None, is_eval=False,
-                          save_path=None):
+                          max_voltage=base_max_voltage, rewards_history=None):
     """Plot the pendulum state evolution for a training episode."""
     # Convert history to numpy arrays
     states_history = np.array(states_history)
@@ -1141,11 +1113,7 @@ def plot_training_episode(episode, states_history, actions_history, dt_history, 
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
-    else:
-        plt.savefig(f"{'eval' if is_eval else 'training'}_episode_{episode + 1}.png")
-
+    plt.savefig(f"training_episode_{episode + 1}.png")
     plt.close()
 
 
@@ -1372,26 +1340,34 @@ if __name__ == "__main__":
     print("Inverted Pendulum Control with Soft Actor-Critic")
     print("=" * 60)
 
+    # Choose one training configuration
+
+    # Option 1: Train a new agent from scratch with variable voltage range
     agent = train(
-        # actor_path="actor_final_1743528264.pth",
-        # critic_path="critic_final_1743528264.pth",
         variable_dt=True,
-        param_variation=0.2,
-        # fixed_params=True,
+        param_variation=0.3,
         voltage_range=(4.0, 18.0),
         max_episodes=1000,
         eval_interval=10
     )
 
+    # Option 2: Continue training from pre-trained model
+    """agent = train(
+        actor_path="actor_final_1743528264.pth",
+        critic_path="critic_final_1743528264.pth",
+        variable_dt=True,
+        param_variation=0.25,
+        #voltage_range=(2.0, 18.0),
+        max_episodes=300,
+        eval_interval=10
+    )"""
+
     # Evaluate trained agent with different parameter variations
     print("\n--- Standard Evaluation ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.0)
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.15)
 
     print("\n--- Robustness Test (High Variation) ---")
     evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.25)
-
-    print("\n--- Robustness Test (High Variation) ---")
-    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.35)
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")
