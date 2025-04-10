@@ -4,15 +4,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 import numba as nb
 from time import time
 from numpy.ma.core import arctan2
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import torch.utils.tensorboard as tb
-from torch.utils.tensorboard import SummaryWriter
-import os
-from datetime import datetime
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
@@ -929,7 +923,7 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 10000 and episode > 500:
+        if avg_reward > 5000 and episode > 100:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
