@@ -194,22 +194,19 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None):
     file_name = os.path.basename(file_path)
     file_name_no_ext = os.path.splitext(file_name)[0]
 
-    # Plot normalized pendulum angle as scatter points
+    # Plot normalized pendulum angle and motor position on top subplot
     if 'NormalizedPendulumAngle' in df.columns:
-        # Use scatter plot with markers for pendulum angle (blue)
-        axs[0].scatter(df['Time'], df['NormalizedPendulumAngle'],
-                       color='b', marker='.', s=10, alpha=0.7,
-                       label='Pendulum Angle (rad)')
+        axs[0].plot(df['Time'], df['NormalizedPendulumAngle'], 'b-', linewidth=1.5,
+                    label='Pendulum Angle (rad)')
 
     if 'NormalizedMotorPosition' in df.columns:
-        # Keep using a line for motor position
         axs[0].plot(df['Time'], df['NormalizedMotorPosition'], 'g-', linewidth=1.5,
                     label='Arm Position (rad)')
 
     # Add reference line at 0 (upright position)
     axs[0].axhline(y=0, color='k', linestyle=':', alpha=0.7, label='Upright Position')
 
-    # Plot voltage on bottom subplot using red color
+    # Plot voltage on bottom subplot with RED color
     if 'Voltage' in df.columns:
         axs[1].plot(df['Time'], df['Voltage'], 'r-', linewidth=1.5, label='Voltage (V)')
 
@@ -271,9 +268,11 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
     # Create subplots
     fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
 
-    # Color cycle for different datasets
-    colors = ['b', 'g', 'c', 'm', 'y', 'k']
-    markers = ['.', 'o', 's', '^', 'x', 'd']
+    # Color cycle for different datasets (for pendulum angles)
+    angle_colors = ['b', 'g', 'c', 'm', 'y', 'k', 'purple', 'orange', 'brown', 'pink']
+
+    # Color cycle for voltage plots (different shades of red)
+    voltage_colors = ['r', 'darkred', 'firebrick', 'indianred', 'lightcoral', 'crimson', 'maroon', 'salmon']
 
     # Keep track of the overall pendulum angle range
     pend_min = float('inf')
@@ -333,28 +332,19 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
         # Use the filename as the label
         label = file_name_no_ext
 
-        color = colors[i % len(colors)]
-        marker = markers[i % len(markers)]
+        # Get colors for this dataset
+        angle_color = angle_colors[i % len(angle_colors)]
+        voltage_color = voltage_colors[i % len(voltage_colors)]
 
-        # Plot normalized pendulum angle on top subplot as scatter plot
+        # Plot normalized pendulum angle on top subplot
         if 'NormalizedPendulumAngle' in df.columns:
-            # Use scatter with reduced marker size for overlay plots
-            # Sample the data if there are many points to avoid overcrowding
-            if len(df) > 500:
-                # Take every nth point
-                n = max(1, len(df) // 500)
-                sampled_df = df.iloc[::n]
-            else:
-                sampled_df = df
+            axs[0].plot(df['Time'], df['NormalizedPendulumAngle'], color=angle_color, linewidth=1.5,
+                        label=label)
 
-            axs[0].scatter(sampled_df['Time'], sampled_df['NormalizedPendulumAngle'],
-                           color=color, marker=marker, s=10, alpha=0.7,
-                           label=label)
-
-        # Plot voltage on bottom subplot - keeping as line but in same color as pendulum points
+        # Plot voltage on bottom subplot (using red shades)
         if 'Voltage' in df.columns:
-            axs[1].plot(df['Time'], df['Voltage'], color='r', linestyle='-', linewidth=1.5,
-                        label=f'{label} (Voltage)')
+            axs[1].plot(df['Time'], df['Voltage'], color=voltage_color, linewidth=1.5,
+                        label=label)
 
     # Add reference line at 0 (upright position)
     axs[0].axhline(y=0, color='k', linestyle=':', alpha=0.7, label='Upright Position')
