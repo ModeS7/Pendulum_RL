@@ -4,12 +4,59 @@ import numpy as np
 import os
 import argparse
 import re
+import copy
 
 
 def normalize_angle(angle):
     """Normalize angle to [-π, π]"""
     angle = angle % (2 * np.pi)
     return angle - 2 * np.pi if angle > np.pi else angle
+
+
+def break_angle_jumps(time, angle, threshold=np.pi):
+    """
+    Breaks lines at points where angle jumps by more than the threshold.
+
+    Args:
+        time: Array of time values
+        angle: Array of angle values
+        threshold: Angle difference threshold (default: π)
+
+    Returns:
+        Tuple of (time_with_breaks, angle_with_breaks) where breaks are represented by NaN values
+    """
+    # Make copies to avoid modifying the originals
+    time_with_breaks = copy.deepcopy(time)
+    angle_with_breaks = copy.deepcopy(angle)
+
+    # Find jumps larger than threshold
+    jumps = np.abs(np.diff(angle))
+    jump_indices = np.where(jumps > threshold)[0]
+
+    # Insert NaN values at jump points to break the line
+    if len(jump_indices) > 0:
+        # Create new arrays with NaNs inserted at jump points
+        # We need to expand the arrays to accommodate the new NaN values
+        new_length = len(time) + len(jump_indices)
+        new_time = np.zeros(new_length)
+        new_angle = np.zeros(new_length)
+
+        # Insert original values and NaNs at appropriate positions
+        insert_pos = 0
+        for i in range(len(time)):
+            new_time[insert_pos] = time[i]
+            new_angle[insert_pos] = angle[i]
+            insert_pos += 1
+
+            # Check if we need to insert a NaN after this point
+            if i in jump_indices:
+                new_time[insert_pos] = time[i] + (time[i + 1] - time[i]) / 2
+                new_angle[insert_pos] = np.nan
+                insert_pos += 1
+
+        return new_time[:insert_pos], new_angle[:insert_pos]
+
+    return time_with_breaks, angle_with_breaks
 
 
 def process_csv_in_excel(file_path):
@@ -164,7 +211,7 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None):
         df['Time'] = np.arange(len(df)) * 0.01  # Assuming 10ms steps
 
     # Filter to only include Balance mode data
-    df = filter_balance_mode(df)
+    #df = filter_balance_mode(df)
 
     if df.empty:
         print(f"No Balance mode data found in {file_path}")
@@ -179,7 +226,7 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None):
         # Convert from degrees to radians
         pendulum_radians = np.radians(df['PendulumAngle'])
         # Normalize to [-π, π]
-        df['NormalizedPendulumAngle'] = np.array([normalize_angle(angle) for angle in pendulum_radians])
+        df['NormalizedPendulumAngle'] = np.array([normalize_angle(angle+np.pi) for angle in pendulum_radians])
 
     if 'MotorPosition' in df.columns:
         # Convert from degrees to radians
@@ -196,24 +243,31 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None):
 
     # Plot normalized pendulum angle and motor position on top subplot
     if 'NormalizedPendulumAngle' in df.columns:
-        axs[0].plot(df['Time'], df['NormalizedPendulumAngle'], 'b-', linewidth=1.5,
+        # Break lines at large angle jumps
+        time_with_breaks, angle_with_breaks = break_angle_jumps(
+            df['Time'].values, df['NormalizedPendulumAngle'].values)
+        axs[0].plot(time_with_breaks, angle_with_breaks, 'b-', linewidth=1.5,
                     label='Pendulum Angle (rad)')
 
     if 'NormalizedMotorPosition' in df.columns:
-        axs[0].plot(df['Time'], df['NormalizedMotorPosition'], 'g-', linewidth=1.5,
+        # Break lines at large angle jumps for motor position too
+        time_with_breaks, angle_with_breaks = break_angle_jumps(
+            df['Time'].values, df['NormalizedMotorPosition'].values)
+        axs[0].plot(time_with_breaks, angle_with_breaks, 'g-', linewidth=1.5,
                     label='Arm Position (rad)')
 
     # Add reference line at 0 (upright position)
-    axs[0].axhline(y=0, color='k', linestyle=':', alpha=0.7, label='Upright Position')
+    axs[0].axhline(y=np.pi, color='k', linestyle=':', alpha=0.7, label='Upright Position')
+    axs[0].axhline(y=-np.pi, color='k', linestyle=':', alpha=0.7, label='Upright Position')
 
     # Plot voltage on bottom subplot with RED color
     if 'Voltage' in df.columns:
         axs[1].plot(df['Time'], df['Voltage'], 'r-', linewidth=1.5, label='Voltage (V)')
 
-    # Set labels and title
-    axs[0].set_title(f'QUBE Balance Mode Analysis: {file_name_no_ext}', fontsize=14)
+    # Title and comment have been removed
+
     axs[0].set_ylabel('Angle (radians)', fontsize=12)
-    axs[0].legend(loc='upper right')
+    axs[0].legend(loc='upper left')
     axs[0].grid(True)
 
     # Calculate the range of the pendulum angle for auto-scaling
@@ -232,11 +286,10 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None):
 
     axs[1].set_xlabel('Time (seconds)', fontsize=12)
     axs[1].set_ylabel('Voltage (V)', fontsize=12)
-    axs[1].legend(loc='upper right')
+    axs[1].legend(loc='upper left')
     axs[1].grid(True)
 
-    # Add file name as subtitle
-    plt.figtext(0.5, 0.01, f"File: {file_name} (Balance Mode Only)", ha='center', fontsize=10)
+    # Subtitle/comment has been removed
 
     # Adjust spacing between subplots
     plt.tight_layout()
@@ -304,7 +357,7 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
             df['Time'] = np.arange(len(df)) * 0.01  # Assuming 10ms steps
 
         # Filter to only include Balance mode data
-        df = filter_balance_mode(df)
+        #df = filter_balance_mode(df)
 
         if df.empty:
             print(f"No Balance mode data found in {file_path}")
@@ -315,7 +368,7 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
             # Convert from degrees to radians
             pendulum_radians = np.radians(df['PendulumAngle'])
             # Normalize to [-π, π]
-            df['NormalizedPendulumAngle'] = np.array([normalize_angle(angle) for angle in pendulum_radians])
+            df['NormalizedPendulumAngle'] = np.array([normalize_angle(angle+np.pi) for angle in pendulum_radians])
 
             # Update overall min/max
             curr_min = df['NormalizedPendulumAngle'].min()
@@ -338,7 +391,10 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
 
         # Plot normalized pendulum angle on top subplot
         if 'NormalizedPendulumAngle' in df.columns:
-            axs[0].plot(df['Time'], df['NormalizedPendulumAngle'], color=angle_color, linewidth=1.5,
+            # Break lines at large angle jumps
+            time_with_breaks, angle_with_breaks = break_angle_jumps(
+                df['Time'].values, df['NormalizedPendulumAngle'].values)
+            axs[0].plot(time_with_breaks, angle_with_breaks, color=angle_color, linewidth=1.5,
                         label=label)
 
         # Plot voltage on bottom subplot (using red shades)
@@ -349,10 +405,9 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
     # Add reference line at 0 (upright position)
     axs[0].axhline(y=0, color='k', linestyle=':', alpha=0.7, label='Upright Position')
 
-    # Set labels and title
-    axs[0].set_title(title, fontsize=14)
+    # Title has been removed
     axs[0].set_ylabel('Pendulum Angle (radians)', fontsize=12)
-    axs[0].legend(loc='upper right')
+    axs[0].legend(loc='upper left')
     axs[0].grid(True)
 
     # Set y limits based on data range if valid
@@ -369,7 +424,7 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Balance M
 
     axs[1].set_xlabel('Time (seconds)', fontsize=12)
     axs[1].set_ylabel('Voltage (V)', fontsize=12)
-    axs[1].legend(loc='upper right')
+    axs[1].legend(loc='upper left')
     axs[1].grid(True)
 
     # Adjust spacing between subplots
