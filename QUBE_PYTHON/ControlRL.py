@@ -34,12 +34,12 @@ class LowPassFilter:
         self.y_last = initial_value
 
 
-# Actor Networks - supporting both original and modern versions
-class ActorReLU(nn.Module):
-    """Original policy network that outputs action distribution with ReLU activation."""
+# Actor Network
+class Actor(nn.Module):
+    """Policy network that outputs action distribution."""
 
     def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(ActorReLU, self).__init__()
+        super(Actor, self).__init__()
 
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -52,9 +52,6 @@ class ActorReLU(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        # Identify model type
-        self.model_type = "relu"
-
     def forward(self, state):
         features = self.network(state)
 
@@ -66,59 +63,6 @@ class ActorReLU(nn.Module):
         action_log_std = torch.clamp(action_log_std, -20, 2)
 
         return action_mean, action_log_std
-
-
-class ActorSiLU(nn.Module):
-    """Modern policy network that outputs action distribution with SiLU activation."""
-
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(ActorSiLU, self).__init__()
-
-        # Improved network with SiLU activation
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
-
-        # Mean and log std for continuous action
-        self.mean = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Linear(hidden_dim, action_dim)
-
-        # Identify model type
-        self.model_type = "silu"
-
-    def forward(self, state):
-        """Forward pass to get action mean and log std."""
-        features = self.network(state)
-
-        # Get mean and constrain it to [-1, 1]
-        action_mean = torch.tanh(self.mean(features))
-
-        # Get log standard deviation and clamp it
-        action_log_std = self.log_std(features)
-        action_log_std = torch.clamp(action_log_std, -20, 2)
-
-        return action_mean, action_log_std
-
-    def sample(self, state):
-        """Sample action from the distribution and compute log probability."""
-        mean, log_std = self.forward(state)
-        std = log_std.exp()
-
-        # Sample from normal distribution with reparameterization trick
-        normal = Normal(mean, std)
-        x = normal.rsample()
-
-        # Constrain to [-1, 1]
-        action = torch.tanh(x)
-
-        # Calculate log probability with squashing correction
-        log_prob = normal.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-
-        return action, log_prob
 
 
 # Helper functions
@@ -146,12 +90,20 @@ class QUBEControllerWithRL:
         self.system_max_voltage = 18.0  # Increased maximum hardware voltage to 18.0V
         self.max_voltage = 5.0  # Default max voltage for RL control (replaces scaling factor)
 
-        # Performance optimization settings
-        self.target_frequency = 1000  # Increased target control frequency to 1000 Hz (max)
-        self.ui_update_interval = 5  # Update UI every N iterations (was every iteration)
+        # Performance optimization settings - MODIFIED: Optimized UI updates
+        self.ui_update_interval = 15  # Increased UI update interval (higher = less UI overhead)
         self.ui_counter = 0
         self.last_loop_time = time.time()
         self.actual_frequency = 0
+
+        # Cache for UI values to avoid unnecessary updates
+        self.ui_cache = {
+            'motor_angle': 0.0,
+            'pendulum_angle': 0.0,
+            'rpm': 0.0,
+            'voltage': 0.0,
+            'frequency': 0.0
+        }
 
         # Performance tracking
         self.iteration_count = 0
@@ -171,11 +123,11 @@ class QUBEControllerWithRL:
         self.prev_motor_pos = 0
         self.prev_logging_time = time.time()
 
-        # Low-pass filters (same cutoff freq as Arduino code)
-        self.dt = 1.0 / self.target_frequency  # Default timestep
-        self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=500.0)
-        self.motor_velocity_filter = LowPassFilter(cutoff_freq=500.0)
-        self.voltage_filter = LowPassFilter(cutoff_freq=500.0)
+        # Low-pass filters
+        self.filter_cutoff = 500.0  # Default cutoff frequency
+        self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+        self.motor_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+        self.voltage_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
         self.filtered_voltage = 0.0
 
         # Initialize the RL model (but don't load weights yet)
@@ -189,13 +141,8 @@ class QUBEControllerWithRL:
         state_dim = 6  # Our observation space (same as in training)
         action_dim = 1  # Motor voltage (normalized)
 
-        # Initialize both model types
-        self.actor_relu = ActorReLU(state_dim, action_dim)
-        self.actor_silu = ActorSiLU(state_dim, action_dim)
-
-        # Default to the original ReLU model initially
-        self.actor = self.actor_relu
-        self.model_type = "relu"
+        # Initialize model
+        self.actor = Actor(state_dim, action_dim)
 
         # Set device (CPU or GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,57 +162,21 @@ class QUBEControllerWithRL:
                 # Load the model state dict
                 state_dict = torch.load(filename, map_location=self.device)
 
-                # Try to determine model type automatically
-                # First attempt: Try loading into both models and check which one works
-                try_relu = True
-                try_silu = True
-
-                # Try loading into ReLU model
+                # Try loading the model
                 try:
-                    self.actor_relu.load_state_dict(state_dict)
-                    self.actor_relu.to(self.device)
-                    self.actor_relu.eval()
-                except Exception:
-                    try_relu = False
-
-                # Try loading into SiLU model
-                try:
-                    self.actor_silu.load_state_dict(state_dict)
-                    self.actor_silu.to(self.device)
-                    self.actor_silu.eval()
-                except Exception:
-                    try_silu = False
-
-                # Decide which model to use based on auto-detection
-                if try_relu and try_silu:
-                    # If both succeed, show dialog to select
-                    model_choice = messagebox.askquestion(
-                        "Model Type",
-                        "Model can load with either architecture. Use SiLU model (newer, recommended)? Select 'No' for ReLU model."
-                    )
-                    if model_choice == 'yes':
-                        self.actor = self.actor_silu
-                        self.model_type = "silu"
-                    else:
-                        self.actor = self.actor_relu
-                        self.model_type = "relu"
-                elif try_relu:
-                    self.actor = self.actor_relu
-                    self.model_type = "relu"
-                elif try_silu:
-                    self.actor = self.actor_silu
-                    self.model_type = "silu"
-                else:
-                    raise ValueError("Model is not compatible with either architecture")
+                    self.actor.load_state_dict(state_dict)
+                    self.actor.to(self.device)
+                    self.actor.eval()
+                except Exception as e:
+                    raise ValueError(f"Failed to load model: {str(e)}")
 
                 # Confirm model loaded
-                model_type_str = "SiLU" if self.model_type == "silu" else "ReLU"
                 self.status_label.config(text=f"Model loaded: {os.path.basename(filename)}")
                 self.rl_model = filename
 
-                # Update model type displays
-                self.model_type_label.config(text=f"Model Type: {model_type_str}")
-                self.architecture_label.config(text=f"Using {model_type_str} activation network")
+                # Update model loaded indication
+                self.model_type_label.config(text="Model Status: Loaded")
+                self.architecture_label.config(text="Model ready for control")
 
                 # Enable RL control button
                 self.rl_control_btn.config(state=tk.NORMAL)
@@ -304,25 +215,25 @@ class QUBEControllerWithRL:
                                      width=15, state=tk.DISABLED)
         self.rl_control_btn.grid(row=0, column=1, padx=5)
 
-        # Model Type Indicator (added to show current model type)
-        self.model_type_label = Label(rl_frame, text="Model Type: Not Loaded", width=20)
+        # Model Status Indicator
+        self.model_type_label = Label(rl_frame, text="Model Status: Not Loaded", width=20)
         self.model_type_label.grid(row=0, column=2, padx=5)
 
-        # CHANGED: Replace RL scaling factor slider with max voltage slider
+        # Max voltage slider
         max_voltage_frame = Frame(control_frame)
         max_voltage_frame.grid(row=2, column=0, pady=5)
 
         self.max_voltage_slider = Scale(
             max_voltage_frame,
             from_=0.5,
-            to=self.system_max_voltage,  # Now goes up to 18V
+            to=self.system_max_voltage,
             orient=tk.HORIZONTAL,
             label="RL Max Voltage",
             length=300,
             resolution=0.1,
             command=self.set_max_voltage
         )
-        self.max_voltage_slider.set(self.max_voltage)  # Start with default value
+        self.max_voltage_slider.set(self.max_voltage)
         self.max_voltage_slider.pack(padx=5)
 
         # Move to position input and button
@@ -338,7 +249,7 @@ class QUBEControllerWithRL:
                                command=self.start_move_to_position, width=15)
         self.move_btn.grid(row=0, column=2, padx=5)
 
-        # DATA LOGGING SECTION - NEW
+        # DATA LOGGING SECTION
         logging_frame = Frame(control_frame)
         logging_frame.grid(row=4, column=0, pady=10)
 
@@ -357,31 +268,36 @@ class QUBEControllerWithRL:
         self.log_status_label = Label(logging_frame, text="Logging: OFF")
         self.log_status_label.grid(row=0, column=3, padx=5)
 
-        # Filter Controls - NEW
+        # MODIFIED: Replace filter text entry with slider (previously control frequency slider)
         filter_frame = Frame(control_frame)
         filter_frame.grid(row=5, column=0, pady=5)
 
-        Label(filter_frame, text="Filter Cutoff (Hz):").grid(row=0, column=0, padx=5)
-        self.filter_entry = Entry(filter_frame, width=5)
-        self.filter_entry.grid(row=0, column=1, padx=5)
-        self.filter_entry.insert(0, "500")  # Default to 500 Hz
-
-        self.filter_btn = Button(filter_frame, text="Update Filter",
-                                 command=self.update_filter_cutoff, width=15)
-        self.filter_btn.grid(row=0, column=2, padx=5)
+        # New filter cutoff slider (replacing control frequency slider)
+        self.filter_cutoff_slider = Scale(
+            filter_frame,
+            from_=0,
+            to=6000,
+            orient=tk.HORIZONTAL,
+            label="Filter Cutoff Frequency (Hz)",
+            length=300,
+            resolution=100,
+            command=self.set_filter_cutoff
+        )
+        self.filter_cutoff_slider.set(self.filter_cutoff)
+        self.filter_cutoff_slider.grid(row=0, column=0, padx=5)
 
         # Filter status
-        self.filter_status_label = Label(filter_frame, text="Cutoff: 500 Hz")
-        self.filter_status_label.grid(row=0, column=3, padx=5)
+        self.filter_status_label = Label(filter_frame, text=f"Cutoff: {self.filter_cutoff} Hz")
+        self.filter_status_label.grid(row=0, column=1, padx=5)
 
-        # Stop button - moved to row 6
+        # Stop button
         self.stop_btn = Button(control_frame, text="STOP MOTOR",
                                command=self.stop_motor,
                                width=20, height=2,
                                bg="red", fg="white")
         self.stop_btn.grid(row=6, column=0, pady=10)
 
-        # Manual voltage control - moved to row 7
+        # Manual voltage control
         self.voltage_slider = Scale(
             control_frame,
             from_=-self.system_max_voltage,
@@ -395,37 +311,23 @@ class QUBEControllerWithRL:
         self.voltage_slider.set(0)
         self.voltage_slider.grid(row=7, column=0, padx=5, pady=10)
 
-        # Performance settings frame - moved to row 8
+        # Performance settings frame - MODIFIED: Only UI update interval
         perf_frame = Frame(control_frame)
         perf_frame.grid(row=8, column=0, pady=5)
 
-        # Add frequency slider
-        self.freq_slider = Scale(
-            perf_frame,
-            from_=60,
-            to=1000,  # Increased maximum frequency to 1000 Hz
-            orient=tk.HORIZONTAL,
-            label="Target Control Frequency (Hz)",
-            length=300,
-            resolution=10,
-            command=self.set_target_frequency
-        )
-        self.freq_slider.set(self.target_frequency)
-        self.freq_slider.grid(row=0, column=0, padx=5)
-
-        # Add UI update interval slider
+        # Add UI update interval slider with increased range
         self.ui_slider = Scale(
             perf_frame,
-            from_=1,
-            to=20,
+            from_=5,
+            to=50,
             orient=tk.HORIZONTAL,
             label="UI Update Every N Iterations",
             length=300,
-            resolution=1,
+            resolution=5,
             command=self.set_ui_update_interval
         )
         self.ui_slider.set(self.ui_update_interval)
-        self.ui_slider.grid(row=1, column=0, padx=5)
+        self.ui_slider.grid(row=0, column=0, padx=5)
 
         # Status display
         status_frame = Frame(self.master, padx=10, pady=10)
@@ -459,14 +361,13 @@ class QUBEControllerWithRL:
         self.voltage_label = Label(status_frame, text="0.0 V")
         self.voltage_label.grid(row=6, column=1, sticky=tk.W)
 
-        # CHANGED: Update label from scaling factor to max voltage
         Label(status_frame, text="RL Max Voltage:").grid(row=7, column=0, sticky=tk.W)
         self.max_voltage_label = Label(status_frame, text=f"{self.max_voltage:.1f} V")
         self.max_voltage_label.grid(row=7, column=1, sticky=tk.W)
 
         # Add actual frequency display
         Label(status_frame, text="Control Frequency:").grid(row=8, column=0, sticky=tk.W)
-        self.freq_label = Label(status_frame, text=f"{self.actual_frequency:.1f} Hz")
+        self.freq_label = Label(status_frame, text="0.0 Hz")
         self.freq_label.grid(row=8, column=1, sticky=tk.W)
 
         # Add data logging info
@@ -487,31 +388,34 @@ class QUBEControllerWithRL:
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
 
-    def update_filter_cutoff(self):
-        """Update the cutoff frequency of the low-pass filters"""
+    # MODIFIED: New method for filter cutoff slider
+    def set_filter_cutoff(self, value):
+        """Set the cutoff frequency of all filters from slider"""
         try:
-            # Get cutoff frequency from entry field
-            cutoff_freq = float(self.filter_entry.get())
+            cutoff_freq = float(value)
             if cutoff_freq <= 0:
-                cutoff_freq = 500.0  # Default if invalid
+                cutoff_freq = 100.0  # Minimum value for safety
 
             # Store current filter values to preserve states
             pendulum_velocity_last = self.pendulum_velocity_filter.y_last
             motor_velocity_last = self.motor_velocity_filter.y_last
             voltage_last = self.voltage_filter.y_last
 
+            # Update internal value
+            self.filter_cutoff = cutoff_freq
+
             # Create new filters with updated cutoff frequency
-            self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=cutoff_freq)
-            self.motor_velocity_filter = LowPassFilter(cutoff_freq=cutoff_freq)
-            self.voltage_filter = LowPassFilter(cutoff_freq=cutoff_freq)
+            self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+            self.motor_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+            self.voltage_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
 
             # Transfer the previous states to maintain continuity
             self.pendulum_velocity_filter.reset(pendulum_velocity_last)
             self.motor_velocity_filter.reset(motor_velocity_last)
             self.voltage_filter.reset(voltage_last)
 
-            # Update status
-            self.filter_status_label.config(text=f"Cutoff: {cutoff_freq} Hz")
+            # Update status label
+            self.filter_status_label.config(text=f"Cutoff: {self.filter_cutoff} Hz")
 
         except ValueError:
             # Handle invalid input
@@ -559,12 +463,8 @@ class QUBEControllerWithRL:
                 self.prev_pendulum_angle = self.qube.getPendulumAngle()
                 self.prev_motor_pos = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
 
-                # Don't reset filters here anymore - instead keep using the existing ones
-                # Only save the current cutoff frequency in case we need it
-                try:
-                    self.log_cutoff_freq = float(self.filter_entry.get())
-                except ValueError:
-                    self.log_cutoff_freq = 500.0  # Default value
+                # Save the current cutoff frequency
+                self.log_cutoff_freq = self.filter_cutoff
 
                 # Update UI
                 self.log_btn.config(text="Stop Logging")
@@ -624,10 +524,6 @@ class QUBEControllerWithRL:
             pendulum_angle = self.qube.getPendulumAngle()
             motor_position = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
 
-            # Get current velocities from the main control loop's filters
-            # instead of calculating them separately
-            # This is to ensure consistency between control and logging
-
             # For motor velocity, use the RPM directly from QUBE
             motor_rpm = self.qube.getMotorRPM()
             motor_velocity = motor_rpm * (2 * np.pi / 60)  # Convert RPM to rad/s
@@ -681,20 +577,10 @@ class QUBEControllerWithRL:
             # Try to stop logging if there's an error
             self.stop_logging()
 
-        except Exception as e:
-            print(f"Error logging data: {str(e)}")
-            # Try to stop logging if there's an error
-            self.stop_logging()
-
-    def set_target_frequency(self, value):
-        """Set target control frequency from slider"""
-        self.target_frequency = float(value)
-
     def set_ui_update_interval(self, value):
         """Set UI update interval from slider"""
         self.ui_update_interval = int(value)
 
-    # CHANGED: Replaced RL scaling factor setter with max voltage setter
     def set_max_voltage(self, value):
         """Set the maximum voltage for RL control from slider"""
         self.max_voltage = float(value)
@@ -707,7 +593,6 @@ class QUBEControllerWithRL:
         self.calibrating = False
         self.moving_to_position = False
         self.rl_mode = False
-        self.rl_started = False
 
         if self.rl_model:
             self.rl_control_btn.config(text="Start RL Control")
@@ -717,7 +602,6 @@ class QUBEControllerWithRL:
         self.calibrating = True
         self.moving_to_position = False
         self.rl_mode = False
-        self.rl_started = False
         self.voltage_slider.set(0)  # Reset slider
 
         # Set calibration start time
@@ -832,7 +716,7 @@ class QUBEControllerWithRL:
         self.motor_voltage = max(-self.system_max_voltage, min(self.system_max_voltage, self.motor_voltage))
 
     def get_observation(self):
-        """Get the current observation vector (shared between ReLU and SiLU models)"""
+        """Get the current observation vector"""
         # Get current state
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
@@ -881,7 +765,7 @@ class QUBEControllerWithRL:
         return obs, pendulum_angle_norm
 
     def update_rl_control(self):
-        """Update RL control logic using ReLU model"""
+        """Update RL control logic"""
         # Get current state
         obs, pendulum_angle_norm = self.get_observation()
 
@@ -894,7 +778,7 @@ class QUBEControllerWithRL:
         # Apply max_voltage directly
         raw_voltage = float(action) * self.max_voltage
 
-        # Apply low-pass filter to voltage (just like in Arduino code)
+        # Apply low-pass filter to voltage
         current_time = time.time()
         dt = current_time - self.last_loop_time if hasattr(self, 'last_loop_time') else 0.001
         self.motor_voltage = self.voltage_filter.filter(raw_voltage, dt)
@@ -903,45 +787,9 @@ class QUBEControllerWithRL:
         if self.ui_counter == 0:
             upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
             if upright_angle < 30:
-                self.status_label.config(text=f"RL control active - Near balance ({upright_angle:.1f}° from upright)")
+                self.status_label.config(text=f"Control active - Near balance ({upright_angle:.1f}° from upright)")
             else:
-                self.status_label.config(text=f"RL control active - Swinging ({upright_angle:.1f}° from upright)")
-
-    def update_rl_control_silu(self):
-        """Update RL control logic using SiLU model with sampling if available"""
-        # Get current state
-        obs, pendulum_angle_norm = self.get_observation()
-
-        # Get action from RL model - using sample method if available
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
-
-            # Try using the sample method if available (for exploration)
-            try:
-                action, _ = self.actor.sample(state_tensor)
-                action = action.cpu().numpy()[0][0]  # Get action as scalar
-            except (AttributeError, NotImplementedError):
-                # Fall back to standard forward if sample is not implemented
-                action_mean, _ = self.actor(state_tensor)
-                action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
-
-        # Apply max_voltage directly
-        raw_voltage = float(action) * self.max_voltage
-
-        # Apply low-pass filter to voltage (just like in Arduino code)
-        current_time = time.time()
-        dt = current_time - self.last_loop_time if hasattr(self, 'last_loop_time') else 0.001
-        self.motor_voltage = self.voltage_filter.filter(raw_voltage, dt)
-
-        # Update status - but only during UI updates
-        if self.ui_counter == 0:
-            upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
-            if upright_angle < 30:
-                self.status_label.config(
-                    text=f"RL control active (SiLU) - Near balance ({upright_angle:.1f}° from upright)")
-            else:
-                self.status_label.config(
-                    text=f"RL control active (SiLU) - Swinging ({upright_angle:.1f}° from upright)")
+                self.status_label.config(text=f"Control active - Swinging ({upright_angle:.1f}° from upright)")
 
     def stop_motor(self):
         """Stop the motor"""
@@ -966,65 +814,80 @@ class QUBEControllerWithRL:
         # Increment iteration counter
         self.iteration_count += 1
 
-        # Calculate current control frequency (every 50 iterations)
+        # Calculate current control frequency (less frequently)
         now = time.time()
         elapsed = now - self.last_loop_time
         self.last_loop_time = now
 
         # Smooth frequency calculation (moving average)
-        alpha = 0.1  # Smoothing factor
+        alpha = 0.05  # Reduced smoothing factor for less processing
         self.actual_frequency = (1 - alpha) * self.actual_frequency + alpha * (1.0 / max(elapsed, 0.001))
 
         # Update UI counter
         self.ui_counter = (self.ui_counter + 1) % self.ui_update_interval
 
-        # Update automatic control modes if active
+        # CRITICAL CONTROL OPERATIONS - These must happen on every loop
+        # ---------------------------------------------------------------
+
+        # Update automatic control modes if active (core functionality)
         if self.calibrating:
             self.update_calibration()
         elif self.moving_to_position:
             self.update_position_control()
         elif self.rl_mode:
-            if self.model_type == "silu":
-                self.update_rl_control_silu()  # Use SiLU-specific control if applicable
-            else:
-                self.update_rl_control()
+            self.update_rl_control()
 
-        # Apply the current motor voltage - THIS IS CRITICAL TO DO ON EVERY LOOP!
+        # Apply the current motor voltage - CRITICAL TO DO ON EVERY LOOP!
         self.qube.setMotorVoltage(self.motor_voltage)
 
-        # Apply RGB values
-        self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
-
-        # Handle data logging - log data every log_interval iterations
+        # Handle data logging counter increment (minimal overhead)
         if self.logging:
             self.log_counter = (self.log_counter + 1) % self.log_interval
             if self.log_counter == 0:
                 self.log_data()
 
-        # Only update display information when UI counter is 0
+        # Only update RGB values periodically to reduce hardware communication overhead
+        if self.ui_counter % 3 == 0:  # Update RGB less frequently than UI
+            self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
+
+        # NON-CRITICAL UI UPDATES - Only do these periodically
+        # ---------------------------------------------------------------
         if self.ui_counter == 0:
-            # Update display information
+            # Get current hardware values
             motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
             pendulum_angle_deg = self.qube.getPendulumAngle()
-
-            # Convert to radians for normalized angle calculation
             pendulum_angle_rad = np.radians(pendulum_angle_deg)
-            pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)  # For display
-
+            pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)
             rpm = self.qube.getMotorRPM()
 
-            self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
-            self.pendulum_label.config(
-                text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
-            self.rpm_label.config(text=f"{rpm:.1f}")
-            self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
-            self.freq_label.config(text=f"{self.actual_frequency:.1f} Hz")
+            # Check if values have changed enough to warrant a UI update
+            # This avoids unnecessary tkinter operations which are expensive
+            if (abs(motor_angle_deg - self.ui_cache['motor_angle']) > 0.5 or
+                    abs(pendulum_angle_deg - self.ui_cache['pendulum_angle']) > 0.5):
+                # Update angle displays
+                self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
+                self.pendulum_label.config(
+                    text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
+                # Update cache
+                self.ui_cache['motor_angle'] = motor_angle_deg
+                self.ui_cache['pendulum_angle'] = pendulum_angle_deg
 
-            if self.rl_model:
-                self.model_label.config(text=f"Using: {os.path.basename(self.rl_model)}")
+            # Update other displays only if they've changed significantly
+            if abs(rpm - self.ui_cache['rpm']) > 1.0:
+                self.rpm_label.config(text=f"{rpm:.1f}")
+                self.ui_cache['rpm'] = rpm
 
-            # Log performance stats every 500 iterations
-            if self.iteration_count % 500 == 0:
+            if abs(self.motor_voltage - self.ui_cache['voltage']) > 0.1:
+                self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+                self.ui_cache['voltage'] = self.motor_voltage
+
+            # Update frequency display less often (every 3rd UI update)
+            if self.iteration_count % (self.ui_update_interval * 3) == 0:
+                self.freq_label.config(text=f"{self.actual_frequency:.1f} Hz")
+                self.ui_cache['frequency'] = self.actual_frequency
+
+            # Log performance stats every 1000 iterations instead of 500
+            if self.iteration_count % 1000 == 0:
                 avg_freq = self.iteration_count / (now - self.start_time)
                 print(
                     f"Performance: {self.iteration_count} iterations, Avg frequency: {avg_freq:.1f} Hz, Current: {self.actual_frequency:.1f} Hz")
@@ -1033,7 +896,7 @@ class QUBEControllerWithRL:
 def main():
     print("Starting QUBE Controller with RL, Data Logging, and Low-Pass Filtering...")
     print("Will set corner position as zero")
-    print("OPTIMIZED VERSION - High-frequency control, extended voltage range")
+    print("OPTIMIZED VERSION - Maximum speed control, improved filter control, optimized UI")
 
     try:
         # Initialize QUBE
@@ -1046,59 +909,74 @@ def main():
         qube.setRGB(0, 0, 999)  # Blue LED to start
         qube.update()
 
-        # Create GUI
+        # Configure Tkinter for higher performance
         root = tk.Tk()
+
+        # Optimize Tkinter settings
+        root.update_idletasks()  # Process any pending UI events before starting main loop
+        root.protocol("WM_DELETE_WINDOW", root.destroy)  # Ensure clean shutdown
+
+        # Create application
         app = QUBEControllerWithRL(root, qube)
 
-        # Set initial high-performance values
-        app.freq_slider.set(500)  # Set to max frequency
-        app.max_voltage_slider.set(4.0)  # Set to 18V
+        # Set initial values
+        app.filter_cutoff_slider.set(500)  # Default filter cutoff to 500 Hz
+        app.max_voltage_slider.set(4.0)  # Set default max voltage
         app.set_max_voltage(4.0)  # Update the internal value
 
-        # For frequency calculation
-        target_period = 1.0 / app.target_frequency
-        last_time = time.time()
+        # Preallocate variables used in main loop
+        ui_counter = 0
+        update_count = 0
 
-        # Main loop with dynamic timing
+        # Display initial performance advice
+        print("Performance tip: Increase 'UI Update Every N Iterations' slider for higher control frequency")
+
+        # Main loop - MODIFIED: High performance optimized loop
         while True:
-            loop_start = time.time()
+            try:
+                # Update hardware - critical control operation
+                qube.update()
 
-            # Update hardware
-            qube.update()
+                # Update controller - critical control operation
+                app.update_gui()
 
-            # Update controller
-            app.update_gui()
+                # Update Tkinter less frequently - major performance improvement
+                if app.ui_counter == 0:
+                    # Process Tkinter events without full redraw
+                    root.update_idletasks()  # Process pending events
 
-            # Update Tkinter - reduced frequency based on UI counter
-            if app.ui_counter == 0:
-                root.update()
+                    # Full update only every few UI cycles for better performance
+                    update_count += 1
+                    if update_count % 3 == 0:  # Reduce full UI updates further
+                        root.update()  # Complete update including redraw
 
-            # Dynamic sleep calculation to maintain target frequency
-            elapsed = time.time() - loop_start
-            sleep_time = max(0.0, target_period - elapsed)
-
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-            # Update target period based on current slider value
-            target_period = 1.0 / app.target_frequency
+            except RuntimeError as e:
+                # Handle transient Tkinter errors (can happen during heavy load)
+                if "main thread is not in main loop" in str(e):
+                    print("Handled UI threading issue, continuing...")
+                    pass
+                else:
+                    raise  # Re-raise if it's a different error
 
     except tk.TclError:
         # Window closed
-        pass
+        print("Window closed, shutting down")
     except KeyboardInterrupt:
         # User pressed Ctrl+C
-        pass
+        print("Keyboard interrupt, shutting down")
     except Exception as e:
         print(f"Error: {str(e)}")
     finally:
-        # Final stop attempt
+        # Final stop attempt with more robust shutdown
         try:
+            print("Shutting down motor and hardware...")
             qube.setMotorVoltage(0.0)
+            qube.setRGB(0, 0, 0)  # Turn off LEDs
             qube.update()
+            time.sleep(0.1)  # Brief pause to ensure commands are sent
             print("Motor stopped")
-        except:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not cleanly shut down hardware: {str(e)}")
 
 
 if __name__ == "__main__":
