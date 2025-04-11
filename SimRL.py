@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numba as nb
 from time import time
 from numpy.ma.core import arctan2
+from torch.utils.tensorboard import SummaryWriter  # Added TensorBoard import
 
 # ====== System Constants ======
 g = 9.81  # Gravity constant (m/s^2)
@@ -33,6 +34,7 @@ base_LL = 0.128  # Length of pendulum link (m)
 base_JA = 0.0000572 + 0.00006  # Arm inertia about pivot (kg·m²)
 base_JL = 0.0000235  # Pendulum inertia about pivot (kg·m²)
 base_k = 0.002  # Torsional spring constant (N·m/rad)
+
 
 # ====== Helper Functions ======
 @nb.njit(fastmath=True, cache=True)
@@ -446,7 +448,7 @@ class PendulumEnv:
         velocity_penalty = -0.05 * np.tanh(velocity_norm)
 
         # 3. Penalty for arm position away from center
-        pos_penalty = np.cos(theta_0)
+        pos_penalty = -abs(theta_0) / 2.0
 
         # 4. Bonus for being close to upright position
         arm_center = np.exp(-1.0 * theta_0 ** 2)
@@ -471,9 +473,9 @@ class PendulumEnv:
         mL = self.params['mL']
         l_1 = self.params['l_1']
         energy_reward = 2 - 0.007 * (
-            mL * g * l_1 * (np.cos(theta_1_norm)) +
-            0.5 * JL * theta_1_dot ** 2 -
-            mL * g * l_1
+                mL * g * l_1 * (np.cos(theta_1_norm)) +
+                0.5 * JL * theta_1_dot ** 2 -
+                mL * g * l_1
         ) ** 2
 
         # 8. Cost for high voltage usage
@@ -486,12 +488,12 @@ class PendulumEnv:
         # Combine all components
         reward = (
                 upright_reward +
-                #velocity_penalty +
-                #pos_penalty +
+                # velocity_penalty +
+                pos_penalty +
                 bonus +
                 limit_penalty +
                 energy_reward
-                #voltage_cost
+            # voltage_cost
         )
 
         return reward
@@ -507,7 +509,6 @@ class Actor(nn.Module):
 
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Actor, self).__init__()
-
 
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -678,7 +679,7 @@ class SACAgent:
 
             return action.cpu().numpy()[0]
 
-    def update_parameters(self, memory, batch_size=512):
+    def update_parameters(self, memory, batch_size=512, writer=None, global_step=0):
         """Update actor and critic parameters using a batch of experiences."""
         # Sample batch from memory
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
@@ -754,9 +755,20 @@ class SACAgent:
 
             self.alpha = self.log_alpha.exp()
 
+            # Log alpha loss if writer provided
+            if writer is not None:
+                writer.add_scalar('Losses/Alpha_Loss', alpha_loss.item(), global_step)
+
         # === Soft Update Target Networks ===
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        # Log to TensorBoard if writer provided
+        if writer is not None:
+            writer.add_scalar('Losses/Critic_Loss', critic_loss.item(), global_step)
+            writer.add_scalar('Losses/Actor_Loss', actor_loss.item(), global_step)
+            writer.add_scalar('Parameters/Alpha', self.alpha.item() if self.automatic_entropy_tuning else self.alpha,
+                              global_step)
 
         return {
             'critic_loss': critic_loss.item(),
@@ -786,6 +798,12 @@ def train(
     else:
         print(f"Using base max voltage: {base_max_voltage} V with {param_variation * 100}% variation")
 
+    # Initialize TensorBoard writer
+    timestamp = int(time())
+    log_dir = f"runs/pendulum_sac_{timestamp}"
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard logs will be saved to {log_dir}")
+
     # Environment setup
     env = PendulumEnv(
         variable_dt=variable_dt,
@@ -798,9 +816,21 @@ def train(
     state_dim = 6  # Observation space dimension
     action_dim = 1  # Motor voltage (normalized)
     max_steps = 1000  # Max steps per episode
-    batch_size = 512 * 3  # Batch size
+    batch_size = 512  # Batch size
     replay_buffer_size = 100000  # Buffer capacity
-    updates_per_step = 3  # Updates per environment step
+    updates_per_step = 1  # Updates per environment step
+
+    # Log hyperparameters to TensorBoard
+    writer.add_text("Hyperparameters/state_dim", str(state_dim))
+    writer.add_text("Hyperparameters/action_dim", str(action_dim))
+    writer.add_text("Hyperparameters/max_steps", str(max_steps))
+    writer.add_text("Hyperparameters/batch_size", str(batch_size))
+    writer.add_text("Hyperparameters/replay_buffer_size", str(replay_buffer_size))
+    writer.add_text("Hyperparameters/updates_per_step", str(updates_per_step))
+    writer.add_text("Hyperparameters/variable_dt", str(variable_dt))
+    writer.add_text("Hyperparameters/param_variation", str(param_variation))
+    writer.add_text("Hyperparameters/fixed_params", str(fixed_params))
+    writer.add_text("Hyperparameters/voltage_range", str(voltage_range))
 
     # Initialize agent (load pre-trained models if provided)
     if actor_path or critic_path:
@@ -819,6 +849,7 @@ def train(
 
     # Training loop
     start_time = time()
+    global_step = 0
 
     for episode in range(max_episodes):
         state = env.reset()
@@ -834,6 +865,11 @@ def train(
         episode_states = [] if plot_this_episode else None
         episode_actions = [] if plot_this_episode else None
         step_rewards = [] if plot_this_episode else None  # Track rewards per step
+
+        # Log current parameter values to TensorBoard
+        current_params = env.get_current_parameters()
+        for param_name, param_value in current_params.items():
+            writer.add_scalar(f'Parameters/{param_name}', param_value, episode)
 
         # Episode loop
         for step in range(max_steps):
@@ -857,23 +893,36 @@ def train(
             # Update networks if enough samples
             if len(replay_buffer) > batch_size:
                 for _ in range(updates_per_step):
-                    update_info = agent.update_parameters(replay_buffer, batch_size)
+                    # Pass the writer and global step to update_parameters
+                    update_info = agent.update_parameters(replay_buffer, batch_size, writer, global_step)
                     critic_losses.append(update_info['critic_loss'])
                     actor_losses.append(update_info['actor_loss'])
                     alpha_values.append(update_info['alpha'])
+                    global_step += 1
+
 
             if done:
                 break
+
+        # Log episode metrics to TensorBoard
+        writer.add_scalar('Training/Episode_Reward', episode_reward, episode)
+        writer.add_scalar('Training/Episode_Length', step + 1, episode)
 
         # Log progress
         episode_rewards.append(episode_reward)
         avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
         avg_rewards.append(avg_reward)
+        writer.add_scalar('Training/Avg_Reward_10', avg_reward, episode)
 
         # Calculate average losses for reporting
         avg_critic_loss = np.mean(critic_losses) if critic_losses else 0.0
         avg_actor_loss = np.mean(actor_losses) if actor_losses else 0.0
         avg_alpha = np.mean(alpha_values) if alpha_values else 0.0
+
+        # Log average losses
+        writer.add_scalar('Training/Avg_Critic_Loss', avg_critic_loss, episode)
+        writer.add_scalar('Training/Avg_Actor_Loss', avg_actor_loss, episode)
+        writer.add_scalar('Training/Avg_Alpha', avg_alpha, episode)
 
         # Periodic reporting and visualization
         if (episode + 1) % eval_interval == 0 or episode <= 1:
@@ -926,7 +975,7 @@ def train(
                 torch.save(agent.actor.state_dict(), f"actor_ep{episode + 1}_{timestamp}.pth")
 
         # Early stopping if well trained
-        if avg_reward > 5000 and episode > 100:
+        if avg_reward > 4000 and episode > 100:
             print(f"Environment solved in {episode + 1} episodes!")
             break
 
@@ -1346,7 +1395,7 @@ if __name__ == "__main__":
     agent = train(
         variable_dt=True,
         param_variation=0.3,
-        voltage_range=(4.0, 18.0),
+        voltage_range=(2.0, 18.0),
         max_episodes=1000,
         eval_interval=10
     )
@@ -1366,8 +1415,11 @@ if __name__ == "__main__":
     print("\n--- Standard Evaluation ---")
     evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.15)
 
-    print("\n--- Robustness Test (High Variation) ---")
+    print("\n--- Robustness Test (Medium Variation) ---")
     evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.25)
+
+    print("\n--- Robustness Test (High Variation) ---")
+    evaluate(agent, num_episodes=3, variable_dt=True, param_variation=0.5)
 
     print("=" * 60)
     print("PROGRAM EXECUTION COMPLETE")
