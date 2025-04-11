@@ -7,9 +7,31 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 import os
+import csv
 
 # Update with your COM port
 COM_PORT = "COM3"
+
+
+# Low Pass Filter class (similar to the Arduino implementation)
+class LowPassFilter:
+    def __init__(self, cutoff_freq=500.0):
+        """Initialize a low-pass filter with specified cutoff frequency in Hz"""
+        self.twopi = 2.0 * np.pi
+        self.wc = cutoff_freq / self.twopi  # Cutoff frequency parameter
+        self.y_last = 0.0  # Last output value
+
+    def filter(self, x, dt):
+        """Apply filter to input x with timestep dt"""
+        # Same equation as in the Arduino code:
+        # y_k = y_k_last + wc*dt*(x - y_k_last)
+        y_k = self.y_last + self.wc * dt * (x - self.y_last)
+        self.y_last = y_k  # Save for next iteration
+        return y_k
+
+    def reset(self, initial_value=0.0):
+        """Reset the filter state"""
+        self.y_last = initial_value
 
 
 # Actor Networks - supporting both original and modern versions
@@ -134,6 +156,27 @@ class QUBEControllerWithRL:
         # Performance tracking
         self.iteration_count = 0
         self.start_time = time.time()
+
+        # Data logging variables
+        self.logging = False
+        self.log_file = None
+        self.log_writer = None
+        self.log_counter = 0
+        self.log_interval = 20  # Log every 20 steps
+        self.log_step = 0
+        self.log_start_time = 0
+
+        # Pendulum velocity tracking for logging
+        self.prev_pendulum_angle = 0
+        self.prev_motor_pos = 0
+        self.prev_logging_time = time.time()
+
+        # Low-pass filters (same cutoff freq as Arduino code)
+        self.dt = 1.0 / self.target_frequency  # Default timestep
+        self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=500.0)
+        self.motor_velocity_filter = LowPassFilter(cutoff_freq=500.0)
+        self.voltage_filter = LowPassFilter(cutoff_freq=500.0)
+        self.filtered_voltage = 0.0
 
         # Initialize the RL model (but don't load weights yet)
         self.initialize_rl_model()
@@ -295,14 +338,50 @@ class QUBEControllerWithRL:
                                command=self.start_move_to_position, width=15)
         self.move_btn.grid(row=0, column=2, padx=5)
 
-        # Stop button
+        # DATA LOGGING SECTION - NEW
+        logging_frame = Frame(control_frame)
+        logging_frame.grid(row=4, column=0, pady=10)
+
+        # Logging interval entry
+        Label(logging_frame, text="Log Interval (steps):").grid(row=0, column=0, padx=5)
+        self.log_interval_entry = Entry(logging_frame, width=5)
+        self.log_interval_entry.grid(row=0, column=1, padx=5)
+        self.log_interval_entry.insert(0, "20")  # Default to 20 steps
+
+        # Log button
+        self.log_btn = Button(logging_frame, text="Start Logging",
+                              command=self.toggle_logging, width=15)
+        self.log_btn.grid(row=0, column=2, padx=5)
+
+        # Log status
+        self.log_status_label = Label(logging_frame, text="Logging: OFF")
+        self.log_status_label.grid(row=0, column=3, padx=5)
+
+        # Filter Controls - NEW
+        filter_frame = Frame(control_frame)
+        filter_frame.grid(row=5, column=0, pady=5)
+
+        Label(filter_frame, text="Filter Cutoff (Hz):").grid(row=0, column=0, padx=5)
+        self.filter_entry = Entry(filter_frame, width=5)
+        self.filter_entry.grid(row=0, column=1, padx=5)
+        self.filter_entry.insert(0, "500")  # Default to 500 Hz
+
+        self.filter_btn = Button(filter_frame, text="Update Filter",
+                                 command=self.update_filter_cutoff, width=15)
+        self.filter_btn.grid(row=0, column=2, padx=5)
+
+        # Filter status
+        self.filter_status_label = Label(filter_frame, text="Cutoff: 500 Hz")
+        self.filter_status_label.grid(row=0, column=3, padx=5)
+
+        # Stop button - moved to row 6
         self.stop_btn = Button(control_frame, text="STOP MOTOR",
                                command=self.stop_motor,
                                width=20, height=2,
                                bg="red", fg="white")
-        self.stop_btn.grid(row=4, column=0, pady=10)
+        self.stop_btn.grid(row=6, column=0, pady=10)
 
-        # Manual voltage control
+        # Manual voltage control - moved to row 7
         self.voltage_slider = Scale(
             control_frame,
             from_=-self.system_max_voltage,
@@ -314,11 +393,11 @@ class QUBEControllerWithRL:
             command=self.set_manual_voltage
         )
         self.voltage_slider.set(0)
-        self.voltage_slider.grid(row=5, column=0, padx=5, pady=10)
+        self.voltage_slider.grid(row=7, column=0, padx=5, pady=10)
 
-        # Performance settings frame
+        # Performance settings frame - moved to row 8
         perf_frame = Frame(control_frame)
-        perf_frame.grid(row=6, column=0, pady=5)
+        perf_frame.grid(row=8, column=0, pady=5)
 
         # Add frequency slider
         self.freq_slider = Scale(
@@ -364,31 +443,36 @@ class QUBEControllerWithRL:
         self.architecture_label = Label(status_frame, text="Not loaded", width=40)
         self.architecture_label.grid(row=2, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Motor Angle:").grid(row=2, column=0, sticky=tk.W)
+        Label(status_frame, text="Motor Angle:").grid(row=3, column=0, sticky=tk.W)
         self.angle_label = Label(status_frame, text="0.0°")
-        self.angle_label.grid(row=2, column=1, sticky=tk.W)
+        self.angle_label.grid(row=3, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Pendulum Angle:").grid(row=3, column=0, sticky=tk.W)
+        Label(status_frame, text="Pendulum Angle:").grid(row=4, column=0, sticky=tk.W)
         self.pendulum_label = Label(status_frame, text="0.0°")
-        self.pendulum_label.grid(row=3, column=1, sticky=tk.W)
+        self.pendulum_label.grid(row=4, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Motor RPM:").grid(row=4, column=0, sticky=tk.W)
+        Label(status_frame, text="Motor RPM:").grid(row=5, column=0, sticky=tk.W)
         self.rpm_label = Label(status_frame, text="0.0")
-        self.rpm_label.grid(row=4, column=1, sticky=tk.W)
+        self.rpm_label.grid(row=5, column=1, sticky=tk.W)
 
-        Label(status_frame, text="Current Voltage:").grid(row=5, column=0, sticky=tk.W)
+        Label(status_frame, text="Current Voltage:").grid(row=6, column=0, sticky=tk.W)
         self.voltage_label = Label(status_frame, text="0.0 V")
-        self.voltage_label.grid(row=5, column=1, sticky=tk.W)
+        self.voltage_label.grid(row=6, column=1, sticky=tk.W)
 
         # CHANGED: Update label from scaling factor to max voltage
-        Label(status_frame, text="RL Max Voltage:").grid(row=6, column=0, sticky=tk.W)
+        Label(status_frame, text="RL Max Voltage:").grid(row=7, column=0, sticky=tk.W)
         self.max_voltage_label = Label(status_frame, text=f"{self.max_voltage:.1f} V")
-        self.max_voltage_label.grid(row=6, column=1, sticky=tk.W)
+        self.max_voltage_label.grid(row=7, column=1, sticky=tk.W)
 
         # Add actual frequency display
-        Label(status_frame, text="Control Frequency:").grid(row=7, column=0, sticky=tk.W)
+        Label(status_frame, text="Control Frequency:").grid(row=8, column=0, sticky=tk.W)
         self.freq_label = Label(status_frame, text=f"{self.actual_frequency:.1f} Hz")
-        self.freq_label.grid(row=7, column=1, sticky=tk.W)
+        self.freq_label.grid(row=8, column=1, sticky=tk.W)
+
+        # Add data logging info
+        Label(status_frame, text="Log Status:").grid(row=9, column=0, sticky=tk.W)
+        self.log_info_label = Label(status_frame, text="Not logging")
+        self.log_info_label.grid(row=9, column=1, sticky=tk.W)
 
         # RGB Control
         rgb_frame = Frame(self.master, padx=10, pady=10)
@@ -402,6 +486,205 @@ class QUBEControllerWithRL:
 
         self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
         self.b_slider.grid(row=0, column=2, padx=5)
+
+    def update_filter_cutoff(self):
+        """Update the cutoff frequency of the low-pass filters"""
+        try:
+            # Get cutoff frequency from entry field
+            cutoff_freq = float(self.filter_entry.get())
+            if cutoff_freq <= 0:
+                cutoff_freq = 500.0  # Default if invalid
+
+            # Store current filter values to preserve states
+            pendulum_velocity_last = self.pendulum_velocity_filter.y_last
+            motor_velocity_last = self.motor_velocity_filter.y_last
+            voltage_last = self.voltage_filter.y_last
+
+            # Create new filters with updated cutoff frequency
+            self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=cutoff_freq)
+            self.motor_velocity_filter = LowPassFilter(cutoff_freq=cutoff_freq)
+            self.voltage_filter = LowPassFilter(cutoff_freq=cutoff_freq)
+
+            # Transfer the previous states to maintain continuity
+            self.pendulum_velocity_filter.reset(pendulum_velocity_last)
+            self.motor_velocity_filter.reset(motor_velocity_last)
+            self.voltage_filter.reset(voltage_last)
+
+            # Update status
+            self.filter_status_label.config(text=f"Cutoff: {cutoff_freq} Hz")
+
+        except ValueError:
+            # Handle invalid input
+            self.filter_status_label.config(text="Invalid cutoff value!")
+
+    def toggle_logging(self):
+        """Start or stop data logging"""
+        if not self.logging:
+            # Start logging
+            try:
+                # Get log interval from entry field
+                self.log_interval = int(self.log_interval_entry.get())
+                if self.log_interval < 1:
+                    self.log_interval = 1
+            except ValueError:
+                self.log_interval = 20  # Default value
+
+            # Open a file dialog to select save location
+            log_filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Save Log Data As"
+            )
+
+            if not log_filename:  # User canceled
+                return
+
+            # Open the file for writing
+            try:
+                self.log_file = open(log_filename, 'w', newline='')
+                self.log_writer = csv.writer(self.log_file)
+
+                # Write header
+                self.log_writer.writerow([
+                    "Step", "Mode", "PendulumAngle", "PendulumVelocity",
+                    "MotorPosition", "MotorVelocity", "dt", "Voltage"
+                ])
+
+                # Set logging state
+                self.logging = True
+                self.log_counter = 0
+                self.log_step = 0
+                self.log_start_time = time.time()
+                self.prev_logging_time = self.log_start_time
+                self.prev_pendulum_angle = self.qube.getPendulumAngle()
+                self.prev_motor_pos = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+
+                # Don't reset filters here anymore - instead keep using the existing ones
+                # Only save the current cutoff frequency in case we need it
+                try:
+                    self.log_cutoff_freq = float(self.filter_entry.get())
+                except ValueError:
+                    self.log_cutoff_freq = 500.0  # Default value
+
+                # Update UI
+                self.log_btn.config(text="Stop Logging")
+                self.log_status_label.config(text="Logging: ON")
+                self.log_info_label.config(text=f"Logging to: {os.path.basename(log_filename)}")
+
+                # Set cyan LED during logging
+                self.r_slider.set(0)
+                self.g_slider.set(500)
+                self.b_slider.set(500)
+
+            except Exception as e:
+                messagebox.showerror("Logging Error", f"Could not start logging: {str(e)}")
+        else:
+            # Stop logging
+            self.stop_logging()
+
+    def stop_logging(self):
+        """Stop data logging and close file"""
+        if self.logging:
+            try:
+                if self.log_file:
+                    self.log_file.close()
+                    self.log_file = None
+                    self.log_writer = None
+            except Exception as e:
+                print(f"Error closing log file: {str(e)}")
+
+            # Update state
+            self.logging = False
+
+            # Update UI
+            self.log_btn.config(text="Start Logging")
+            self.log_status_label.config(text="Logging: OFF")
+            self.log_info_label.config(text="Not logging")
+
+            # Reset LED to blue
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
+
+    def log_data(self):
+        """Log current data to CSV file with low-pass filtered velocities"""
+        if not self.logging or not self.log_file or not self.log_writer:
+            return
+
+        try:
+            # Increment log step counter
+            self.log_step += 1
+
+            # Get current time and calculate dt (just for logging purposes)
+            current_time = time.time()
+            dt = current_time - self.prev_logging_time
+            self.prev_logging_time = current_time
+
+            # Get pendulum angle and motor position
+            pendulum_angle = self.qube.getPendulumAngle()
+            motor_position = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
+
+            # Get current velocities from the main control loop's filters
+            # instead of calculating them separately
+            # This is to ensure consistency between control and logging
+
+            # For motor velocity, use the RPM directly from QUBE
+            motor_rpm = self.qube.getMotorRPM()
+            motor_velocity = motor_rpm * (2 * np.pi / 60)  # Convert RPM to rad/s
+
+            # For pendulum velocity, use the same filtered value used in control
+            # This requires recomputing it
+            current_pendulum_angle_rad = np.radians(pendulum_angle)
+            if hasattr(self, 'prev_pendulum_angle_rl') and hasattr(self, 'prev_time_rl'):
+                time_diff = current_time - self.prev_time_rl
+                if time_diff > 0:
+                    # Get the same filtered velocity used in RL control
+                    pendulum_velocity = self.pendulum_velocity_filter.y_last
+                else:
+                    pendulum_velocity = 0.0
+            else:
+                pendulum_velocity = 0.0
+
+            # Get the filtered voltage being used
+            filtered_voltage = self.motor_voltage  # Use the current commanded voltage
+
+            # Determine mode
+            mode = "Balance" if self.rl_mode else "Swingup"
+            if self.moving_to_position:
+                mode = "Position"
+            elif self.calibrating:
+                mode = "Calibrate"
+
+            # Write the row to CSV
+            self.log_writer.writerow([
+                self.log_step,
+                mode,
+                f"{pendulum_angle:.2f}",
+                f"{pendulum_velocity:.2f}",
+                f"{motor_position:.2f}",
+                f"{motor_velocity:.2f}",
+                f"{dt:.6f}",
+                f"{filtered_voltage:.2f}"
+            ])
+
+            # Flush the file to make sure data is written
+            self.log_file.flush()
+
+            # Update log status every 100 records
+            if self.log_step % 100 == 0:
+                elapsed = time.time() - self.log_start_time
+                rate = self.log_step / max(elapsed, 0.001)
+                self.log_info_label.config(text=f"Logging: {self.log_step} rows at {rate:.1f} rows/sec")
+
+        except Exception as e:
+            print(f"Error logging data: {str(e)}")
+            # Try to stop logging if there's an error
+            self.stop_logging()
+
+        except Exception as e:
+            print(f"Error logging data: {str(e)}")
+            # Try to stop logging if there's an error
+            self.stop_logging()
 
     def set_target_frequency(self, value):
         """Set target control frequency from slider"""
@@ -578,7 +861,9 @@ class QUBEControllerWithRL:
         else:
             dt = current_time - self.prev_time_rl
             if dt > 0:
-                pendulum_velocity = (current_pendulum_angle_rad - self.prev_pendulum_angle_rl) / dt
+                raw_velocity = (current_pendulum_angle_rad - self.prev_pendulum_angle_rl) / dt
+                # Apply low-pass filter to pendulum velocity for RL
+                pendulum_velocity = self.pendulum_velocity_filter.filter(raw_velocity, dt)
             else:
                 pendulum_velocity = 0.0
             self.prev_pendulum_angle_rl = current_pendulum_angle_rad
@@ -607,7 +892,12 @@ class QUBEControllerWithRL:
             action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
 
         # Apply max_voltage directly
-        self.motor_voltage = float(action) * self.max_voltage
+        raw_voltage = float(action) * self.max_voltage
+
+        # Apply low-pass filter to voltage (just like in Arduino code)
+        current_time = time.time()
+        dt = current_time - self.last_loop_time if hasattr(self, 'last_loop_time') else 0.001
+        self.motor_voltage = self.voltage_filter.filter(raw_voltage, dt)
 
         # Update status - but only during UI updates
         if self.ui_counter == 0:
@@ -636,7 +926,12 @@ class QUBEControllerWithRL:
                 action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
 
         # Apply max_voltage directly
-        self.motor_voltage = float(action) * self.max_voltage
+        raw_voltage = float(action) * self.max_voltage
+
+        # Apply low-pass filter to voltage (just like in Arduino code)
+        current_time = time.time()
+        dt = current_time - self.last_loop_time if hasattr(self, 'last_loop_time') else 0.001
+        self.motor_voltage = self.voltage_filter.filter(raw_voltage, dt)
 
         # Update status - but only during UI updates
         if self.ui_counter == 0:
@@ -700,6 +995,12 @@ class QUBEControllerWithRL:
         # Apply RGB values
         self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
 
+        # Handle data logging - log data every log_interval iterations
+        if self.logging:
+            self.log_counter = (self.log_counter + 1) % self.log_interval
+            if self.log_counter == 0:
+                self.log_data()
+
         # Only update display information when UI counter is 0
         if self.ui_counter == 0:
             # Update display information
@@ -730,7 +1031,7 @@ class QUBEControllerWithRL:
 
 
 def main():
-    print("Starting QUBE Controller with RL...")
+    print("Starting QUBE Controller with RL, Data Logging, and Low-Pass Filtering...")
     print("Will set corner position as zero")
     print("OPTIMIZED VERSION - High-frequency control, extended voltage range")
 
