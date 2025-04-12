@@ -1,40 +1,43 @@
 #include "QUBE.hpp"
-
 QUBE qube;
 
 // Physical parameters
-float m_p = 0.1;        // Pendulum stick - kg
-float l = 0.095;        // Length of pendulum - meters
-float l_com = l/2;      // Distance to COM - meters
+float m_p = 0.1; // Pendulum stick - kg
+float l = 0.095; // Length of pendulum - meters
+float l_com = l/2; // Distance to COM - meters
 float J = (1/3) * m_p * l * l; // Inertia kg/m^2
-float g = 9.81;         // Gravitational constant - m/s^2
+float g = 9.81; // Gravitational constant - m/s^2
 
 // Swingup Parameters
-float Er = 0.015;       // Reference energy - Joules
-float ke = 50;          // Tunable gain for swingup voltage - m/s/J
-float u_max = 3;        // m/s^2
+float Er = 0.015; // Reference energy - Joules
+float ke = 50; // Tunable gain for swingup voltage - m/s/J
+float u_max = 3.0; // m/s^2
 float balance_range = 35.0; // Range where mode switches to balancing - degrees
 
 // Balance Parameters
-float s = 0.33;         // Quick scaling
-float kp_theta = 2 * s;    // Kp pendulum angle
+float s = 0.33; // Quick scaling
+float kp_theta = 2 * s; // Kp pendulum angle
 float kd_theta = 0.125 * s; // Kd pendulum angle
-float kp_pos = 0.07 * s;    // Kp motor angle
-float kd_pos = 0.06 * s;    // Kd motor angle
+float kp_pos = 0.07 * s; // Kp motor angle
+float kd_pos = 0.06 * s; // Kd motor angle
 long t_balance = 0;
 
 // Filter parameters
-float twopi = 3.141592*2;  // 2pi
-float wc = 500/twopi;      // Cutoff frequency for pendulum velocity
-float wc3 = 500/twopi;     // Cutoff frequency for voltage
+float twopi = 3.141592*2; // 2pi
+float y_k_last = 0; // Pendulum angular velocity
+float wc = 500/twopi; // Cutoff frequency
+float y2_k_last = 0; // Motor angular velocity
+float wc2 = 500/twopi; // Cutoff frequency
+float y3_k_last = 0; // Voltage 
+float wc3 = 500/twopi; // Cutoff frequency
 
 // Control loop parameters
-float freq = 2000;     // Frequency - Hz
-float dt = 1.0/freq;   // Timestep - sec
-const unsigned int LOOP_TIME_US = (unsigned int)(dt * 1e6);
+float freq = 2000; // Frequency - Hz
+float dt = 1.0/freq; // Timestep - sec
 
 // Program variables
 float prevAngle = 0;
+float prevPos = 0;
 long last = micros();
 long now = micros();
 long t_reset = micros();
@@ -42,28 +45,12 @@ bool mode = 0;
 bool lastMode = 0;
 bool reset = false;
 
-// Safety parameters
-const float CURRENT_LIMIT = 400.0; // mA
-
-// Data collection variables
-float voltage = 0;           // Applied voltage
-float angularV = 0;          // Pendulum angular velocity
-float motorV = 0;            // Motor angular velocity in RPM
-float energy = 0;            // System energy
-unsigned long startTime = 0; // Time when logging started
-long dataTimestamp = 0;      // Time elapsed since start
-
-// Data collection settings
-bool dataLoggingEnabled = true;
-int decimationFactor = 20;   // Only log every Nth sample
-int sampleCounter = 0;
-
-// Filter variables
-float y_k_last = 0;          // Last filtered pendulum angular velocity
-float y3_k_last = 0;         // Last filtered voltage
+// Print counter and voltage tracking
+int printCounter = 0;
+float currentVoltage = 0.0;
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);  // Initialize serial communication at high baud rate
   qube.begin();
   delay(1000);
   qube.setRGB(999, 999, 999);
@@ -71,127 +58,108 @@ void setup() {
   delay(1000);
   qube.setPendulumEncoder(0);
   qube.update();
-  delay(1000);
+  delay(10000);
   
-  // Print CSV header
-  Serial.println("time,position,angle,motor_velocity,pendulum_velocity,voltage,energy,mode");
-  startTime = millis();
+  // Print header for data
+  Serial.println("Step,Mode,PendulumAngle,PendulumVelocity,MotorPosition,MotorVelocity,dt,Voltage");
 }
 
-void sendDataToSerial(long timestamp, float position, float angle, float motorVelocity, 
-                     float pendulumVelocity, float appliedVoltage, float systemEnergy, int controlMode) {
-  if (!dataLoggingEnabled) return;
-  
-  // Only log every Nth sample to avoid overwhelming serial
-  sampleCounter++;
-  if (sampleCounter % decimationFactor != 0) return;
-  
-  // Write the data as CSV to serial
-  Serial.print(timestamp);
-  Serial.print(",");
-  Serial.print(position);
-  Serial.print(",");
-  Serial.print(angle);
-  Serial.print(",");
-  Serial.print(motorVelocity);
-  Serial.print(",");
-  Serial.print(pendulumVelocity);
-  Serial.print(",");
-  Serial.print(appliedVoltage);
-  Serial.print(",");
-  Serial.print(systemEnergy);
-  Serial.print(",");
-  Serial.println(controlMode);
-}
-
-float swingup(float angle) {
-  // Calculate pendulum angular velocity
-  angularV = (angle-prevAngle) / dt;
+void swingup(float angle) {
+  float angularV = (angle-prevAngle) / dt;
   prevAngle = angle;
 
-  // Calculate system energy
-  energy = 0.5 * J * angularV*angularV + m_p*g*l_com*(1-cos(angle));
-  
-  // Calculate control input
-  float u = ke * (energy - Er) * (-angularV * cos(angle));
+  float E = 0.5 * J * angularV*angularV + m_p*g*l_com*(1-cos(angle));
+  float u = ke * (E - Er) * (-angularV * cos(angle));
   float u_sat = min(u_max, max(-u_max, u));
 
-  // Convert to voltage
-  voltage = u_sat * (8.4*0.095*0.085) /0.042;
+  float voltage = u_sat * (8.4*0.095*0.085) /0.042;
 
   // Low pass filter voltage to reduce noise
-  float y3_k = y3_k_last + wc3*dt*(voltage - y3_k_last);
+  float y3_k = y3_k_last  + wc3*dt*(voltage - y3_k_last);
   y3_k_last = y3_k;
 
-  // Apply voltage to motor
+  currentVoltage = y3_k;  // Store current voltage for printing
   qube.setMotorVoltage(y3_k);
-  return y3_k; // Return the applied voltage
 }
 
-float balance(float position, float angle) {
-  // Calculate pendulum angular velocity with filtering
-  angularV = (angle-prevAngle) / dt;
-  float y_k = y_k_last + wc*dt*(angularV - y_k_last);
+void settlePendulum(float angle) {
+
+  // Hack for using energy equation to make target energy 0
+  if (angle < 0) {
+    angle += 180;
+    angle = 180 - angle;
+  } else {
+    angle -= 180;
+    angle = -180 - angle;
+  }
+
+  float angularV = (angle-prevAngle) / dt;
+  prevAngle = angle;
+
+  float E = 0.5 * J * angularV*angularV + m_p*g*l_com*(1-cos(angle));
+  float u = -ke * (E - Er) * (angularV * cos(angle));
+  float u_sat = min(u_max, max(-u_max, u));
+
+  float voltage = u_sat * (8.4*0.095*0.085) /0.042;
+
+  // Low pass filter the voltage to reduce noise
+  float y3_k = y3_k_last  + wc3*dt*(voltage - y3_k_last);
+  y3_k_last = y3_k;
   
-  // Get motor velocity directly from tachometer (in RPM)
-  motorV = qube.getRPM();
+  currentVoltage = y3_k;  // Store current voltage for printing
+  qube.setMotorVoltage(y3_k);
+}
+
+void settleMotor(float position) {
+  float v = (position-prevPos) / dt;
+  prevPos = position;
+  float y2_k = y2_k_last  + wc2*dt*(v - y2_k_last);
+  y2_k_last = y2_k;
   
-  // Calculate control inputs
+  float u_pos = kp_pos * 3 * position + kd_pos * y2_k;
+  
+  currentVoltage = -u_pos;  // Store current voltage for printing
+  qube.setMotorVoltage(-u_pos);
+}
+
+void balance(float position, float angle) {
+  float u_dot = (angle-prevAngle) / dt;
+  float v = (position-prevPos) / dt;
+
+  // Low pass filtering velocities
+  float y_k = y_k_last  + wc*dt*(u_dot - y_k_last);
+  float y2_k = y2_k_last  + wc2*dt*(v - y2_k_last);
+
   float u_ang = kp_theta * angle + kd_theta * y_k;
-  float u_pos = kp_pos * position + kd_pos * (motorV / 6.0); // Convert RPM to deg/s
+  float u_pos = kp_pos * position + kd_pos * y2_k;
   float u = u_pos + u_ang;
   
-  // Apply voltage to motor
+  currentVoltage = u;  // Store current voltage for printing
   qube.setMotorVoltage(u);
-  
-  // Update filter states
   prevAngle = angle;
+  prevPos = position;
   y_k_last = y_k;
-  
-  // Calculate energy for data collection
-  energy = 0.5 * J * angularV*angularV + m_p*g*l_com*(1-cos(angle));
-  
-  return u; // Return the applied voltage
-}
-
-float settleMotor(float position) {
-  // Get motor velocity directly from tachometer
-  motorV = qube.getRPM();
-  
-  // Use a simple proportional-derivative controller to settle
-  float u_pos = kp_pos * 3 * position + kd_pos * (motorV / 6.0); // Convert RPM to deg/s
-  qube.setMotorVoltage(-u_pos);
-  return -u_pos;
+  y2_k_last = y2_k;
 }
 
 void loop() {
   now = micros();
-  if ((unsigned long)(now - last) < LOOP_TIME_US) return;
-  
+  if (now - last < dt*1e6) return;
   last = now;
-  float appliedVoltage = 0.0;
-  dataTimestamp = millis() - startTime; // Time in ms since start
   
-  // Get sensor readings
   int position = qube.getMotorAngle();
   float angle = qube.getPendulumAngle();
-  angle = (angle > 0) ? angle - 180 : angle + 180; // Makes 0 degrees be the top position
-  
-  // Check motor current for safety
-  float current = qube.getMotorCurrent();
-  if (current > CURRENT_LIMIT) {
-    // Safety cutoff
-    qube.setMotorVoltage(0);
-    reset = true;
-    t_reset = now;
-  }
-  
-  // Mode switching logic
-  if (mode == 0 && angle < balance_range && angle > -balance_range) {
+  angle > 0 ? angle -= 180 : angle += 180; // Makes 0 degrees be the top position
+
+  // Calculate velocities for printing
+  float pendulumVelocity = (angle-prevAngle) / dt;
+  float motorVelocity = (position-prevPos) / dt;
+
+  if (mode == 0 && angle < (balance_range) && angle > (-balance_range)) {
     mode = 1;
     t_balance = now;
   }
-  if (mode == 1 && !(angle < balance_range && angle > -balance_range)) {
+  if (mode == 1 && !(angle < (balance_range) && angle > (-balance_range))) {
     mode = 0;
     if (now - t_balance > 1e6) {
       reset = true;
@@ -199,41 +167,43 @@ void loop() {
     }
   }
 
-  // Reset sequence
+  // Reset
   if (reset) {
     while (micros() - t_reset < 2e6) {
-      position = qube.getMotorAngle();
-      angle = qube.getPendulumAngle();
-      angle = (angle > 0) ? angle - 180 : angle + 180;
-      
-      appliedVoltage = settleMotor(position);
-      motorV = qube.getRPM();
-      
-      // Collect data during reset phase too (with mode = 2 for reset)
-      dataTimestamp = millis() - startTime;
-      sendDataToSerial(dataTimestamp, position, angle, motorV, angularV, appliedVoltage, 0, 2);
-      
+      settleMotor(position);
       qube.update();
+      position = qube.getMotorAngle();
       delay(dt*1e3);
     }
     reset = false;
     return;
   }
 
-  // Control logic
-  if (mode == 0) {
-    appliedVoltage = swingup(angle);
-  } else {
-    appliedVoltage = balance(position, angle);
+  if (mode == 0) swingup(angle);
+  if (mode == 1) balance(position, angle);
+
+  // Print data every 20 steps
+  printCounter++;
+  if (printCounter >= 20) {
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(mode ? "Balance" : "Swingup");
+    Serial.print(",");
+    Serial.print(angle);
+    Serial.print(",");
+    Serial.print(pendulumVelocity);
+    Serial.print(",");
+    Serial.print(position);
+    Serial.print(",");
+    Serial.print(motorVelocity);
+    Serial.print(",");
+    Serial.print(dt, 6);  // Print with 6 decimal places
+    Serial.print(",");
+    Serial.println(currentVoltage);
+    
+    printCounter = 0;  // Reset counter
   }
 
-  // Get motor velocity from tachometer for data logging
-  motorV = qube.getRPM();
-  
-  // Send data to serial
-  sendDataToSerial(dataTimestamp, position, angle, motorV, angularV, appliedVoltage, energy, mode);
-  
-  // Update hardware
   qube.update();
   lastMode = mode;
 }
