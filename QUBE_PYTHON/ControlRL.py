@@ -15,10 +15,9 @@ COM_PORT = "COM3"
 
 # Low Pass Filter class (similar to the Arduino implementation)
 class LowPassFilter:
-    def __init__(self, cutoff_freq=63.0):
+    def __init__(self, cutoff_freq=400.0):
         """Initialize a low-pass filter with specified cutoff frequency in Hz"""
-        self.twopi = 2.0 * np.pi
-        self.wc = cutoff_freq * self.twopi  # Cutoff frequency parameter
+        self.wc = cutoff_freq
         self.y_last = 0.0  # Last output value
 
     def filter(self, x, dt):
@@ -124,7 +123,7 @@ class QUBEControllerWithRL:
         self.prev_logging_time = time.time()
 
         # Low-pass filters
-        self.filter_cutoff = 500.0  # Default cutoff frequency
+        self.filter_cutoff = 400.0  # Default cutoff frequency (corrected value)
         self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
         self.motor_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
         self.voltage_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
@@ -276,14 +275,14 @@ class QUBEControllerWithRL:
         self.filter_cutoff_slider = Scale(
             filter_frame,
             from_=0,
-            to=6000,
+            to=1000,
             orient=tk.HORIZONTAL,
             label="Filter Cutoff Frequency (Hz)",
             length=300,
-            resolution=100,
+            resolution=1,
             command=self.set_filter_cutoff
         )
-        self.filter_cutoff_slider.set(self.filter_cutoff)
+        self.filter_cutoff_slider.set(63)
         self.filter_cutoff_slider.grid(row=0, column=0, padx=5)
 
         # Filter status
@@ -394,7 +393,7 @@ class QUBEControllerWithRL:
         try:
             cutoff_freq = float(value)
             if cutoff_freq <= 0:
-                cutoff_freq = 100.0  # Minimum value for safety
+                cutoff_freq = 10.0  # Minimum value for safety
 
             # Store current filter values to preserve states
             pendulum_velocity_last = self.pendulum_velocity_filter.y_last
@@ -920,7 +919,7 @@ def main():
         app = QUBEControllerWithRL(root, qube)
 
         # Set initial values
-        app.filter_cutoff_slider.set(500)  # Default filter cutoff to 500 Hz
+        app.filter_cutoff_slider.set(400.0)  # Default filter cutoff to 500 Hz
         app.max_voltage_slider.set(4.0)  # Set default max voltage
         app.set_max_voltage(4.0)  # Update the internal value
 
