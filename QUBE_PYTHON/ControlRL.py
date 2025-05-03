@@ -15,10 +15,10 @@ COM_PORT = "COM3"
 
 # Low Pass Filter class (similar to the Arduino implementation)
 class LowPassFilter:
-    def __init__(self, cutoff_freq=500.0):
+    def __init__(self, cutoff_freq=63.0):
         """Initialize a low-pass filter with specified cutoff frequency in Hz"""
         self.twopi = 2.0 * np.pi
-        self.wc = cutoff_freq / self.twopi  # Cutoff frequency parameter
+        self.wc = cutoff_freq * self.twopi  # Cutoff frequency parameter
         self.y_last = 0.0  # Last output value
 
     def filter(self, x, dt):
