@@ -110,9 +110,14 @@ def process_csv_in_excel(file_path):
         # Try to convert to numeric
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
+    # Use Step values directly for Time
+    if 'Step' in df.columns:
+        # Just subtract the first Step to make time start at zero
+        df['Time'] = (df['Step'] - df['Step'].iloc[0]) / 1000.0
+
     # Convert u_sat to Voltage for xlsx files
     # This assumes 'Voltage' column already exists but contains u_sat values
-    if 'Voltage' in df.columns:
+    if 'Voltage' in df.columns and file_path.endswith(('.xlsx', '.xls')):
         df['Voltage'] = df['Voltage'] * (8.4 * 0.095 * 0.085) / 0.042
 
     return df
@@ -245,7 +250,7 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None, filter_mode=Fals
         return None, None
 
     # Reset time axis to start from 0.0 regardless of original Step values
-    df = reset_time_axis(df)
+    #df = reset_time_axis(df)
 
     # Filter to only include Balance mode data if requested
     if filter_mode:
@@ -302,9 +307,6 @@ def plot_qube_data(file_path, save_plot=False, output_dir=None, filter_mode=Fals
     # Add reference line at 0 (upright position)
     axs[0].axhline(y=np.pi, color='k', linestyle=':', alpha=0.7, label='Upright Position')
     axs[0].axhline(y=-np.pi, color='k', linestyle=':', alpha=0.7, label='Upright Position')
-
-
-    # Title and comment have been removed
 
     axs[0].set_ylabel('Angle (radians)', fontsize=12)
     axs[0].legend(loc='upper left')
@@ -403,7 +405,7 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Data Comp
             continue
 
         # Reset time axis to start from 0.0 regardless of original Step values
-        df = reset_time_axis(df)
+        #df = reset_time_axis(df)
 
         # Filter to only include Balance mode data if requested
         if filter_mode:
@@ -484,7 +486,7 @@ def overlay_plots(file_paths, save_plot=False, output_dir=None, title="Data Comp
 
     # Adjust spacing between subplots
     plt.tight_layout()
-    plt.subplots_adjust(top=0.92)  # Adjust for the title
+    # plt.subplots_adjust(top=0.92)  # No title adjustment needed
 
     # Save plot if requested
     if save_plot:

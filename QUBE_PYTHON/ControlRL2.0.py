@@ -1,31 +1,56 @@
 import tkinter as tk
-from tkinter import Button, Label, Frame, Scale, Entry, filedialog, Checkbutton, IntVar, StringVar
+from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox, Checkbutton, IntVar, StringVar, \
+    OptionMenu
 from QUBE import QUBE
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.distributions import Normal
 import os
+import csv
+import threading
 from datetime import datetime
 
+# Try to import from SimRL for code reuse
+try:
+    from SimRL import ReplayBuffer, Critic, SACAgent
+
+    print("Successfully imported components from SimRL")
+except ImportError:
+    print("Could not import from SimRL. Using built-in implementations.")
+    # Define here if imports fail (implementations below)
+
 # Update with your COM port
-COM_PORT = "COM10"
-
-# Improved SAC Hyperparameters
-BATCH_SIZE = 256  # Increased from 128 for more stable updates
-GAMMA = 0.99
-TAU = 0.001  # Reduced for more stable target updates
-LR = 1e-4  # Reduced from 3e-4 for more careful learning
-ALPHA = 0.1  # Reduced from 0.2 for less random exploration initially
-AUTO_ENTROPY_TUNING = True
-MAX_VOLTAGE = 10.0
+COM_PORT = "COM3"
 
 
-# Actor Network - same architecture as in training script
+# Low Pass Filter class (similar to the Arduino implementation)
+class LowPassFilter:
+    def __init__(self, cutoff_freq=500.0):
+        """Initialize a low-pass filter with specified cutoff frequency in Hz"""
+        self.twopi = 2.0 * np.pi
+        self.wc = cutoff_freq / self.twopi  # Cutoff frequency parameter
+        self.y_last = 0.0  # Last output value
+
+    def filter(self, x, dt):
+        """Apply filter to input x with timestep dt"""
+        # Same equation as in the Arduino code:
+        # y_k = y_k_last + wc*dt*(x - y_k_last)
+        y_k = self.y_last + self.wc * dt * (x - self.y_last)
+        self.y_last = y_k  # Save for next iteration
+        return y_k
+
+    def reset(self, initial_value=0.0):
+        """Reset the filter state"""
+        self.y_last = initial_value
+
+
+# Actor Network
 class Actor(nn.Module):
+    """Policy network that outputs action distribution."""
+
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Actor, self).__init__()
 
@@ -53,116 +78,234 @@ class Actor(nn.Module):
         return action_mean, action_log_std
 
     def sample(self, state):
+        """Sample action from the distribution and compute log probability."""
         mean, log_std = self.forward(state)
         std = log_std.exp()
 
-        # Sample from normal distribution
+        # Sample from normal distribution with reparameterization trick
         normal = Normal(mean, std)
-        x = normal.rsample()  # Reparameterization trick
+        x = normal.rsample()
 
         # Constrain to [-1, 1]
         action = torch.tanh(x)
 
-        # Calculate log probability
+        # Calculate log probability with squashing correction
         log_prob = normal.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
 
         return action, log_prob
 
 
-# Critic (Value) Network
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(Critic, self).__init__()
+# Critic Network - only include if import from SimRL fails
+if 'Critic' not in globals():
+    class Critic(nn.Module):
+        """Value network that estimates Q-values."""
 
-        # Q1 architecture
-        self.q1 = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        def __init__(self, state_dim, action_dim, hidden_dim=256):
+            super(Critic, self).__init__()
 
-        # Q2 architecture (for Twin Delayed DDPG)
-        self.q2 = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+            # Q1 network
+            self.q1 = nn.Sequential(
+                nn.Linear(state_dim + action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
 
-    def forward(self, state, action):
-        x = torch.cat([state, action], 1)
+            # Q2 network to reducing overestimation bias
+            self.q2 = nn.Sequential(
+                nn.Linear(state_dim + action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
 
-        q1 = self.q1(x)
-        q2 = self.q2(x)
+        def forward(self, state, action):
+            """Forward pass through both Q networks."""
+            x = torch.cat([state, action], 1)
 
-        return q1, q2
+            q1 = self.q1(x)
+            q2 = self.q2(x)
 
+            return q1, q2
 
-# Improved Prioritized Replay Buffer
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.alpha = alpha  # How much prioritization to use
+# ReplayBuffer - only include if import from SimRL fails
+if 'ReplayBuffer' not in globals():
+    class ReplayBuffer:
+        """Store and sample transitions for off-policy learning."""
 
-        # Progressive beta for importance sampling
-        self.beta_start = beta_start
-        self.beta_frames = beta_frames
-        self.frame_idx = 1
+        def __init__(self, capacity):
+            self.capacity = capacity
+            self.buffer = []
+            self.position = 0
 
-    def get_beta(self):
-        # Calculate beta based on training progress
-        beta = min(1.0, self.beta_start + self.frame_idx * (1.0 - self.beta_start) / self.beta_frames)
-        self.frame_idx += 1
-        return beta
+        def push(self, state, action, reward, next_state, done):
+            """Add a transition to the buffer."""
+            if len(self.buffer) < self.capacity:
+                self.buffer.append(None)
+            self.buffer[self.position] = (state, action, reward, next_state, done)
+            self.position = (self.position + 1) % self.capacity
 
-    def push(self, state, action, reward, next_state, done):
-        max_priority = self.priorities.max() if self.buffer else 1.0
+        def sample(self, batch_size):
+            """Randomly sample a batch of transitions."""
+            batch = np.random.choice(len(self.buffer), batch_size, replace=False)
+            states, actions, rewards, next_states, dones = map(np.array, zip(*[self.buffer[i] for i in batch]))
+            return states, actions, rewards, next_states, dones
 
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
+        def __len__(self):
+            return len(self.buffer)
 
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
+# SACAgent - only include if import from SimRL fails
+if 'SACAgent' not in globals():
+    class SACAgent:
+        """Soft Actor-Critic agent for continuous control."""
 
-    def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == 0:
-            return [], [], [], [], [], [], []
+        def __init__(
+                self,
+                state_dim,
+                action_dim,
+                hidden_dim=256,
+                lr=3e-4,
+                gamma=0.99,
+                tau=0.005,
+                alpha=0.2,
+                automatic_entropy_tuning=True
+        ):
+            self.gamma = gamma
+            self.tau = tau
+            self.alpha = alpha
+            self.automatic_entropy_tuning = automatic_entropy_tuning
 
-        if len(self.buffer) < self.capacity:
-            priorities = self.priorities[:len(self.buffer)]
-        else:
-            priorities = self.priorities
+            # Initialize networks
+            self.actor = Actor(state_dim, action_dim, hidden_dim)
+            self.critic = Critic(state_dim, action_dim, hidden_dim)
+            self.critic_target = Critic(state_dim, action_dim, hidden_dim)
 
-        # Calculate sampling probabilities from priorities
-        probs = priorities ** self.alpha
-        probs /= probs.sum()
+            # Copy parameters to target network
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(param.data)
 
-        # Sample indices based on probabilities
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+            # Optimizers
+            self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
+            self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr)
 
-        # Calculate importance sampling weights
-        weights = (len(self.buffer) * probs[indices]) ** -beta
-        weights /= weights.max()
-        weights = np.array(weights, dtype=np.float32)
+            # Automatic entropy tuning
+            if automatic_entropy_tuning:
+                self.target_entropy = -torch.prod(torch.Tensor([action_dim])).item()
+                self.log_alpha = torch.zeros(1, requires_grad=True)
+                self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr)
 
-        states, actions, rewards, next_states, dones = zip(*[self.buffer[idx] for idx in indices])
-        return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(
-            dones), indices, weights
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def update_priorities(self, indices, priorities):
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
+            # Move networks to device
+            self.actor.to(self.device)
+            self.critic.to(self.device)
+            self.critic_target.to(self.device)
 
-    def __len__(self):
-        return len(self.buffer)
+            if automatic_entropy_tuning:
+                self.log_alpha = self.log_alpha.to(self.device)
+
+        def select_action(self, state, evaluate=False):
+            """Select an action given a state."""
+            state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+
+            with torch.no_grad():
+                if evaluate:
+                    # Use mean action (no exploration) for evaluation
+                    action, _ = self.actor(state)
+                else:
+                    # Sample action for training (with exploration)
+                    action, _ = self.actor.sample(state)
+
+                return action.cpu().numpy()[0]
+
+        def update_parameters(self, memory, batch_size=512):
+            """Update actor and critic parameters using a batch of experiences."""
+            # Sample batch from memory
+            state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
+
+            # Convert to tensors
+            state_batch = torch.FloatTensor(state_batch).to(self.device)
+            action_batch = torch.FloatTensor(action_batch).to(self.device)
+            reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+            next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+            done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)
+
+            # === Update Critic ===
+            with torch.no_grad():
+                # Get next actions and log probs from current policy
+                next_action, next_log_prob = self.actor.sample(next_state_batch)
+
+                # Get target Q values
+                target_q1, target_q2 = self.critic_target(next_state_batch, next_action)
+                target_q = torch.min(target_q1, target_q2)
+
+                # Apply entropy term
+                if self.automatic_entropy_tuning:
+                    alpha = self.log_alpha.exp()
+                else:
+                    alpha = self.alpha
+
+                # Compute TD target
+                target_q = target_q - alpha * next_log_prob
+                target_q = reward_batch + (1 - done_batch) * self.gamma * target_q
+
+            # Current Q estimates
+            current_q1, current_q2 = self.critic(state_batch, action_batch)
+
+            # Compute critic loss (MSE)
+            critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+
+            # Optimize critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic_optimizer.step()
+
+            # === Update Actor ===
+            # Sample actions and log probs from current policy
+            actions, log_probs = self.actor.sample(state_batch)
+
+            # Get Q values for new actions
+            q1, q2 = self.critic(state_batch, actions)
+            min_q = torch.min(q1, q2)
+
+            # Get current alpha
+            if self.automatic_entropy_tuning:
+                alpha = self.log_alpha.exp()
+            else:
+                alpha = self.alpha
+
+            # Actor loss (maximize Q - alpha * log_prob)
+            actor_loss = (alpha * log_probs - min_q).mean()
+
+            # Optimize actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # === Update Alpha (if automatic entropy tuning) ===
+            if self.automatic_entropy_tuning:
+                # Alpha loss
+                alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+
+                # Optimize alpha
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+
+                self.alpha = self.log_alpha.exp()
+
+            # === Soft Update Target Networks ===
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            return {
+                'critic_loss': critic_loss.item(),
+                'actor_loss': actor_loss.item(),
+                'alpha': self.alpha.item() if self.automatic_entropy_tuning else self.alpha
+            }
 
 
 # Helper functions
@@ -174,7 +317,7 @@ def normalize_angle(angle):
     return angle
 
 
-class QUBEControllerWithRLTraining:
+class QUBEControllerWithRL:
     def __init__(self, master, qube):
         self.master = master
         self.qube = qube
@@ -185,434 +328,106 @@ class QUBEControllerWithRLTraining:
         self.target_position = 0.0
         self.calibrating = False
         self.rl_mode = False
-        self.training_mode = False
         self.moving_to_position = False
         self.rl_model = None
-        self.max_voltage = MAX_VOLTAGE
-        self.rl_scaling_factor = 6.0
-        self.balance_angle_threshold = np.radians(30)  # Default balance threshold
+        self.system_max_voltage = 18.0  # Increased maximum hardware voltage to 18.0V
+        self.max_voltage = 5.0  # Default max voltage for RL control (replaces scaling factor)
 
-        # Training state variables
-        self.experience_counter = 0
-        self.update_counter = 0
-        self.prev_state = None
-        self.prev_action = None
-        self.exploration_noise = 0.1  # Exploration noise during training
+        # Performance optimization settings - MODIFIED: Optimized UI updates
+        self.ui_update_interval = 15  # Increased UI update interval (higher = less UI overhead)
+        self.ui_counter = 0
+        self.last_loop_time = time.time()
+        self.actual_frequency = 0
 
-        # Tracking variables for improved balance detection
-        self.near_balance_time = 0.0
-        self.last_balance_check = time.time()
-        self.was_near_balance = False
+        # Cache for UI values to avoid unnecessary updates
+        self.ui_cache = {
+            'motor_angle': 0.0,
+            'pendulum_angle': 0.0,
+            'rpm': 0.0,
+            'voltage': 0.0,
+            'frequency': 0.0
+        }
 
-        # Variables for dynamic exploration and recovery
-        self.exploration_decay = 0.9997  # Decay rate for exploration
-        self.min_exploration = 0.05  # Minimum exploration level
+        # Performance tracking
+        self.iteration_count = 0
+        self.start_time = time.time()
 
-        # Variables for curriculum learning
-        self.curriculum_stage = 0
-        self.curriculum_success_counter = 0
-        self.curriculum_failure_counter = 0
+        # Data logging variables
+        self.logging = False
+        self.log_file = None
+        self.log_writer = None
+        self.log_counter = 0
+        self.log_interval = 20  # Log every 20 steps
+        self.log_step = 0
+        self.log_start_time = 0
 
-        # Variables for checkpointing and recovery
-        self.best_episode_reward = -float('inf')
-        self.best_episode_length = 0
-        self.consecutive_short_episodes = 0
+        # Pendulum velocity tracking for logging
+        self.prev_pendulum_angle = 0
+        self.prev_motor_pos = 0
+        self.prev_logging_time = time.time()
 
-        # RL components
-        self.state_dim = 6  # Our observation space
-        self.action_dim = 1  # Motor voltage (normalized)
-        self.replay_buffer_size = 100000
-        self.min_buffer_size_for_training = BATCH_SIZE * 3
-        self.training_steps_per_update = 1
-        self.update_every_n_steps = 5
-        self.init_rl_components()
+        # Low-pass filters
+        self.filter_cutoff = 500.0  # Default cutoff frequency
+        self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+        self.motor_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+        self.voltage_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+        self.filtered_voltage = 0.0
+
+        # Initialize the RL model (but don't load weights yet)
+        self.initialize_rl_model()
+
+        # Training variables - NEW
+        self.training_mode = False
+        self.sac_agent = None
+        self.replay_buffer = None
+        self.episode_rewards = []
+        self.episode_reward = 0
+        self.episode_step = 0
+        self.training_thread = None
+        self.stop_training = False
+        self.use_filters_during_training = True
+        self.random_reset = False
+        self.previous_state = None
+        self.batch_size = 256
+        self.update_freq = 1
+        self.episodes_completed = 0
+        self.training_start_time = 0
+
+        # Create training params
+        self.initialize_training_params()
 
         # Create GUI elements
         self.create_gui()
 
-        # Stats for training
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.current_episode_reward = 0
-        self.current_episode_length = 0
-        self.current_episode = 0
-        self.episode_start_time = time.time()
+    def initialize_training_params(self):
+        """Initialize parameters for SAC training"""
+        self.training_params = {
+            'state_dim': 6,  # Observation dimension
+            'action_dim': 1,  # Action dimension
+            'hidden_dim': 256,  # Neural network hidden layer size
+            'buffer_size': 100000,  # Replay buffer capacity
+            'batch_size': 256,  # Training batch size
+            'lr': 3e-4,  # Learning rate
+            'gamma': 0.99,  # Discount factor
+            'tau': 0.005,  # Target network update rate
+            'alpha': 0.2,  # Temperature parameter (or learned)
+            'auto_entropy': True,  # Automatic entropy tuning
+            'updates_per_step': 1,  # Updates per environment step
+            'max_episode_steps': 2000  # Maximum steps per episode
+        }
 
-        # Set up exploration cycle parameters
-        self.exploration_cycle_period = 200  # Episodes per exploration cycle
-        self.exploration_base = 0.2
-        self.exploration_amplitude = 0.2
+    def initialize_rl_model(self):
+        """Initialize the RL model architecture"""
+        state_dim = 6  # Our observation space (same as in training)
+        action_dim = 1  # Motor voltage (normalized)
 
-    def init_rl_components(self):
-        """Initialize RL components with better weight initialization"""
-        # Initialize SAC components
-        self.actor = Actor(self.state_dim, self.action_dim)
-        self.critic = Critic(self.state_dim, self.action_dim)
-        self.critic_target = Critic(self.state_dim, self.action_dim)
-
-        # Apply custom weight initialization for more stable start
-        def weights_init(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                nn.init.constant_(m.bias, 0)
-
-        self.actor.apply(weights_init)
-        self.critic.apply(weights_init)
-
-        # Copy parameters to target network
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(param.data)
+        # Initialize model
+        self.actor = Actor(state_dim, action_dim)
 
         # Set device (CPU or GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor.to(self.device)
-        self.critic.to(self.device)
-        self.critic_target.to(self.device)
-
-        # Initialize optimizers with weight decay for regularization
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=LR, weight_decay=1e-5)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=LR, weight_decay=1e-5)
-
-        # Automatic entropy tuning
-        if AUTO_ENTROPY_TUNING:
-            self.target_entropy = -torch.prod(torch.Tensor([self.action_dim])).item()
-            self.log_alpha = torch.zeros(1, requires_grad=True)
-            self.log_alpha = self.log_alpha.to(self.device)
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LR)
-            self.alpha = torch.exp(self.log_alpha).item()
-        else:
-            self.alpha = ALPHA
-
-        # Set networks to evaluation mode initially
-        self.actor.eval()
-        self.critic.eval()
-        self.critic_target.eval()
-
-        # Initialize prioritized experience replay buffer
-        self.replay_buffer = PrioritizedReplayBuffer(self.replay_buffer_size)
-
-    def create_gui(self):
-        # Main container frame
-        main_frame = Frame(self.master)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Control frame (left column)
-        control_frame = Frame(main_frame, padx=10, pady=10)
-        control_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Training frame (right column)
-        training_frame = Frame(main_frame, padx=10, pady=10, bd=2, relief=tk.RIDGE)
-        training_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-
-        # Status frame (bottom)
-        status_frame = Frame(self.master, padx=10, pady=10)
-        status_frame.pack(fill=tk.X, expand=False)
-
-        # RGB frame (bottom)
-        rgb_frame = Frame(self.master, padx=10, pady=10)
-        rgb_frame.pack(fill=tk.X, expand=False)
-
-        # ---------- Control Frame Elements ----------
-        Label(control_frame, text="QUBE Control", font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=2,
-                                                                                   pady=5)
-
-        # Calibrate button
-        self.calibrate_btn = Button(control_frame, text="Calibrate (Set Corner as Zero)",
-                                    command=self.calibrate,
-                                    width=25, height=2)
-        self.calibrate_btn.grid(row=1, column=0, padx=5, pady=5)
-
-        # RL Model buttons
-        rl_frame = Frame(control_frame)
-        rl_frame.grid(row=2, column=0, pady=10)
-
-        self.load_model_btn = Button(rl_frame, text="Load RL Model",
-                                     command=self.load_rl_model,
-                                     width=15)
-        self.load_model_btn.grid(row=0, column=0, padx=5)
-
-        self.rl_control_btn = Button(rl_frame, text="Start RL Control",
-                                     command=self.toggle_rl_control,
-                                     width=15, state=tk.DISABLED)
-        self.rl_control_btn.grid(row=0, column=1, padx=5)
-
-        # RL SCALING FACTOR SLIDER
-        rl_scaling_frame = Frame(control_frame)
-        rl_scaling_frame.grid(row=3, column=0, pady=5)
-
-        self.rl_scaling_slider = Scale(
-            rl_scaling_frame,
-            from_=1.0,
-            to=10.0,
-            orient=tk.HORIZONTAL,
-            label="RL Voltage Scaling Factor",
-            length=300,
-            resolution=0.1,
-            command=self.set_rl_scaling_factor
-        )
-        self.rl_scaling_slider.set(self.rl_scaling_factor)
-        self.rl_scaling_slider.pack(padx=5)
-
-        # Move to position input and button
-        position_frame = Frame(control_frame)
-        position_frame.grid(row=4, column=0, pady=10)
-
-        Label(position_frame, text="Target Position (degrees):").grid(row=0, column=0, padx=5)
-        self.position_entry = Entry(position_frame, width=10)
-        self.position_entry.grid(row=0, column=1, padx=5)
-        self.position_entry.insert(0, "0.0")
-
-        self.move_btn = Button(position_frame, text="Move to Position",
-                               command=self.start_move_to_position, width=15)
-        self.move_btn.grid(row=0, column=2, padx=5)
-
-        # Stop button
-        self.stop_btn = Button(control_frame, text="STOP MOTOR",
-                               command=self.stop_motor,
-                               width=20, height=2,
-                               bg="red", fg="white")
-        self.stop_btn.grid(row=5, column=0, pady=10)
-
-        # Manual voltage control
-        self.voltage_slider = Scale(
-            control_frame,
-            from_=-self.max_voltage,
-            to=self.max_voltage,
-            orient=tk.HORIZONTAL,
-            label="Manual Voltage",
-            length=300,
-            resolution=0.1,
-            command=self.set_manual_voltage
-        )
-        self.voltage_slider.set(0)
-        self.voltage_slider.grid(row=6, column=0, padx=5, pady=10)
-
-        # ---------- Training Frame Elements ----------
-        Label(training_frame, text="RL Training Settings", font=("Arial", 12, "bold")).grid(row=0, column=0,
-                                                                                            columnspan=2, pady=5)
-
-        # Training mode checkbox
-        self.training_var = IntVar()
-        self.training_checkbox = Checkbutton(
-            training_frame,
-            text="Enable Training Mode",
-            variable=self.training_var,
-            command=self.toggle_training_mode
-        )
-        self.training_checkbox.grid(row=1, column=0, sticky=tk.W, pady=5)
-
-        # Noise slider for exploration
-        noise_frame = Frame(training_frame)
-        noise_frame.grid(row=2, column=0, pady=5, sticky=tk.W)
-
-        self.noise_slider = Scale(
-            noise_frame,
-            from_=0.0,
-            to=0.5,
-            orient=tk.HORIZONTAL,
-            label="Exploration Noise",
-            length=200,
-            resolution=0.01,
-            command=self.set_exploration_noise
-        )
-        self.noise_slider.set(self.exploration_noise)
-        self.noise_slider.pack(padx=5)
-
-        # Save model button
-        self.save_model_btn = Button(
-            training_frame,
-            text="Save Current Model",
-            command=self.save_current_model,
-            width=20
-        )
-        self.save_model_btn.grid(row=3, column=0, pady=10)
-
-        # Training stats display
-        training_stats_frame = Frame(training_frame)
-        training_stats_frame.grid(row=4, column=0, pady=5, sticky=tk.W)
-
-        Label(training_stats_frame, text="Training Statistics:").grid(row=0, column=0, sticky=tk.W)
-        Label(training_stats_frame, text="Episodes:").grid(row=1, column=0, sticky=tk.W)
-        self.episodes_label = Label(training_stats_frame, text="0")
-        self.episodes_label.grid(row=1, column=1, sticky=tk.W)
-
-        Label(training_stats_frame, text="Buffer Size:").grid(row=2, column=0, sticky=tk.W)
-        self.buffer_label = Label(training_stats_frame, text="0/100000")
-        self.buffer_label.grid(row=2, column=1, sticky=tk.W)
-
-        Label(training_stats_frame, text="Updates:").grid(row=3, column=0, sticky=tk.W)
-        self.updates_label = Label(training_stats_frame, text="0")
-        self.updates_label.grid(row=3, column=1, sticky=tk.W)
-
-        Label(training_stats_frame, text="Avg Reward:").grid(row=4, column=0, sticky=tk.W)
-        self.avg_reward_label = Label(training_stats_frame, text="0.0")
-        self.avg_reward_label.grid(row=4, column=1, sticky=tk.W)
-
-        Label(training_stats_frame, text="Last Loss:").grid(row=5, column=0, sticky=tk.W)
-        self.loss_label = Label(training_stats_frame, text="N/A")
-        self.loss_label.grid(row=5, column=1, sticky=tk.W)
-
-        # Add best performance display
-        Label(training_stats_frame, text="Best Episode:").grid(row=6, column=0, sticky=tk.W)
-        self.best_episode_label = Label(training_stats_frame, text="N/A")
-        self.best_episode_label.grid(row=6, column=1, sticky=tk.W)
-
-        # Add curriculum display
-        Label(training_stats_frame, text="Curriculum Stage:").grid(row=7, column=0, sticky=tk.W)
-        self.curriculum_label = Label(training_stats_frame, text="0")
-        self.curriculum_label.grid(row=7, column=1, sticky=tk.W)
-
-        # Auto-save settings
-        auto_save_frame = Frame(training_frame)
-        auto_save_frame.grid(row=5, column=0, pady=10, sticky=tk.W)
-
-        Label(auto_save_frame, text="Auto-save every:").grid(row=0, column=0, sticky=tk.W)
-
-        self.save_interval_var = StringVar()
-        self.save_interval_var.set("100")  # Set to 100 updates (more frequent saving)
-        self.save_interval_entry = Entry(auto_save_frame, textvariable=self.save_interval_var, width=6)
-        self.save_interval_entry.grid(row=0, column=1, padx=5)
-
-        Label(auto_save_frame, text="updates").grid(row=0, column=2, sticky=tk.W)
-
-        # ---------- Status Display ----------
-        Label(status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W)
-        self.status_label = Label(status_frame, text="Ready - Please calibrate", width=40)
-        self.status_label.grid(row=0, column=1, sticky=tk.W)
-
-        Label(status_frame, text="Model:").grid(row=1, column=0, sticky=tk.W)
-        self.model_label = Label(status_frame, text="No model loaded", width=40)
-        self.model_label.grid(row=1, column=1, sticky=tk.W)
-
-        Label(status_frame, text="Motor Angle:").grid(row=2, column=0, sticky=tk.W)
-        self.angle_label = Label(status_frame, text="0.0°")
-        self.angle_label.grid(row=2, column=1, sticky=tk.W)
-
-        Label(status_frame, text="Pendulum Angle:").grid(row=3, column=0, sticky=tk.W)
-        self.pendulum_label = Label(status_frame, text="0.0°")
-        self.pendulum_label.grid(row=3, column=1, sticky=tk.W)
-
-        Label(status_frame, text="Motor RPM:").grid(row=4, column=0, sticky=tk.W)
-        self.rpm_label = Label(status_frame, text="0.0")
-        self.rpm_label.grid(row=4, column=1, sticky=tk.W)
-
-        Label(status_frame, text="Current Voltage:").grid(row=5, column=0, sticky=tk.W)
-        self.voltage_label = Label(status_frame, text="0.0 V")
-        self.voltage_label.grid(row=5, column=1, sticky=tk.W)
-
-        # Training mode indicator
-        Label(status_frame, text="Training:").grid(row=6, column=0, sticky=tk.W)
-        self.training_label = Label(status_frame, text="OFF", fg="red")
-        self.training_label.grid(row=6, column=1, sticky=tk.W)
-
-        # Add balance time indicator
-        Label(status_frame, text="Balance Time:").grid(row=7, column=0, sticky=tk.W)
-        self.balance_time_label = Label(status_frame, text="0.0s")
-        self.balance_time_label.grid(row=7, column=1, sticky=tk.W)
-
-        # RGB Control
-        self.r_slider = Scale(rgb_frame, from_=999, to=0, label="Red")
-        self.r_slider.grid(row=0, column=0, padx=5)
-
-        self.g_slider = Scale(rgb_frame, from_=999, to=0, label="Green")
-        self.g_slider.grid(row=0, column=1, padx=5)
-
-        self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
-        self.b_slider.grid(row=0, column=2, padx=5)
-
-    def toggle_training_mode(self):
-        """Toggle the training mode on/off with improved exploration strategy"""
-        self.training_mode = bool(self.training_var.get())
-
-        if self.training_mode:
-            # Enter training mode
-            self.actor.train()  # Set network to training mode
-            self.critic.train()
-            self.training_label.config(text="ON", fg="green")
-            self.status_label.config(text="Training mode enabled - collecting experiences")
-
-            # Reset episode tracking
-            self.current_episode_reward = 0
-            self.current_episode_length = 0
-            self.episode_start_time = time.time()
-            self.near_balance_time = 0.0
-            self.last_balance_check = time.time()
-
-            # Better exploration strategy - cyclical exploration
-            if not hasattr(self, 'exploration_cycle_period'):
-                self.exploration_cycle_period = 200  # Episodes per exploration cycle
-                self.exploration_base = 0.2
-                self.exploration_amplitude = 0.2
-
-            # Calculate exploration based on cycle position
-            cycle_position = (self.current_episode % self.exploration_cycle_period) / self.exploration_cycle_period
-            self.exploration_noise = self.exploration_base + self.exploration_amplitude * (
-                        0.5 - abs(cycle_position - 0.5)) * 2
-
-            self.noise_slider.set(self.exploration_noise)
-
-            # Set orange LED for training mode
-            self.r_slider.set(999)
-            self.g_slider.set(500)
-            self.b_slider.set(0)
-        else:
-            # Exit training mode
-            self.actor.eval()  # Set network to evaluation mode
-            self.critic.eval()
-            self.training_label.config(text="OFF", fg="red")
-            self.status_label.config(text="Training mode disabled")
-
-            # Set blue LED when stopping training
-            self.r_slider.set(0)
-            self.g_slider.set(0)
-            self.b_slider.set(999)
-
-            # End current episode and log stats
-            if self.current_episode_length > 0:
-                self.episode_rewards.append(self.current_episode_reward)
-                self.episode_lengths.append(self.current_episode_length)
-                self.current_episode += 1
-
-                # Update episode stats
-                self.episodes_label.config(text=str(self.current_episode))
-                if len(self.episode_rewards) > 0:
-                    avg_reward = sum(self.episode_rewards[-10:]) / min(len(self.episode_rewards), 10)
-                    self.avg_reward_label.config(text=f"{avg_reward:.1f}")
-
-    def set_exploration_noise(self, value):
-        """Set the exploration noise level from slider with better scaling"""
-        raw_value = float(value)
-
-        # Non-linear scaling for more fine-grained control at lower values
-        if raw_value <= 0.2:
-            # Finer control for small values (0-0.2)
-            self.exploration_noise = raw_value * 0.5
-        else:
-            # Regular scaling for larger values
-            self.exploration_noise = 0.1 + (raw_value - 0.2) * 0.5
-
-        # Update the exploration base value
-        if hasattr(self, 'exploration_base'):
-            self.exploration_base = max(0.05, min(0.3, self.exploration_noise))
-
-    def set_rl_scaling_factor(self, value):
-        """Set the RL scaling factor from slider"""
-        self.rl_scaling_factor = float(value)
-
-    def set_manual_voltage(self, value):
-        """Set manual voltage from slider"""
-        self.motor_voltage = float(value)
-        # Reset any automatic control modes
-        self.calibrating = False
-        self.moving_to_position = False
-        self.rl_mode = False
-
-        if self.training_mode:
-            self.toggle_training_mode()  # Turn off training mode
-            self.training_var.set(0)  # Update checkbox
-
-        if self.rl_model:
-            self.rl_control_btn.config(text="Start RL Control")
+        self.actor.eval()  # Set to evaluation mode
 
     def load_rl_model(self):
         """Open file dialog to select the model file"""
@@ -624,11 +439,24 @@ class QUBEControllerWithRLTraining:
 
         if filename:
             try:
-                # Load the model
-                self.actor.load_state_dict(torch.load(filename, map_location=self.device))
+                # Load the model state dict
+                state_dict = torch.load(filename, map_location=self.device)
+
+                # Try loading the model
+                try:
+                    self.actor.load_state_dict(state_dict)
+                    self.actor.to(self.device)
+                    self.actor.eval()
+                except Exception as e:
+                    raise ValueError(f"Failed to load model: {str(e)}")
+
+                # Confirm model loaded
                 self.status_label.config(text=f"Model loaded: {os.path.basename(filename)}")
                 self.rl_model = filename
-                self.model_label.config(text=f"Using: {os.path.basename(filename)}")
+
+                # Update model loaded indication
+                self.model_type_label.config(text="Model Status: Loaded")
+                self.architecture_label.config(text="Model ready for control")
 
                 # Enable RL control button
                 self.rl_control_btn.config(state=tk.NORMAL)
@@ -640,44 +468,735 @@ class QUBEControllerWithRLTraining:
 
             except Exception as e:
                 self.status_label.config(text=f"Error loading model: {str(e)}")
+                messagebox.showerror("Load Error", f"Could not load model: {str(e)}")
 
-    def save_current_model(self):
-        """Save the current model to a file"""
+    def load_critic_model(self):
+        """Open file dialog to select the critic model file"""
+        if not hasattr(self, 'sac_agent') or self.sac_agent is None:
+            messagebox.showerror("Error", "Initialize SAC agent first by clicking 'Setup Training'")
+            return
+
+        filename = filedialog.askopenfilename(
+            initialdir=os.getcwd(),
+            title="Select Critic Model File",
+            filetypes=(("PyTorch Models", "*.pth"), ("All files", "*.*"))
+        )
+
+        if filename:
+            try:
+                # Load the critic state dict
+                state_dict = torch.load(filename, map_location=self.device)
+
+                # Try loading the model
+                self.sac_agent.critic.load_state_dict(state_dict)
+                self.sac_agent.critic_target.load_state_dict(state_dict)
+
+                # Confirm model loaded
+                self.status_label.config(text=f"Critic loaded: {os.path.basename(filename)}")
+
+            except Exception as e:
+                self.status_label.config(text=f"Error loading critic: {str(e)}")
+                messagebox.showerror("Load Error", f"Could not load critic model: {str(e)}")
+
+    def setup_training(self):
+        """Initialize the SAC agent and replay buffer for training"""
         try:
-            # Create timestamp for filename
+            # Get parameters from UI
+            try:
+                hidden_dim = int(self.hidden_dim_entry.get())
+                buffer_size = int(self.buffer_size_entry.get())
+                self.batch_size = int(self.batch_size_entry.get())
+                lr = float(self.lr_entry.get())
+                gamma = float(self.gamma_entry.get())
+                tau = float(self.tau_entry.get())
+                alpha = float(self.alpha_entry.get())
+                self.update_freq = int(self.update_freq_entry.get())
+                max_episode_steps = int(self.max_steps_entry.get())
+            except ValueError as e:
+                messagebox.showerror("Parameter Error", f"Invalid parameter value: {str(e)}")
+                return
+
+            # Update training params
+            self.training_params['hidden_dim'] = hidden_dim
+            self.training_params['buffer_size'] = buffer_size
+            self.training_params['batch_size'] = self.batch_size
+            self.training_params['lr'] = lr
+            self.training_params['gamma'] = gamma
+            self.training_params['tau'] = tau
+            self.training_params['alpha'] = alpha
+            self.training_params['updates_per_step'] = self.update_freq
+            self.training_params['max_episode_steps'] = max_episode_steps
+            self.training_params['auto_entropy'] = bool(self.auto_entropy_var.get())
+
+            # Initialize replay buffer
+            self.replay_buffer = ReplayBuffer(buffer_size)
+
+            # Initialize SAC agent
+            self.sac_agent = SACAgent(
+                state_dim=self.training_params['state_dim'],
+                action_dim=self.training_params['action_dim'],
+                hidden_dim=hidden_dim,
+                lr=lr,
+                gamma=gamma,
+                tau=tau,
+                alpha=alpha,
+                automatic_entropy_tuning=bool(self.auto_entropy_var.get())
+            )
+
+            # If we have a loaded actor model, copy its weights to the SAC agent
+            if self.rl_model:
+                try:
+                    self.sac_agent.actor.load_state_dict(self.actor.state_dict())
+                    print("Transferred weights from loaded actor to SAC agent")
+                except Exception as e:
+                    print(f"Warning: Could not transfer weights: {str(e)}")
+
+            # Reset training statistics
+            self.episode_rewards = []
+            self.episodes_completed = 0
+
+            # Update UI
+            self.status_label.config(text="Training setup complete. Ready to start training.")
+            self.setup_train_btn.config(text="Reset Training")
+            self.train_btn.config(state=tk.NORMAL)
+            self.load_critic_btn.config(state=tk.NORMAL)
+            self.save_model_btn.config(state=tk.NORMAL)
+
+        except Exception as e:
+            messagebox.showerror("Setup Error", f"Failed to setup training: {str(e)}")
+            raise e
+
+    def toggle_training(self):
+        """Start or stop the training process"""
+        if not self.training_mode:
+            # Check if SAC agent is initialized
+            if self.sac_agent is None:
+                messagebox.showerror("Error", "Please setup training first")
+                return
+
+            # Start training
+            self.training_mode = True
+            self.stop_training = False
+            self.train_btn.config(text="Stop Training")
+
+            # Disable other controls
+            self.rl_control_btn.config(state=tk.DISABLED)
+            self.move_btn.config(state=tk.DISABLED)
+            self.calibrate_btn.config(state=tk.DISABLED)
+            self.setup_train_btn.config(state=tk.DISABLED)
+            self.load_model_btn.config(state=tk.DISABLED)
+            self.load_critic_btn.config(state=tk.DISABLED)
+
+            # Set magenta LED during training
+            self.r_slider.set(999)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
+
+            # Reset episode variables
+            self.episode_reward = 0
+            self.episode_step = 0
+            self.previous_state = None
+            self.training_start_time = time.time()
+
+            # Get filter setting
+            self.use_filters_during_training = bool(self.use_filters_var.get())
+            self.random_reset = bool(self.random_reset_var.get())
+
+            # Update status
+            self.status_label.config(text="Training active. Calibrating...")
+
+            # Start with calibration
+            self.calibrate_for_training()
+
+        else:
+            # Stop training
+            self.training_mode = False
+            self.stop_training = True
+            self.train_btn.config(text="Start Training")
+
+            # Re-enable controls
+            self.rl_control_btn.config(state=tk.NORMAL)
+            self.move_btn.config(state=tk.NORMAL)
+            self.calibrate_btn.config(state=tk.NORMAL)
+            self.setup_train_btn.config(state=tk.NORMAL)
+            self.load_model_btn.config(state=tk.NORMAL)
+            self.load_critic_btn.config(state=tk.NORMAL)
+
+            # Stop motor and set blue LED
+            self.motor_voltage = 0.0
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
+
+            # Update status
+            self.status_label.config(text="Training stopped")
+
+    def calibrate_for_training(self):
+        """Calibrate before starting training episode"""
+        # Set yellow LED during calibration
+        self.r_slider.set(999)
+        self.g_slider.set(999)
+        self.b_slider.set(0)
+
+        # Apply voltage to move to corner
+        self.motor_voltage = 1.5
+        self.calibrating = True
+        self.calibration_start_time = time.time()
+
+    def update_training(self):
+        """Main training loop - called on each iteration"""
+        # First, check if we're calibrating
+        if self.calibrating:
+            elapsed = time.time() - self.calibration_start_time
+
+            if elapsed < 3.0:
+                # Still calibrating
+                if self.ui_counter == 0:
+                    self.status_label.config(text=f"Calibrating... ({3.0 - elapsed:.1f}s)")
+            else:
+                # Calibration complete
+                self.motor_voltage = 0.0
+                self.qube.resetMotorEncoder()
+                self.qube.resetPendulumEncoder()
+                self.calibrating = False
+
+                # Set magenta LED for training
+                self.r_slider.set(999)
+                self.g_slider.set(0)
+                self.b_slider.set(999)
+
+                # Initialize pendulum in random or default position
+                if self.random_reset:
+                    # Random initial position within safe range
+                    random_voltage = np.random.uniform(-1.0, 1.0)
+                    self.motor_voltage = random_voltage
+
+                    # Apply for a short duration
+                    time.sleep(0.3)
+                    self.motor_voltage = 0.0
+
+                # Reset episode variables
+                self.episode_reward = 0
+                self.episode_step = 0
+
+                # Get initial state
+                self.previous_state = self.get_observation()[0]
+
+                # Inform user
+                self.status_label.config(text=f"Training episode {self.episodes_completed + 1} started")
+                return
+
+        # If we have a previous state, we're in the middle of an episode
+        if self.previous_state is not None:
+            # Check if episode done
+            if self.episode_step >= self.training_params['max_episode_steps']:
+                # Episode complete
+                self.episodes_completed += 1
+                self.episode_rewards.append(self.episode_reward)
+
+                # Calculate average reward
+                avg_reward = np.mean(self.episode_rewards[-10:]) if len(self.episode_rewards) >= 10 else np.mean(
+                    self.episode_rewards)
+
+                # Update status
+                self.status_label.config(
+                    text=f"Episode {self.episodes_completed} complete. Reward: {self.episode_reward:.2f}, Avg: {avg_reward:.2f}")
+
+                # Log to console
+                elapsed = time.time() - self.training_start_time
+                print(
+                    f"Episode {self.episodes_completed} - Steps: {self.episode_step}, Reward: {self.episode_reward:.2f}, Avg Reward: {avg_reward:.2f}, Time: {elapsed:.1f}s")
+
+                # Update reward display
+                self.reward_label.config(text=f"{self.episode_reward:.2f}")
+                self.avg_reward_label.config(text=f"{avg_reward:.2f}")
+                self.episodes_label.config(text=f"{self.episodes_completed}")
+
+                # Reset for next episode
+                self.previous_state = None
+                self.motor_voltage = 0.0
+
+                # Start calibration for next episode
+                self.calibrate_for_training()
+                return
+
+            # Select action from policy (with exploration)
+            action = self.sac_agent.select_action(self.previous_state, evaluate=False)
+
+            # Scale action to voltage
+            self.motor_voltage = float(action[0]) * self.max_voltage
+
+            # Apply action and get new state
+            current_obs, pendulum_angle_norm = self.get_observation()
+
+            # Compute reward
+            reward = self._compute_reward(pendulum_angle_norm)
+
+            # Update episode reward
+            self.episode_reward += reward
+
+            # Periodically update UI with current reward
+            if self.ui_counter == 0:
+                self.reward_label.config(text=f"{self.episode_reward:.2f}")
+
+                # Classify state for user feedback
+                upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
+                if upright_angle < 30:
+                    self.status_label.config(
+                        text=f"Training: Ep {self.episodes_completed + 1}, Step {self.episode_step}, Near balance ({upright_angle:.1f}°)")
+                else:
+                    self.status_label.config(
+                        text=f"Training: Ep {self.episodes_completed + 1}, Step {self.episode_step}, Swinging ({upright_angle:.1f}°)")
+
+            # Check terminal condition (pendulum fell or arm at limit)
+            # In real system, we don't terminate episodes early to maximize learning
+            done = False
+
+            # Store transition in replay buffer
+            self.replay_buffer.push(
+                self.previous_state,
+                action,
+                reward,
+                current_obs,
+                done
+            )
+
+            # Update for next step
+            self.previous_state = current_obs
+            self.episode_step += 1
+
+            # Update networks if enough samples & correct update interval
+            if len(self.replay_buffer) > self.batch_size and self.episode_step % self.update_freq == 0:
+                for _ in range(self.training_params['updates_per_step']):
+                    self.sac_agent.update_parameters(self.replay_buffer, self.batch_size)
+
+    def _compute_reward(self, pendulum_angle_norm):
+        """Calculate reward based on current state"""
+        # Get state values
+        theta_0, theta_1, theta_0_dot, theta_1_dot = self.state
+
+        # We'll use a simplified version of the reward function from SimRL
+
+        # 1. Base reward for pendulum being upright (range: -1 to 1)
+        upright_reward = 1.0 * np.cos(pendulum_angle_norm)
+
+        # 2. Penalty for arm position away from center
+        pos_penalty = -abs(theta_0) / 2.0
+
+        # 3. Bonus for being close to upright position
+        arm_center = np.exp(-1.0 * theta_0 ** 2)
+        upright_closeness = np.exp(-10.0 * pendulum_angle_norm ** 2)
+        stability_factor = np.exp(-0.6 * theta_1_dot ** 2)
+        bonus = 3.0 * upright_closeness * stability_factor * arm_center
+
+        # 4. Energy management reward
+        energy_reward = 2 - 0.007 * (theta_1_dot ** 2)
+
+        # Combine all components
+        reward = (
+                upright_reward +
+                pos_penalty +
+                bonus +
+                energy_reward
+        )
+
+        return reward
+
+    def save_trained_model(self):
+        """Save the trained actor and critic models"""
+        if not hasattr(self, 'sac_agent') or self.sac_agent is None:
+            messagebox.showerror("Error", "No trained model to save")
+            return
+
+        try:
+            # Create timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # Create models directory if it doesn't exist
-            os.makedirs("trained_models", exist_ok=True)
+            # Save actor model
+            actor_filename = f"trained_actor_{timestamp}.pth"
+            torch.save(self.sac_agent.actor.state_dict(), actor_filename)
 
-            # Define filenames
-            actor_filename = f"trained_models/actor_{timestamp}.pth"
-            critic_filename = f"trained_models/critic_{timestamp}.pth"
+            # Save critic model
+            critic_filename = f"trained_critic_{timestamp}.pth"
+            torch.save(self.sac_agent.critic.state_dict(), critic_filename)
 
-            # Save models
-            torch.save(self.actor.state_dict(), actor_filename)
-            torch.save(self.critic.state_dict(), critic_filename)
+            # Also update the main actor for immediate use
+            self.actor.load_state_dict(self.sac_agent.actor.state_dict())
+            self.actor.eval()
 
-            self.status_label.config(text=f"Model saved: {actor_filename}")
-            print(f"Model saved: {actor_filename}")
+            # Update UI
+            self.status_label.config(text=f"Models saved: {actor_filename} and {critic_filename}")
+            self.rl_model = actor_filename  # Update the main model reference
 
-            return actor_filename
+            # Enable RL control with the new model
+            self.rl_control_btn.config(state=tk.NORMAL)
+
+            messagebox.showinfo("Save Success",
+                                f"Models saved successfully.\nActor: {actor_filename}\nCritic: {critic_filename}")
+
         except Exception as e:
-            self.status_label.config(text=f"Error saving model: {str(e)}")
-            print(f"Error saving model: {str(e)}")
-            return None
+            messagebox.showerror("Save Error", f"Failed to save models: {str(e)}")
+
+    def create_gui(self):
+        # Main control frame
+        control_frame = Frame(self.master, padx=10, pady=10)
+        control_frame.pack()
+
+        # Calibrate button
+        self.calibrate_btn = Button(control_frame, text="Calibrate (Set Corner as Zero)",
+                                    command=self.calibrate,
+                                    width=25, height=2)
+        self.calibrate_btn.grid(row=0, column=0, padx=5, pady=5)
+
+        # RL Model buttons
+        rl_frame = Frame(control_frame)
+        rl_frame.grid(row=1, column=0, pady=10)
+
+        self.load_model_btn = Button(rl_frame, text="Load RL Model",
+                                     command=self.load_rl_model,
+                                     width=15)
+        self.load_model_btn.grid(row=0, column=0, padx=5)
+
+        self.rl_control_btn = Button(rl_frame, text="Start RL Control",
+                                     command=self.toggle_rl_control,
+                                     width=15, state=tk.DISABLED)
+        self.rl_control_btn.grid(row=0, column=1, padx=5)
+
+        # Model Status Indicator
+        self.model_type_label = Label(rl_frame, text="Model Status: Not Loaded", width=20)
+        self.model_type_label.grid(row=0, column=2, padx=5)
+
+        # Max voltage slider
+        max_voltage_frame = Frame(control_frame)
+        max_voltage_frame.grid(row=2, column=0, pady=5)
+
+        self.max_voltage_slider = Scale(
+            max_voltage_frame,
+            from_=0.5,
+            to=self.system_max_voltage,
+            orient=tk.HORIZONTAL,
+            label="RL Max Voltage",
+            length=300,
+            resolution=0.1,
+            command=self.set_max_voltage
+        )
+        self.max_voltage_slider.set(self.max_voltage)
+        self.max_voltage_slider.pack(padx=5)
+
+        # Move to position input and button
+        position_frame = Frame(control_frame)
+        position_frame.grid(row=3, column=0, pady=10)
+
+        Label(position_frame, text="Target Position (degrees):").grid(row=0, column=0, padx=5)
+        self.position_entry = Entry(position_frame, width=10)
+        self.position_entry.grid(row=0, column=1, padx=5)
+        self.position_entry.insert(0, "0.0")
+
+        self.move_btn = Button(position_frame, text="Move to Position",
+                               command=self.start_move_to_position, width=15)
+        self.move_btn.grid(row=0, column=2, padx=5)
+
+        # TRAINING SECTION - NEW
+        # Create a LabelFrame for training settings
+        train_frame = Frame(self.master, bd=2, relief=tk.GROOVE, padx=10, pady=10)
+        train_frame.pack(pady=10, fill=tk.X, padx=10)
+
+        # Title label
+        Label(train_frame, text="Training Settings", font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=4,
+                                                                                      pady=5)
+
+        # Left column - Parameters
+        param_frame = Frame(train_frame)
+        param_frame.grid(row=1, column=0, padx=10, sticky="n")
+
+        # SAC Parameters
+        Label(param_frame, text="Neural Network Size:").grid(row=0, column=0, sticky="w")
+        self.hidden_dim_entry = Entry(param_frame, width=8)
+        self.hidden_dim_entry.grid(row=0, column=1, pady=2)
+        self.hidden_dim_entry.insert(0, "256")
+
+        Label(param_frame, text="Buffer Size:").grid(row=1, column=0, sticky="w")
+        self.buffer_size_entry = Entry(param_frame, width=8)
+        self.buffer_size_entry.grid(row=1, column=1, pady=2)
+        self.buffer_size_entry.insert(0, "100000")
+
+        Label(param_frame, text="Batch Size:").grid(row=2, column=0, sticky="w")
+        self.batch_size_entry = Entry(param_frame, width=8)
+        self.batch_size_entry.grid(row=2, column=1, pady=2)
+        self.batch_size_entry.insert(0, "256")
+
+        Label(param_frame, text="Learning Rate:").grid(row=3, column=0, sticky="w")
+        self.lr_entry = Entry(param_frame, width=8)
+        self.lr_entry.grid(row=3, column=1, pady=2)
+        self.lr_entry.insert(0, "0.0003")
+
+        # Middle column - More parameters
+        param_frame2 = Frame(train_frame)
+        param_frame2.grid(row=1, column=1, padx=10, sticky="n")
+
+        Label(param_frame2, text="Discount (gamma):").grid(row=0, column=0, sticky="w")
+        self.gamma_entry = Entry(param_frame2, width=8)
+        self.gamma_entry.grid(row=0, column=1, pady=2)
+        self.gamma_entry.insert(0, "0.99")
+
+        Label(param_frame2, text="Tau:").grid(row=1, column=0, sticky="w")
+        self.tau_entry = Entry(param_frame2, width=8)
+        self.tau_entry.grid(row=1, column=1, pady=2)
+        self.tau_entry.insert(0, "0.005")
+
+        Label(param_frame2, text="Alpha:").grid(row=2, column=0, sticky="w")
+        self.alpha_entry = Entry(param_frame2, width=8)
+        self.alpha_entry.grid(row=2, column=1, pady=2)
+        self.alpha_entry.insert(0, "0.2")
+
+        Label(param_frame2, text="Updates/Step:").grid(row=3, column=0, sticky="w")
+        self.update_freq_entry = Entry(param_frame2, width=8)
+        self.update_freq_entry.grid(row=3, column=1, pady=2)
+        self.update_freq_entry.insert(0, "1")
+
+        # Right column - Additional settings
+        settings_frame = Frame(train_frame)
+        settings_frame.grid(row=1, column=2, padx=10, sticky="n")
+
+        Label(settings_frame, text="Max Episode Steps:").grid(row=0, column=0, sticky="w")
+        self.max_steps_entry = Entry(settings_frame, width=8)
+        self.max_steps_entry.grid(row=0, column=1, pady=2)
+        self.max_steps_entry.insert(0, "2000")
+
+        # Checkboxes
+        self.auto_entropy_var = IntVar(value=1)
+        self.use_filters_var = IntVar(value=1)
+        self.random_reset_var = IntVar(value=0)
+
+        Checkbutton(settings_frame, text="Auto Entropy", variable=self.auto_entropy_var).grid(row=1, column=0,
+                                                                                              columnspan=2, sticky="w",
+                                                                                              pady=2)
+        Checkbutton(settings_frame, text="Use Filters During Training", variable=self.use_filters_var).grid(row=2,
+                                                                                                            column=0,
+                                                                                                            columnspan=2,
+                                                                                                            sticky="w",
+                                                                                                            pady=2)
+        Checkbutton(settings_frame, text="Random Initial Position", variable=self.random_reset_var).grid(row=3,
+                                                                                                         column=0,
+                                                                                                         columnspan=2,
+                                                                                                         sticky="w",
+                                                                                                         pady=2)
+
+        # Training control buttons
+        button_frame = Frame(train_frame)
+        button_frame.grid(row=1, column=3, padx=10, sticky="n")
+
+        self.setup_train_btn = Button(button_frame, text="Setup Training",
+                                      command=self.setup_training, width=15)
+        self.setup_train_btn.grid(row=0, column=0, pady=2)
+
+        self.train_btn = Button(button_frame, text="Start Training",
+                                command=self.toggle_training, width=15, state=tk.DISABLED)
+        self.train_btn.grid(row=1, column=0, pady=2)
+
+        self.load_critic_btn = Button(button_frame, text="Load Critic",
+                                      command=self.load_critic_model, width=15, state=tk.DISABLED)
+        self.load_critic_btn.grid(row=2, column=0, pady=2)
+
+        self.save_model_btn = Button(button_frame, text="Save Models",
+                                     command=self.save_trained_model, width=15, state=tk.DISABLED)
+        self.save_model_btn.grid(row=3, column=0, pady=2)
+
+        # Training stats display
+        stats_frame = Frame(train_frame)
+        stats_frame.grid(row=2, column=0, columnspan=4, pady=10)
+
+        Label(stats_frame, text="Training Stats:", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=6,
+                                                                                    pady=5)
+
+        Label(stats_frame, text="Episodes:").grid(row=1, column=0, padx=5)
+        self.episodes_label = Label(stats_frame, text="0", width=8)
+        self.episodes_label.grid(row=1, column=1, padx=5)
+
+        Label(stats_frame, text="Current Reward:").grid(row=1, column=2, padx=5)
+        self.reward_label = Label(stats_frame, text="0.0", width=8)
+        self.reward_label.grid(row=1, column=3, padx=5)
+
+        Label(stats_frame, text="Avg Reward:").grid(row=1, column=4, padx=5)
+        self.avg_reward_label = Label(stats_frame, text="0.0", width=8)
+        self.avg_reward_label.grid(row=1, column=5, padx=5)
+
+        # FILTER SECTION
+        filter_frame = Frame(control_frame)
+        filter_frame.grid(row=5, column=0, pady=5)
+
+        # New filter cutoff slider (replacing control frequency slider)
+        self.filter_cutoff_slider = Scale(
+            filter_frame,
+            from_=0,
+            to=6000,
+            orient=tk.HORIZONTAL,
+            label="Filter Cutoff Frequency (Hz)",
+            length=300,
+            resolution=100,
+            command=self.set_filter_cutoff
+        )
+        self.filter_cutoff_slider.set(self.filter_cutoff)
+        self.filter_cutoff_slider.grid(row=0, column=0, padx=5)
+
+        # Filter status
+        self.filter_status_label = Label(filter_frame, text=f"Cutoff: {self.filter_cutoff} Hz")
+        self.filter_status_label.grid(row=0, column=1, padx=5)
+
+        # Stop button
+        self.stop_btn = Button(control_frame, text="STOP MOTOR",
+                               command=self.stop_motor,
+                               width=20, height=2,
+                               bg="red", fg="white")
+        self.stop_btn.grid(row=6, column=0, pady=10)
+
+        # Manual voltage control
+        self.voltage_slider = Scale(
+            control_frame,
+            from_=-self.system_max_voltage,
+            to=self.system_max_voltage,
+            orient=tk.HORIZONTAL,
+            label="Manual Voltage",
+            length=400,
+            resolution=0.1,
+            command=self.set_manual_voltage
+        )
+        self.voltage_slider.set(0)
+        self.voltage_slider.grid(row=7, column=0, padx=5, pady=10)
+
+        # Performance settings frame - MODIFIED: Only UI update interval
+        perf_frame = Frame(control_frame)
+        perf_frame.grid(row=8, column=0, pady=5)
+
+        # Add UI update interval slider with increased range
+        self.ui_slider = Scale(
+            perf_frame,
+            from_=5,
+            to=50,
+            orient=tk.HORIZONTAL,
+            label="UI Update Every N Iterations",
+            length=300,
+            resolution=5,
+            command=self.set_ui_update_interval
+        )
+        self.ui_slider.set(self.ui_update_interval)
+        self.ui_slider.grid(row=0, column=0, padx=5)
+
+        # Status display
+        status_frame = Frame(self.master, padx=10, pady=10)
+        status_frame.pack()
+
+        Label(status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W)
+        self.status_label = Label(status_frame, text="Ready - Please calibrate", width=40)
+        self.status_label.grid(row=0, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Model:").grid(row=1, column=0, sticky=tk.W)
+        self.model_label = Label(status_frame, text="No model loaded", width=40)
+        self.model_label.grid(row=1, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Architecture:").grid(row=2, column=0, sticky=tk.W)
+        self.architecture_label = Label(status_frame, text="Not loaded", width=40)
+        self.architecture_label.grid(row=2, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Motor Angle:").grid(row=3, column=0, sticky=tk.W)
+        self.angle_label = Label(status_frame, text="0.0°")
+        self.angle_label.grid(row=3, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Pendulum Angle:").grid(row=4, column=0, sticky=tk.W)
+        self.pendulum_label = Label(status_frame, text="0.0°")
+        self.pendulum_label.grid(row=4, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Motor RPM:").grid(row=5, column=0, sticky=tk.W)
+        self.rpm_label = Label(status_frame, text="0.0")
+        self.rpm_label.grid(row=5, column=1, sticky=tk.W)
+
+        Label(status_frame, text="Current Voltage:").grid(row=6, column=0, sticky=tk.W)
+        self.voltage_label = Label(status_frame, text="0.0 V")
+        self.voltage_label.grid(row=6, column=1, sticky=tk.W)
+
+        Label(status_frame, text="RL Max Voltage:").grid(row=7, column=0, sticky=tk.W)
+        self.max_voltage_label = Label(status_frame, text=f"{self.max_voltage:.1f} V")
+        self.max_voltage_label.grid(row=7, column=1, sticky=tk.W)
+
+        # Add actual frequency display
+        Label(status_frame, text="Control Frequency:").grid(row=8, column=0, sticky=tk.W)
+        self.freq_label = Label(status_frame, text="0.0 Hz")
+        self.freq_label.grid(row=8, column=1, sticky=tk.W)
+
+        # RGB Control
+        rgb_frame = Frame(self.master, padx=10, pady=10)
+        rgb_frame.pack()
+
+        self.r_slider = Scale(rgb_frame, from_=999, to=0, label="Red")
+        self.r_slider.grid(row=0, column=0, padx=5)
+
+        self.g_slider = Scale(rgb_frame, from_=999, to=0, label="Green")
+        self.g_slider.grid(row=0, column=1, padx=5)
+
+        self.b_slider = Scale(rgb_frame, from_=999, to=0, label="Blue")
+        self.b_slider.grid(row=0, column=2, padx=5)
+
+    # MODIFIED: New method for filter cutoff slider
+    def set_filter_cutoff(self, value):
+        """Set the cutoff frequency of all filters from slider"""
+        try:
+            cutoff_freq = float(value)
+            if cutoff_freq <= 0:
+                cutoff_freq = 100.0  # Minimum value for safety
+
+            # Store current filter values to preserve states
+            pendulum_velocity_last = self.pendulum_velocity_filter.y_last
+            motor_velocity_last = self.motor_velocity_filter.y_last
+            voltage_last = self.voltage_filter.y_last
+
+            # Update internal value
+            self.filter_cutoff = cutoff_freq
+
+            # Create new filters with updated cutoff frequency
+            self.pendulum_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+            self.motor_velocity_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+            self.voltage_filter = LowPassFilter(cutoff_freq=self.filter_cutoff)
+
+            # Transfer the previous states to maintain continuity
+            self.pendulum_velocity_filter.reset(pendulum_velocity_last)
+            self.motor_velocity_filter.reset(motor_velocity_last)
+            self.voltage_filter.reset(voltage_last)
+
+            # Update status label
+            self.filter_status_label.config(text=f"Cutoff: {self.filter_cutoff} Hz")
+
+        except ValueError:
+            # Handle invalid input
+            self.filter_status_label.config(text="Invalid cutoff value!")
+
+    def set_ui_update_interval(self, value):
+        """Set UI update interval from slider"""
+        self.ui_update_interval = int(value)
+
+    def set_max_voltage(self, value):
+        """Set the maximum voltage for RL control from slider"""
+        self.max_voltage = float(value)
+        self.max_voltage_label.config(text=f"{self.max_voltage:.1f} V")
+
+    def set_manual_voltage(self, value):
+        """Set manual voltage from slider"""
+        self.motor_voltage = float(value)
+        # Reset any automatic control modes
+        self.calibrating = False
+        self.moving_to_position = False
+        self.rl_mode = False
+        self.training_mode = False
+
+        if self.rl_model:
+            self.rl_control_btn.config(text="Start RL Control")
 
     def calibrate(self):
         """Simple calibration - move to corner and set as zero"""
         self.calibrating = True
         self.moving_to_position = False
         self.rl_mode = False
+        self.training_mode = False
         self.voltage_slider.set(0)  # Reset slider
-
-        # Turn off training if active
-        if self.training_mode:
-            self.toggle_training_mode()
-            self.training_var.set(0)
 
         # Set calibration start time
         self.calibration_start_time = time.time()
@@ -695,7 +1214,8 @@ class QUBEControllerWithRLTraining:
         if elapsed < 3.0:
             # Apply voltage to move to corner
             self.motor_voltage = 1.5
-            self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
+            if self.ui_counter == 0:  # Only update UI when counter is 0
+                self.status_label.config(text=f"Finding corner... ({3.0 - elapsed:.1f}s)")
         else:
             # At corner - set as zero
             self.motor_voltage = 0.0
@@ -720,44 +1240,31 @@ class QUBEControllerWithRLTraining:
             self.rl_mode = True
             self.moving_to_position = False
             self.calibrating = False
+            self.training_mode = False
             self.voltage_slider.set(0)  # Reset slider
             self.rl_control_btn.config(text="Stop RL Control")
+            self.status_label.config(text="RL control active")
 
-            if self.training_mode:
-                self.status_label.config(text="RL control active with TRAINING")
-                # Set purple+orange (pinkish) LED for RL+training
-                self.r_slider.set(800)
-                self.g_slider.set(400)
-                self.b_slider.set(800)
-            else:
-                self.status_label.config(text="RL control active")
-                # Set purple LED during RL control
-                self.r_slider.set(500)
-                self.g_slider.set(0)
-                self.b_slider.set(999)
+            # Set purple LED during RL control
+            self.r_slider.set(500)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
 
         else:
             # Stop RL control
             self.rl_mode = False
             self.motor_voltage = 0.0
             self.rl_control_btn.config(text="Start RL Control")
+            self.status_label.config(text="RL control stopped")
 
-            if self.training_mode:
-                self.status_label.config(text="Training mode active - waiting for control")
-                # Set orange LED for training mode
-                self.r_slider.set(999)
-                self.g_slider.set(500)
-                self.b_slider.set(0)
-            else:
-                self.status_label.config(text="RL control stopped")
-                # Set blue LED when stopped
-                self.r_slider.set(0)
-                self.g_slider.set(0)
-                self.b_slider.set(999)
+            # Set blue LED when stopped
+            self.r_slider.set(0)
+            self.g_slider.set(0)
+            self.b_slider.set(999)
 
     def start_move_to_position(self):
         """Start moving to target position"""
-        if not self.calibrating and not self.rl_mode:
+        if not self.calibrating and not self.rl_mode and not self.training_mode:
             try:
                 # Get target position from entry field
                 self.target_position = float(self.position_entry.get())
@@ -765,11 +1272,6 @@ class QUBEControllerWithRLTraining:
                 self.moving_to_position = True
                 self.voltage_slider.set(0)  # Reset slider
                 self.status_label.config(text=f"Moving to {self.target_position:.1f}°...")
-
-                # Turn off training if active
-                if self.training_mode:
-                    self.toggle_training_mode()
-                    self.training_var.set(0)
 
                 # Set green LED during movement
                 self.r_slider.set(0)
@@ -797,7 +1299,8 @@ class QUBEControllerWithRLTraining:
             self.g_slider.set(0)
             self.b_slider.set(999)
 
-            self.status_label.config(text="Position reached")
+            if self.ui_counter == 0:  # Only update UI when counter is 0
+                self.status_label.config(text="Position reached")
             return
 
         # Simple proportional control
@@ -805,23 +1308,25 @@ class QUBEControllerWithRLTraining:
         self.motor_voltage = kp * position_error
 
         # Limit voltage for safety
-        self.motor_voltage = max(-self.max_voltage, min(self.max_voltage, self.motor_voltage))
+        self.motor_voltage = max(-self.system_max_voltage, min(self.system_max_voltage, self.motor_voltage))
 
-    def _get_observation(self):
-        """Create observation vector from current state - similar to what's in simulation"""
-        # Get current state from hardware
+    def get_observation(self):
+        """Get the current observation vector"""
+        # Get current state
         motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjusted for corner as zero
         pendulum_angle_deg = self.qube.getPendulumAngle()
 
         # Convert all angles to radians for the RL model
         motor_angle = np.radians(motor_angle_deg)
 
-        # For pendulum angle, convert to radians and adjust convention:
+        # For pendulum angle, convert to radians and flip convention:
+        # QUBE: 0 degrees = down position
+        # Training: 0 radians = upright position, π radians = down position
         pendulum_angle = np.radians(pendulum_angle_deg)
         # Adjust so that upright is 0
         pendulum_angle_norm = normalize_angle(pendulum_angle + np.pi)
 
-        # Get motor velocity - convert from RPM to rad/s
+        # Estimate motor velocity - convert from RPM to rad/s
         motor_velocity = self.qube.getMotorRPM() * (2 * np.pi / 60)  # Convert RPM to rad/s
 
         # Estimate pendulum velocity by finite difference (in radians)
@@ -835,13 +1340,25 @@ class QUBEControllerWithRLTraining:
         else:
             dt = current_time - self.prev_time_rl
             if dt > 0:
-                pendulum_velocity = (current_pendulum_angle_rad - self.prev_pendulum_angle_rl) / dt
+                raw_velocity = (current_pendulum_angle_rad - self.prev_pendulum_angle_rl) / dt
+
+                # Apply low-pass filter to pendulum velocity for RL
+                # Only if we're using filters during training
+                if self.use_filters_during_training or not self.training_mode:
+                    pendulum_velocity = self.pendulum_velocity_filter.filter(raw_velocity, dt)
+                else:
+                    pendulum_velocity = raw_velocity
             else:
                 pendulum_velocity = 0.0
             self.prev_pendulum_angle_rl = current_pendulum_angle_rad
             self.prev_time_rl = current_time
 
-        # Create observation vector with sin/cos values for angles to avoid discontinuities
+        # Save state for reward calculation
+        self.state = np.array([
+            motor_angle, pendulum_angle_norm, motor_velocity, pendulum_velocity
+        ])
+
+        # Create observation vector
         obs = np.array([
             np.sin(motor_angle), np.cos(motor_angle),
             np.sin(pendulum_angle_norm), np.cos(pendulum_angle_norm),
@@ -849,467 +1366,50 @@ class QUBEControllerWithRLTraining:
             pendulum_velocity / 10.0
         ])
 
-        return obs, pendulum_angle_norm, motor_angle, motor_velocity, pendulum_velocity
-
-    def _compute_reward(self, alpha_norm, theta, alpha_dot, theta_dot):
-        """Improved reward function with better shaping for real hardware"""
-
-        # COMPONENT 1: Base reward for pendulum being upright (range: -1 to 1)
-        # Uses cosine which is a naturally smooth function
-        upright_reward = 2.0 * np.cos(alpha_norm)
-
-        # COMPONENT 2: Smooth penalty for high velocities - quadratic falloff
-        # Use tanh to create a smoother penalty that doesn't grow excessively large
-        velocity_norm = (theta_dot ** 2 + alpha_dot ** 2) / 10.0  # Normalize velocities
-        velocity_penalty = -0.3 * np.tanh(velocity_norm)  # Bounded penalty
-
-        # COMPONENT 3: Smooth penalty for arm position away from center
-        # Again using tanh for smooth bounded penalties
-        pos_penalty = -0.1 * np.tanh(theta ** 2 / 2.0)
-
-        # COMPONENT 4: Smoother bonus for being close to upright position
-        upright_closeness = np.exp(-10.0 * alpha_norm ** 2)  # Close to 1 when near upright, falls off quickly
-        stability_factor = np.exp(-1.0 * alpha_dot ** 2)  # Close to 1 when velocity is low
-        bonus = 3.0 * upright_closeness * stability_factor  # Smoothly scales based on both factors
-
-        # COMPONENT 4.5: Smoother cost for being close to downright position
-        # For new convention, downright is at π
-        downright_alpha = normalize_angle(alpha_norm - np.pi)
-        downright_closeness = np.exp(-10.0 * downright_alpha ** 2)
-        stability_factor = np.exp(-1.0 * alpha_dot ** 2)
-        bonus += -3.0 * downright_closeness * stability_factor  # Smoothly scales based on both factors
-
-        # COMPONENT 5: Smoother penalty for approaching limits
-        # Create a continuous penalty that increases as the arm approaches limits
-        # Map the distance to limits to a 0-1 range, with 1 being at the limit
-        THETA_MIN = -2.2  # Minimum arm angle (radians)
-        THETA_MAX = 2.2  # Maximum arm angle (radians)
-        theta_max_dist = np.clip(1.0 - abs(theta - THETA_MAX) / 0.5, 0, 1)
-        theta_min_dist = np.clip(1.0 - abs(theta - THETA_MIN) / 0.5, 0, 1)
-        limit_distance = max(theta_max_dist, theta_min_dist)
-
-        # Apply a nonlinear function to create gradually increasing penalty
-        # The penalty grows more rapidly as the arm gets very close to limits
-        limit_penalty = -10.0 * limit_distance ** 3
-
-        # COMPONENT 6: Energy management reward
-        # This component is already quite smooth, just adjust scaling
-        Mp_g_Lp = 0.03013632
-        Jp = 0.000131072
-        energy_reward = 2 - 0.15 * abs(Mp_g_Lp * (np.cos(alpha_norm))
-                                       + 0.5 * Jp * alpha_dot ** 2
-                                       - Mp_g_Lp)
-
-
-        # Combine all components
-        reward = (
-                upright_reward
-                # + velocity_penalty
-                + pos_penalty
-                + bonus
-                + limit_penalty
-                + energy_reward
-        )
-
-        return reward
-
-    def check_episode_termination(self, pendulum_angle_norm, elapsed_time):
-        """Check if episode should terminate with more lenient conditions"""
-        # More lenient angle threshold - only terminate if completely fallen
-        pendulum_fell = abs(pendulum_angle_norm) > np.radians(150)  # Was 160
-
-        # Time-based termination - longer episodes for more learning opportunity
-        episode_timeout = elapsed_time > 40.0  # Was 30.0 seconds
-
-        # Success condition - consider episode complete after sustained balancing
-        sustained_balance = (
-                elapsed_time > 15.0 and  # Must balance for at least 15 seconds
-                abs(pendulum_angle_norm) < np.radians(20) and  # Currently near balanced
-                self.near_balance_time > 12.0  # Has been near balanced for 12+ seconds
-        )
-
-        return pendulum_fell or episode_timeout or sustained_balance
-
-    def update_curriculum(self):
-        """Update training curriculum based on performance"""
-        if not hasattr(self, 'curriculum_stage'):
-            self.curriculum_stage = 0
-            self.curriculum_success_counter = 0
-            self.curriculum_failure_counter = 0
-
-        # Track successes and failures
-        if self.current_episode_length > 10 and self.near_balance_time > 5.0:
-            self.curriculum_success_counter += 1
-            self.curriculum_failure_counter = max(0, self.curriculum_failure_counter - 1)
-        elif self.current_episode_length <= 5:
-            self.curriculum_failure_counter += 1
-            self.curriculum_success_counter = max(0, self.curriculum_success_counter - 1)
-
-        # Progress to next stage if consistently successful
-        if self.curriculum_success_counter >= 10:
-            self.curriculum_stage += 1
-            self.curriculum_success_counter = 0
-            self.curriculum_failure_counter = 0
-            print(f"Advancing to curriculum stage {self.curriculum_stage}")
-
-        # Regress to previous stage if consistently failing
-        elif self.curriculum_failure_counter >= 20 and self.curriculum_stage > 0:
-            self.curriculum_stage -= 1
-            self.curriculum_success_counter = 0
-            self.curriculum_failure_counter = 0
-            print(f"Regressing to curriculum stage {self.curriculum_stage}")
-
-        # Apply curriculum adjustments
-        if self.curriculum_stage == 0:
-            # Stage 0: Easier balance - more lenient termination, higher rewards
-            self.rl_scaling_factor = 4.0
-            self.balance_angle_threshold = np.radians(40)  # More lenient balance definition
-        elif self.curriculum_stage == 1:
-            # Stage 1: Medium difficulty
-            self.rl_scaling_factor = 4.0
-            self.balance_angle_threshold = np.radians(30)
-        else:
-            # Stage 2+: Harder challenges
-            self.rl_scaling_factor = 4.0
-            self.balance_angle_threshold = np.radians(20)  # Stricter balance definition
-
-        # Update slider to match curriculum
-        self.rl_scaling_slider.set(self.rl_scaling_factor)
-
-        # Update curriculum display
-        self.curriculum_label.config(text=str(self.curriculum_stage))
+        # Return both the observation and pendulum angle for status updates
+        return obs, pendulum_angle_norm
 
     def update_rl_control(self):
-        """Update RL control logic with optional training using improved methods"""
-        # Get current observation
-        obs, pendulum_angle_norm, motor_angle, motor_velocity, pendulum_velocity = self._get_observation()
-
-        # Track time spent near balanced position with improved hysteresis
-        current_time = time.time()
-        dt = current_time - self.last_balance_check
-        self.last_balance_check = current_time
-
-        # Better balance tracking with hysteresis
-        if not hasattr(self, 'was_near_balance'):
-            self.was_near_balance = False
-
-        is_near_balance = abs(pendulum_angle_norm) < self.balance_angle_threshold
-
-        # Only reset balance time when definitely out of balance zone
-        if is_near_balance:
-            self.near_balance_time += dt
-            self.was_near_balance = True
-        elif not is_near_balance and abs(pendulum_angle_norm) > self.balance_angle_threshold * 1.2:
-            # Only reset if well outside the balance zone (hysteresis)
-            self.near_balance_time = 0.0
-            self.was_near_balance = False
-
-        # Update balance time display
-        self.balance_time_label.config(text=f"{self.near_balance_time:.1f}s")
+        """Update RL control logic"""
+        # Get current state
+        obs, pendulum_angle_norm = self.get_observation()
 
         # Get action from RL model
         with torch.no_grad():
             state_tensor = torch.FloatTensor(obs).to(self.device).unsqueeze(0)
+            action_mean, _ = self.actor(state_tensor)
+            action = action_mean.cpu().numpy()[0][0]  # Get action as scalar
 
-            if self.training_mode:
-                # Sample from policy distribution during training (with added noise)
-                action_tensor, _ = self.actor.sample(state_tensor)
+        # Apply max_voltage directly
+        raw_voltage = float(action) * self.max_voltage
 
-                # Add external exploration noise if needed
-                if self.exploration_noise > 0:
-                    noise = torch.randn_like(action_tensor) * self.exploration_noise
-                    action_tensor = torch.clamp(action_tensor + noise, -1.0, 1.0)
+        # Apply low-pass filter to voltage
+        current_time = time.time()
+        dt = current_time - self.last_loop_time if hasattr(self, 'last_loop_time') else 0.001
+        self.motor_voltage = self.voltage_filter.filter(raw_voltage, dt)
 
-                action = action_tensor.cpu().numpy()[0][0]
+        # Update status - but only during UI updates
+        if self.ui_counter == 0:
+            upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
+            if upright_angle < 30:
+                self.status_label.config(text=f"Control active - Near balance ({upright_angle:.1f}° from upright)")
             else:
-                # Use mean action (no exploration) during evaluation
-                action_mean, _ = self.actor(state_tensor)
-                action = action_mean.cpu().numpy()[0][0]
-
-        # Convert normalized action [-1, 1] to voltage using adjustable scaling factor
-        self.motor_voltage = float(action) * self.max_voltage / self.rl_scaling_factor
-
-        # Training mode - collect experiences and update
-        if self.training_mode:
-            # Calculate reward for current state using improved reward function
-            reward = self._compute_reward(
-                pendulum_angle_norm,
-                motor_angle,
-                pendulum_velocity,
-                motor_velocity
-            )
-
-            # Update episode tracking
-            self.current_episode_reward += reward
-            self.current_episode_length += 1
-
-            # Check for episode termination with improved conditions
-            elapsed_time = time.time() - self.episode_start_time
-            done = self.check_episode_termination(pendulum_angle_norm, elapsed_time)
-
-            if done:
-                # Log episode stats
-                self.episode_rewards.append(self.current_episode_reward)
-                self.episode_lengths.append(self.current_episode_length)
-                self.current_episode += 1
-
-                # Update episode stats display
-                self.episodes_label.config(text=str(self.current_episode))
-                if len(self.episode_rewards) > 0:
-                    avg_reward = sum(self.episode_rewards[-10:]) / min(len(self.episode_rewards), 10)
-                    self.avg_reward_label.config(text=f"{avg_reward:.1f}")
-
-                # Record best performance and auto-save
-                if self.current_episode_reward > self.best_episode_reward:
-                    self.best_episode_reward = self.current_episode_reward
-                    self.best_episode_length = self.current_episode_length
-                    # Update best episode display
-                    self.best_episode_label.config(
-                        text=f"R:{self.best_episode_reward:.1f} L:{self.best_episode_length}")
-
-                    # Auto-save best model
-                    best_model_path = os.path.join("trained_models", f"best_model_{self.current_episode}.pth")
-                    torch.save(self.actor.state_dict(), best_model_path)
-                    print(
-                        f"New best episode! Reward: {self.best_episode_reward:.2f}, Length: {self.best_episode_length}")
-
-                # Check for training stagnation
-                if self.current_episode_length <= 2:
-                    self.consecutive_short_episodes += 1
-                else:
-                    self.consecutive_short_episodes = 0
-
-                # If too many short episodes, consider recovery actions
-                if self.consecutive_short_episodes > 30:
-                    self.consecutive_short_episodes = 0
-
-                    # Recalculate exploration noise based on cycle
-                    cycle_position = (
-                                                 self.current_episode % self.exploration_cycle_period) / self.exploration_cycle_period
-                    new_exploration_noise = self.exploration_base + self.exploration_amplitude * (
-                                0.5 - abs(cycle_position - 0.5)) * 2
-
-                    # Make sure it's significantly higher than current
-                    old_noise = self.exploration_noise
-                    self.exploration_noise = max(0.3, new_exploration_noise * 1.5)
-                    self.noise_slider.set(self.exploration_noise)
-
-                    print(
-                        f"Training appears stuck - temporarily increasing exploration from {old_noise:.2f} to {self.exploration_noise:.2f}")
-
-                # Reset for next episode
-                self.current_episode_reward = 0
-                self.current_episode_length = 0
-                self.episode_start_time = time.time()
-                self.near_balance_time = 0.0
-
-                # Update curriculum
-                self.update_curriculum()
-
-                # Indicate episode end
-                print(
-                    f"Episode {self.current_episode} ended: Reward={self.episode_rewards[-1]:.2f}, Length={self.episode_lengths[-1]}")
-
-            # Store experience in replay buffer if we have a previous state
-            if self.prev_state is not None:
-                self.replay_buffer.push(
-                    self.prev_state,  # State
-                    np.array([action]),  # Action
-                    reward,  # Reward
-                    obs,  # Next state
-                    float(done)  # Done flag
-                )
-                self.experience_counter += 1
-
-            # Store current state and action for next step
-            self.prev_state = obs
-            self.prev_action = action
-
-            # Update training stats display
-            self.buffer_label.config(text=f"{len(self.replay_buffer)}/{self.replay_buffer_size}")
-
-            # Gradually adjust exploration noise according to cyclical schedule
-            if len(self.replay_buffer) > BATCH_SIZE * 5:
-                # Calculate cycle position for smooth exploration variation
-                cycle_position = (self.current_episode % self.exploration_cycle_period) / self.exploration_cycle_period
-                target_noise = self.exploration_base + self.exploration_amplitude * (
-                            0.5 - abs(cycle_position - 0.5)) * 2
-
-                # Smooth transition to target noise
-                self.exploration_noise = 0.95 * self.exploration_noise + 0.05 * target_noise
-                self.exploration_noise = max(self.min_exploration, self.exploration_noise)
-
-                # Update slider without triggering the callback
-                self.noise_slider.set(self.exploration_noise)
-
-            # Periodic network updates when buffer has enough samples
-            if (len(self.replay_buffer) > self.min_buffer_size_for_training and
-                    self.experience_counter % self.update_every_n_steps == 0):
-
-                # Perform multiple training updates
-                critic_losses = []
-                actor_losses = []
-
-                for _ in range(self.training_steps_per_update):
-                    losses = self.update_networks()
-                    critic_losses.append(losses['critic_loss'])
-                    actor_losses.append(losses['actor_loss'])
-
-                # Calculate average losses
-                avg_critic_loss = sum(critic_losses) / len(critic_losses)
-                avg_actor_loss = sum(actor_losses) / len(actor_losses)
-
-                # Update loss display
-                self.loss_label.config(text=f"C:{avg_critic_loss:.4f} A:{avg_actor_loss:.4f}")
-
-                # Increment update counter
-                self.update_counter += 1
-                self.updates_label.config(text=str(self.update_counter))
-
-                # Auto-save if needed
-                try:
-                    save_interval = int(self.save_interval_var.get())
-                    if self.update_counter % save_interval == 0:
-                        model_path = self.save_current_model()
-                        if model_path:
-                            print(f"Auto-saved model at {model_path}")
-                except ValueError:
-                    pass  # Invalid save interval
-
-                # Gradually increase training intensity as buffer fills
-                if self.update_counter % 100 == 0 and len(self.replay_buffer) > BATCH_SIZE * 20:
-                    # More updates per step as training progresses
-                    self.training_steps_per_update = min(5, self.training_steps_per_update + 1)
-                    print(f"Increased training steps per update to {self.training_steps_per_update}")
-
-        # Update status
-        upright_angle = abs(pendulum_angle_norm) * 180 / np.pi
-        if upright_angle < 30:
-            if self.training_mode:
-                self.status_label.config(text=f"Training: Near balance ({upright_angle:.1f}° from upright)")
-            else:
-                self.status_label.config(text=f"RL control active - Near balance ({upright_angle:.1f}° from upright)")
-        else:
-            if self.training_mode:
-                self.status_label.config(text=f"Training: Swinging ({upright_angle:.1f}° from upright)")
-            else:
-                self.status_label.config(text=f"RL control active - Swinging ({upright_angle:.1f}° from upright)")
-
-    def update_networks(self):
-        """Update actor and critic networks using SAC algorithm with improved techniques"""
-        # Set networks to training mode
-        self.actor.train()
-        self.critic.train()
-        self.critic_target.train()
-
-        # Sample batch with adaptive beta for priorities
-        beta = self.replay_buffer.get_beta()  # Progressive beta for importance sampling
-        sample_result = self.replay_buffer.sample(BATCH_SIZE, beta=beta)
-
-        if len(sample_result) == 7:
-            state_batch, action_batch, reward_batch, next_state_batch, done_batch, indices, weights = sample_result
-
-            # Convert to tensors
-            state_batch = torch.FloatTensor(state_batch).to(self.device)
-            action_batch = torch.FloatTensor(action_batch).to(self.device)
-            reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
-            next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-            done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)
-            weights = torch.FloatTensor(weights).to(self.device).unsqueeze(1)
-        else:
-            # Handle the case where the buffer may be empty
-            return {'critic_loss': 0.0, 'actor_loss': 0.0}
-
-        # Update critic with gradient clipping
-        with torch.no_grad():
-            next_action, next_log_prob = self.actor.sample(next_state_batch)
-            target_q1, target_q2 = self.critic_target(next_state_batch, next_action)
-            target_q = torch.min(target_q1, target_q2)
-
-            if AUTO_ENTROPY_TUNING:
-                alpha = torch.exp(self.log_alpha).item()
-            else:
-                alpha = ALPHA
-
-            target_q = target_q - alpha * next_log_prob
-            target_q = reward_batch + (1 - done_batch) * GAMMA * target_q
-
-        # Current Q estimates
-        current_q1, current_q2 = self.critic(state_batch, action_batch)
-
-        # Use Huber loss instead of MSE for more robust training
-        q1_loss = F.smooth_l1_loss(current_q1 * weights, target_q * weights)
-        q2_loss = F.smooth_l1_loss(current_q2 * weights, target_q * weights)
-        critic_loss = q1_loss + q2_loss
-
-        # Optimize critic with gradient clipping
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        # Tighter gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-        self.critic_optimizer.step()
-
-        # Calculate TD errors for priority updates
-        with torch.no_grad():
-            td_error1 = torch.abs(current_q1 - target_q)
-            td_error2 = torch.abs(current_q2 - target_q)
-            td_error = torch.max(td_error1, td_error2).cpu().numpy().flatten()
-
-        # Update priorities in buffer
-        new_priorities = td_error + 1e-6  # Add small constant to avoid zero priority
-        self.replay_buffer.update_priorities(indices, new_priorities)
-
-        # Update actor less frequently for stability (every 2 updates)
-        if self.update_counter % 2 == 0:
-            actions, log_probs = self.actor.sample(state_batch)
-            q1, q2 = self.critic(state_batch, actions)
-            min_q = torch.min(q1, q2)
-
-            if AUTO_ENTROPY_TUNING:
-                alpha = torch.exp(self.log_alpha).item()
-            else:
-                alpha = ALPHA
-
-            # Actor loss (maximize Q - alpha * log_prob)
-            actor_loss = (alpha * log_probs - min_q).mean()
-
-            # Optimize actor with gradient clipping
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            self.actor_optimizer.step()
-
-            # Update automatic entropy tuning parameter
-            if AUTO_ENTROPY_TUNING:
-                alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
-
-                self.alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.alpha_optimizer.step()
-
-                self.alpha = torch.exp(self.log_alpha).item()
-        else:
-            actor_loss = torch.tensor(0.0)
-
-        # Soft update target networks with reduced TAU (slower updates)
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
-
-        return {
-            'critic_loss': critic_loss.item(),
-            'actor_loss': actor_loss.item() if isinstance(actor_loss, torch.Tensor) else actor_loss
-        }
+                self.status_label.config(text=f"Control active - Swinging ({upright_angle:.1f}° from upright)")
 
     def stop_motor(self):
-        """Stop the motor and reset control modes"""
+        """Stop the motor"""
         self.calibrating = False
         self.moving_to_position = False
         self.rl_mode = False
+        self.training_mode = False
         self.motor_voltage = 0.0
         self.voltage_slider.set(0)
 
         if self.rl_model:
             self.rl_control_btn.config(text="Start RL Control")
+
+        if hasattr(self, 'train_btn'):
+            self.train_btn.config(text="Start Training")
 
         # Set blue LED when stopped
         self.r_slider.set(0)
@@ -1320,40 +1420,88 @@ class QUBEControllerWithRLTraining:
 
     def update_gui(self):
         """Update the GUI and control the hardware - called continuously"""
-        # Update automatic control modes if active
+        # Increment iteration counter
+        self.iteration_count += 1
+
+        # Calculate current control frequency (less frequently)
+        now = time.time()
+        elapsed = now - self.last_loop_time
+        self.last_loop_time = now
+
+        # Smooth frequency calculation (moving average)
+        alpha = 0.05  # Reduced smoothing factor for less processing
+        self.actual_frequency = (1 - alpha) * self.actual_frequency + alpha * (1.0 / max(elapsed, 0.001))
+
+        # Update UI counter
+        self.ui_counter = (self.ui_counter + 1) % self.ui_update_interval
+
+        # CRITICAL CONTROL OPERATIONS - These must happen on every loop
+        # ---------------------------------------------------------------
+
+        # Update automatic control modes if active (core functionality)
         if self.calibrating:
             self.update_calibration()
         elif self.moving_to_position:
             self.update_position_control()
         elif self.rl_mode:
             self.update_rl_control()
+        elif self.training_mode:
+            self.update_training()
 
-        # Apply the current motor voltage - THIS IS CRITICAL TO DO ON EVERY LOOP!
+        # Apply the current motor voltage - CRITICAL TO DO ON EVERY LOOP!
         self.qube.setMotorVoltage(self.motor_voltage)
 
-        # Apply RGB values
-        self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
+        # Only update RGB values periodically to reduce hardware communication overhead
+        if self.ui_counter % 3 == 0:  # Update RGB less frequently than UI
+            self.qube.setRGB(self.r_slider.get(), self.g_slider.get(), self.b_slider.get())
 
-        # Update display information
-        motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
-        pendulum_angle_deg = self.qube.getPendulumAngle()
+        # NON-CRITICAL UI UPDATES - Only do these periodically
+        # ---------------------------------------------------------------
+        if self.ui_counter == 0:
+            # Get current hardware values
+            motor_angle_deg = self.qube.getMotorAngle() + 136.0  # Adjust for corner as zero
+            pendulum_angle_deg = self.qube.getPendulumAngle()
+            pendulum_angle_rad = np.radians(pendulum_angle_deg)
+            pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)
+            rpm = self.qube.getMotorRPM()
 
-        # Convert to radians for normalized angle calculation
-        pendulum_angle_rad = np.radians(pendulum_angle_deg)
-        pendulum_angle_norm = normalize_angle(pendulum_angle_rad + np.pi)  # For display
+            # Check if values have changed enough to warrant a UI update
+            # This avoids unnecessary tkinter operations which are expensive
+            if (abs(motor_angle_deg - self.ui_cache['motor_angle']) > 0.5 or
+                    abs(pendulum_angle_deg - self.ui_cache['pendulum_angle']) > 0.5):
+                # Update angle displays
+                self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
+                self.pendulum_label.config(
+                    text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
+                # Update cache
+                self.ui_cache['motor_angle'] = motor_angle_deg
+                self.ui_cache['pendulum_angle'] = pendulum_angle_deg
 
-        rpm = self.qube.getMotorRPM()
+            # Update other displays only if they've changed significantly
+            if abs(rpm - self.ui_cache['rpm']) > 1.0:
+                self.rpm_label.config(text=f"{rpm:.1f}")
+                self.ui_cache['rpm'] = rpm
 
-        self.angle_label.config(text=f"{motor_angle_deg:.1f}°")
-        self.pendulum_label.config(
-            text=f"{pendulum_angle_deg:.1f}° ({abs(pendulum_angle_norm) * 180 / np.pi:.1f}° from upright)")
-        self.rpm_label.config(text=f"{rpm:.1f}")
-        self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+            if abs(self.motor_voltage - self.ui_cache['voltage']) > 0.1:
+                self.voltage_label.config(text=f"{self.motor_voltage:.1f} V")
+                self.ui_cache['voltage'] = self.motor_voltage
+
+            # Update frequency display less often (every 3rd UI update)
+            if self.iteration_count % (self.ui_update_interval * 3) == 0:
+                self.freq_label.config(text=f"{self.actual_frequency:.1f} Hz")
+                self.ui_cache['frequency'] = self.actual_frequency
+
+            # Log performance stats every 1000 iterations instead of 500
+            if self.iteration_count % 1000 == 0:
+                avg_freq = self.iteration_count / (now - self.start_time)
+                print(
+                    f"Performance: {self.iteration_count} iterations, Avg frequency: {avg_freq:.1f} Hz, Current: {self.actual_frequency:.1f} Hz")
 
 
 def main():
-    print("Starting QUBE Controller with Improved RL Training...")
+    print("Starting QUBE Controller with RL Training and Real-Time Control")
     print("Will set corner position as zero")
+    print("OPTIMIZED VERSION - Maximum speed control, real-time training, improved filter control")
 
     try:
         # Initialize QUBE
@@ -1366,33 +1514,74 @@ def main():
         qube.setRGB(0, 0, 999)  # Blue LED to start
         qube.update()
 
-        # Create GUI
+        # Configure Tkinter for higher performance
         root = tk.Tk()
-        app = QUBEControllerWithRLTraining(root, qube)
 
-        # Main loop
+        # Optimize Tkinter settings
+        root.update_idletasks()  # Process any pending UI events before starting main loop
+        root.protocol("WM_DELETE_WINDOW", root.destroy)  # Ensure clean shutdown
+
+        # Create application
+        app = QUBEControllerWithRL(root, qube)
+
+        # Set initial values
+        app.filter_cutoff_slider.set(500)  # Default filter cutoff to 500 Hz
+        app.max_voltage_slider.set(4.0)  # Set default max voltage
+        app.set_max_voltage(4.0)  # Update the internal value
+
+        # Preallocate variables used in main loop
+        ui_counter = 0
+        update_count = 0
+
+        # Display initial performance advice
+        print("Performance tip: Increase 'UI Update Every N Iterations' slider for higher control frequency")
+
+        # Main loop - MODIFIED: High performance optimized loop
         while True:
-            qube.update()
-            app.update_gui()
-            root.update()
-            time.sleep(0.01)
+            try:
+                # Update hardware - critical control operation
+                qube.update()
+
+                # Update controller - critical control operation
+                app.update_gui()
+
+                # Update Tkinter less frequently - major performance improvement
+                if app.ui_counter == 0:
+                    # Process Tkinter events without full redraw
+                    root.update_idletasks()  # Process pending events
+
+                    # Full update only every few UI cycles for better performance
+                    update_count += 1
+                    if update_count % 3 == 0:  # Reduce full UI updates further
+                        root.update()  # Complete update including redraw
+
+            except RuntimeError as e:
+                # Handle transient Tkinter errors (can happen during heavy load)
+                if "main thread is not in main loop" in str(e):
+                    print("Handled UI threading issue, continuing...")
+                    pass
+                else:
+                    raise  # Re-raise if it's a different error
 
     except tk.TclError:
         # Window closed
-        pass
+        print("Window closed, shutting down")
     except KeyboardInterrupt:
         # User pressed Ctrl+C
-        pass
+        print("Keyboard interrupt, shutting down")
     except Exception as e:
         print(f"Error: {str(e)}")
     finally:
-        # Final stop attempt
+        # Final stop attempt with more robust shutdown
         try:
+            print("Shutting down motor and hardware...")
             qube.setMotorVoltage(0.0)
+            qube.setRGB(0, 0, 0)  # Turn off LEDs
             qube.update()
+            time.sleep(0.1)  # Brief pause to ensure commands are sent
             print("Motor stopped")
-        except:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not cleanly shut down hardware: {str(e)}")
 
 
 if __name__ == "__main__":
