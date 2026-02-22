@@ -63,12 +63,13 @@ Pendulum_RL/
 │       ├── Inverted_Pendulum_data/  # Data collection firmware and analysis
 │       └── Python_Serial/           # Serial communication firmware
 │
-├── validated models/           # Trained model weights (.pth)
+├── models/                    # Trained model weights (.pth)
 │
-├── sim_constant_voltage.m      # MATLAB: Simple pendulum dynamics with constant input
-├── sim_time_varying_voltage.m  # MATLAB: Pendulum dynamics with time-varying input
-├── wynda_parameter_estimation.m # MATLAB: WyNDA parameter estimation (AO + AKF)
-└── learned_vs_physics_model.m  # MATLAB: Data-driven vs physics model validation
+└── matlab/                    # MATLAB analysis and validation scripts
+    ├── sim_constant_voltage.m      # Simple pendulum dynamics with constant input
+    ├── sim_time_varying_voltage.m  # Pendulum dynamics with time-varying input
+    ├── wynda_parameter_estimation.m # WyNDA parameter estimation (AO + AKF)
+    └── learned_vs_physics_model.m  # Data-driven vs physics model validation
 ```
 
 ## Getting Started
