@@ -1,3 +1,16 @@
+"""
+User-defined control law interface for QUBE system.
+
+Template module for implementing custom control strategies. Provides control_system()
+function that users override with their control law, and setPidParams() for tuning
+PID gains via GUI. Returns voltage command (-24 to 24V) based on system states.
+
+User defines:
+- control_system(dt, motor_angle, pendulum_angle, rpm): Main control law
+- setPidParams(_pid): PID parameter tuning
+- Control targets: MOTOR_TARGET_ANGLE, PENDULUM_TARGET_ANGLE, MOTOR_TARGET_RPM
+"""
+
 from PID import *
 
 # Arduino COM port

@@ -1,3 +1,13 @@
+"""
+Updated system identification v2 for 2-DOF QUBE-Servo pendulum.
+
+This module is version 2 of system identification with optimized ODE solver parameters,
+improved performance, and enhanced simulation accuracy. Includes streamlined Lagrangian
+dynamics without cable oscillation effects and performance characteristic analysis.
+
+Main function: pendulum_dynamics_no_cable() for optimized physics simulation.
+Utilities: Advanced ODE integration with DOP853 method and real-time characteristics estimation.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp

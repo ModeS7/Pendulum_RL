@@ -1,3 +1,18 @@
+"""
+PID cascade controller for QUBE pendulum swing-up and balance.
+
+Implements dual-loop control: inner PID loop for pendulum balance with proportional-
+derivative action, outer loop for motor position tracking. Energy-based swing-up control
+guides pendulum to upright position, switching to balance mode within specified range.
+Includes GUI for real-time parameter tuning, calibration, and manual voltage control.
+
+Control modes:
+- Calibration: Move to corner and set as zero
+- Position Control: Move motor to target angle
+- Balance Control: Swing-up and balance pendulum with simultaneous motor positioning
+- Manual: Direct voltage slider control
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog
 from QUBE import QUBE

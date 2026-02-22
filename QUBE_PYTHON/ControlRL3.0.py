@@ -1,3 +1,19 @@
+"""
+Refined RL controller with Kalman filtering and normalized state/action spaces.
+
+Integrates Extended Kalman Filter for robust state estimation from noisy sensors,
+improving policy performance by providing filtered angle and velocity estimates.
+Includes real-time comparison with system dynamics simulation and Kalman prediction
+overlays. Supports data recording and interactive visualization for validation.
+
+Key features:
+- Extended Kalman Filter for state estimation
+- Simulation dynamics model for prediction comparison
+- Live plotting of raw vs filtered vs model states
+- Data recording and export for analysis
+- Normalized state and action spaces
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog, Checkbutton, IntVar
 from QUBE import QUBE

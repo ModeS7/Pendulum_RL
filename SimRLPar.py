@@ -1,3 +1,13 @@
+"""
+Parallel SAC training launcher for distributed episode execution across CPU cores.
+
+This module orchestrates multi-process training of SAC agents using CPU affinity optimization.
+Launches the OptimizedCPUAffinityTrainer to manage parallel workers, distributes episodes,
+tracks hyperparameter evolution, and selects the best performing configuration.
+
+Main class: OptimizedCPUAffinityTrainer (imported from episode_parallel_trainer).
+Main execution: Parallel training with configurable worker count and CPU core assignment.
+"""
 import multiprocessing as mp
 import os
 import argparse

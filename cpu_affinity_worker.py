@@ -1,3 +1,13 @@
+"""
+CPU affinity worker wrapper for parallel training processes.
+
+This module provides a wrapper function that sets CPU affinity before executing training
+jobs. Ensures worker processes are pinned to specific CPU cores for better cache locality
+and performance during parallel episode training.
+
+Main function: affinity_worker_training_job() - sets CPU affinity then runs training.
+Use case: Called by OptimizedCPUAffinityTrainer to execute workers with core assignment.
+"""
 import multiprocessing as mp
 import pickle
 import numpy as np

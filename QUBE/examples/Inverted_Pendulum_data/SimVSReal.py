@@ -1,3 +1,10 @@
+"""Compares simulation predictions against real hardware measurements for the QUBE pendulum.
+
+This module validates the nonlinear pendulum dynamics model by running RK4 integrations
+with real voltage data and comparing arm and pendulum angles against measured data. Generates
+detailed error analysis plots and summary statistics across multiple datasets.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd

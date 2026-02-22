@@ -1,3 +1,19 @@
+"""
+Enhanced RL controller with SAC training and dual network architecture.
+
+Deploys Soft Actor-Critic (SAC) agent trained in simulation on real QUBE hardware with
+low-pass filtering, prioritized replay buffer, and soft target updates. Supports both
+policy evaluation mode (loaded pretrained models) and online training with data logging.
+Dual critic networks reduce overestimation bias. Automatic entropy temperature tuning.
+
+Key features:
+- Policy network (actor) for action selection
+- Dual critic networks (Q1, Q2) for value estimation
+- Replay buffer with configurable capacity
+- Configurable neural network architecture and hyperparameters
+- Real-time model evaluation and performance tracking
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox, Checkbutton, IntVar, StringVar, \
     OptionMenu

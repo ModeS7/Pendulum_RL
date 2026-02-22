@@ -1,3 +1,10 @@
+"""Generates comparison plots between PID and RL controllers at various voltage limits.
+
+This module provides utilities for reading, processing, and visualizing QUBE hardware data
+from both Excel and CSV formats. It supports filtering by controller mode, normalizing angles,
+and creating individual and overlay comparison plots with automatic scaling and formatting.
+"""
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np

@@ -1,3 +1,13 @@
+"""
+SAC with LSTM actor and adaptive temperature for inverted pendulum control.
+
+This module combines LSTM-based policy networks with SAC for the 2-DOF pendulum task.
+The LSTM captures temporal dynamics and improves sim-to-real transfer. Includes adaptive
+temperature tuning and parameter variation support for domain randomization.
+
+Key classes: LSTMActor, LSTMSACAgent, Critic, PendulumEnv, ReplayBuffer, ParameterManager.
+Main function: train() for training with LSTM-SAC.
+"""
 import numpy as np
 import torch
 import torch.nn as nn

@@ -1,3 +1,16 @@
+"""
+Experiment data logging to CSV files for offline analysis.
+
+Logs real-time QUBE sensor measurements (angles, RPM, current) and control signals
+(target angles, voltages) to timestamped CSV files. Automatically creates Data
+directory and sequentially names files. Provides simple enable/disable toggle and
+buffered write for efficiency.
+
+Logged fields:
+- time, motor_angle, motor_target, pendulum_angle, pendulum_target
+- rpm, rpm_target, voltage, current
+"""
+
 import csv
 import os
 import time

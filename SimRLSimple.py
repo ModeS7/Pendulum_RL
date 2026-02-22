@@ -1,3 +1,13 @@
+"""
+Simplified Soft Actor-Critic (SAC) training for inverted pendulum control.
+
+This module provides a streamlined SAC implementation for the 2-DOF inverted pendulum
+without domain randomization or variable timesteps. Ideal for baseline comparisons and
+simplified testing with fixed system parameters and timesteps.
+
+Key classes: ParameterManager, Actor, Critic, SACAgent, PendulumEnv, ReplayBuffer.
+Main function: train() for training, evaluate() for evaluation.
+"""
 import numpy as np
 import torch
 import torch.nn as nn

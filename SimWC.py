@@ -1,3 +1,13 @@
+"""
+Simulation with cable oscillation modeling and multi-controller switching.
+
+This module simulates the inverted pendulum with cable oscillation effects and implements
+a multi-mode controller that switches between Emergency, Bang-Bang, LQR, and Energy-based
+control strategies. Includes limit avoidance and optimized bang-bang swing-up control.
+
+Key components: Control algorithms (bang_bang, energy_control, lqr), cable modeling.
+Main use: Evaluate performance of different control strategies on the pendulum task.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from time import time

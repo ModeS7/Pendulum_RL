@@ -1,3 +1,13 @@
+"""
+Interactive reward function visualization and analysis tool.
+
+This GUI-based module provides comprehensive exploration and visualization of the RL reward
+function. Features interactive sliders for state variables, multiple visualization modes
+(components, state, 3D surface), component analysis, and swing-up trajectory simulation.
+
+Key class: RewardExplorerGUI - main interactive GUI application.
+Main use: Analyze reward structure, debug reward shaping, and verify training incentives.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk

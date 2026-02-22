@@ -1,3 +1,17 @@
+"""
+Hardware and control validation tests with system dynamics comparison.
+
+Validates QUBE hardware functionality and tests control implementations against
+nonlinear system simulator. Includes step response testing, data recording with
+automatic comparison plots, and optional standalone mode for reanalyzing recorded
+data. SimpleSimulator models actual QUBE dynamics for real vs. simulated comparison.
+
+Test modes:
+- Hardware validation: Manual voltage steps with data logging
+- Simulator validation: Identical voltage inputs to both real and simulated systems
+- Standalone analysis: Reprocess recorded CSV data with fresh simulation
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog
 from QUBE import QUBE

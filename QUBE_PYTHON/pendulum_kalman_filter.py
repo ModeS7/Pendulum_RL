@@ -1,3 +1,18 @@
+"""
+Extended Kalman filter for state estimation from noisy pendulum system.
+
+Fuses QUBE sensor measurements with nonlinear system dynamics model to provide
+optimal state estimates (motor angle, pendulum angle, angular velocities). Uses
+predict-update cycle with tunable process and measurement noise covariances.
+Handles angle normalization for circular state variables.
+
+State vector: [theta, alpha, theta_dot, alpha_dot]
+Main methods:
+- predict(simulation_model, action): Prediction step with dynamics
+- update(measurement): Update with real sensor data
+- get_filtered_state(): Return current estimate
+"""
+
 import numpy as np
 import torch
 from scipy.linalg import block_diag

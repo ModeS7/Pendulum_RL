@@ -1,3 +1,18 @@
+"""
+Real-time plotting utilities for QUBE data visualization using PyQtGraph.
+
+Displays live sensor data (motor/pendulum angles, RPM, voltage) across four synchronized
+subplots. Implements efficient circular buffer for scrolling time-history with configurable
+update frequency and maximum data points. PyQtGraph provides fast OpenGL-based rendering
+suitable for continuous updating at control loop rates.
+
+Features:
+- 4 separate plots for different sensor groups
+- Live data scrolling with configurable buffer size
+- Dark theme for visual clarity
+- Multi-threaded synchronization with control loop
+"""
+
 import sys
 from PyQt5.QtWidgets import (
     QApplication,

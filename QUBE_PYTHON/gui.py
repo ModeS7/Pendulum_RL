@@ -1,3 +1,17 @@
+"""
+PyQt GUI for live monitoring and parameter tuning of QUBE control system.
+
+Provides interactive interface for real-time monitoring of motor/pendulum angles,
+RPM, and current. Includes RGB LED control sliders, encoder reset buttons, and
+voltage command input. Extends PyQtGraph plotting for interactive visualization.
+
+GUI components:
+- Encoder reset buttons (motor and pendulum)
+- RGB color sliders (0-999 range)
+- Motor voltage slider (-24 to +24V)
+- Real-time sensor displays
+"""
+
 import tkinter as tk
 from tkinter import Scale, Entry
 from QUBE import *

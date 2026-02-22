@@ -1,13 +1,23 @@
+# Core ML
 torch
 torchvision
 torchaudio
-opencv-python
-gymnasium
-gymnasium[classic-control]
 torchrl
 tensordict
-tqdm
-matplotlib
-lion-pytorch
+
+# Simulation & training
+gymnasium[classic-control]
 numba
-dataclasses
+numpy
+matplotlib
+tqdm
+tensorboard
+lion-pytorch
+psutil
+scipy
+pandas
+
+# Hardware interface (QUBE_PYTHON)
+pyserial
+PyQt5
+pyqtgraph

@@ -1,3 +1,13 @@
+"""
+Energy-based system identification with encoder cable oscillation effects.
+
+This module simulates the QUBE-Servo 2 pendulum with focus on system identification
+using energy-based approaches. Models encoder cable oscillations via Fourier series
+and includes cable damping effects in the full Lagrangian formulation.
+
+Main function: lagrangian_dynamics() for physics simulation with cable effects.
+Utilities: Voltage functions for step and impulse inputs.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp

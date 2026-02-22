@@ -1,3 +1,19 @@
+"""
+RL controller deploying trained SAC policy on hardware with low-pass filtering.
+
+Deploys Soft Actor-Critic policy trained in simulation onto real QUBE hardware.
+Includes low-pass velocity filtering for noise rejection and optional data logging
+with configurable sampling intervals. Supports loading pre-trained actor networks
+and real-time frequency monitoring for performance analysis.
+
+Main features:
+- Loads pretrained SAC actor policy (state_dim=6, action_dim=1)
+- Low-pass filtering for sensor noise rejection
+- Real-time control frequency monitoring
+- Data logging with configurable intervals
+- UI optimization for high-frequency control loops
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox
 from QUBE import QUBE

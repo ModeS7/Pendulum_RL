@@ -1,3 +1,18 @@
+"""
+LQR state-feedback controller with swing-up energy control and data logging.
+
+Implements Soft Actor-Critic (SAC) swing-up phase followed by Linear Quadratic Regulator
+(LQR) balance control. Features automatic controller selection based on pendulum state,
+configurable gain tuning for each control mode, and comprehensive data logging to CSV.
+Real-time monitoring of motor/pendulum angles, velocities, and control authority.
+
+Control modes:
+- Emergency: Limit avoidance when motor reaches boundaries
+- Bang-Bang: Aggressive swing-up using full voltage magnitude
+- Energy Control: Energy-based swing-up with smooth voltage transitions
+- LQR Balance: State-feedback control for stabilization near upright position
+"""
+
 import tkinter as tk
 from tkinter import Button, Label, Frame, Scale, Entry, filedialog, messagebox
 from QUBE import QUBE

@@ -1,3 +1,15 @@
+"""
+Basic PID controller class for feedback control.
+
+Simple proportional-integral-derivative controller implementation with configurable
+gains, integral windup prevention, and state management. Computes control output based
+on error between target and current measurement. Integrable with GUI for live tuning.
+
+Methods:
+- control(target, current, dt): Compute PID output
+- copy(pid): Copy parameters from another PID instance
+"""
+
 import sys
 
 

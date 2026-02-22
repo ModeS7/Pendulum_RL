@@ -1,3 +1,11 @@
+"""
+Serial port configuration and data packet definition.
+
+Defines COM port settings for Arduino/QUBE hardware connection. Provides Packet class
+for thread-safe data exchange between control loop and GUI, containing PID parameters,
+plot data, and encoder reset flags.
+"""
+
 from PID import *
 
 class Packet:

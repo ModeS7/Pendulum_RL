@@ -1,3 +1,13 @@
+"""
+Proximal Policy Optimization (PPO) training for inverted pendulum control.
+
+This module implements PPO agent training on a 2-DOF inverted pendulum with physics-based
+dynamics and RK4 integration. Includes Actor and Critic networks, advantage estimation
+via GAE-Lambda, and multi-epoch policy updates with KL divergence early stopping.
+
+Key classes: PPOAgent, Actor, Critic, PPOBuffer, PendulumEnv, ReplayBuffer.
+Main function: train() for training, evaluate() for evaluation.
+"""
 import numpy as np
 import torch
 import torch.nn as nn

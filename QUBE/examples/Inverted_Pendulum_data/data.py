@@ -1,3 +1,10 @@
+"""Data processing utilities for inverted pendulum experiments.
+
+This module handles loading, converting, and processing QUBE pendulum data in multiple
+formats (old Excel/CSV, new CSV). Supports angle unwrapping, format conversion, and
+visualization of time-series measurements including angles, positions, and voltages.
+"""
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import os

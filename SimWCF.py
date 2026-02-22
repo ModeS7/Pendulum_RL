@@ -1,3 +1,13 @@
+"""
+Simulation with frequency-dependent damping and zero-crossing frequency estimation.
+
+This module extends cable oscillation modeling with frequency-dependent damping effects
+derived from Fourier series analysis. Implements online frequency estimation via zero-crossing
+detection and adaptive damping based on detected oscillation frequency.
+
+Key features: Fourier-based cable damping, adaptive frequency estimation, multi-controller support.
+Main use: Study frequency-dependent effects and adaptive control in pendulum simulation.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from time import time

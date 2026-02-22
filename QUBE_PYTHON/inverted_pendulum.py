@@ -1,3 +1,17 @@
+"""
+Pendulum physics model with swing-up and balance control algorithms.
+
+Implements complete inverted pendulum dynamics using QUBE hardware parameters.
+Includes energy-based swing-up control to guide pendulum toward upright position,
+and cascade balance controller combining pendulum angle feedback with motor position
+control. Features low-pass filtering for velocity estimation.
+
+Control strategies:
+- Swing-up: Energy-based control for swinging pendulum to upright
+- Balance: PID-based controller with position and angle feedback
+- Mode switching: Automatic transition based on pendulum position
+"""
+
 from QUBE import QUBE
 from time import sleep, time
 import numpy as np

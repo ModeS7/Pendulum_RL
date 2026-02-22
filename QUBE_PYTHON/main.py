@@ -1,3 +1,14 @@
+"""
+Entry point for the QUBE-Servo inverted pendulum control system.
+
+Initializes the hardware connection, encoders, and logging, then runs the
+real-time control loop in a separate thread alongside a live plotting GUI.
+The control law is defined in control.py via the control_system() function.
+
+Usage:
+    python main.py
+"""
+
 # ------------------------------------- AVAILABLE FUNCTIONS --------------------------------#
 # qube.setRGB(r, g, b) - Sets the LED color of the QUBE. Color values range from [0, 999].
 # qube.setMotorSpeed(speed) - Sets the motor speed. Speed ranges from [-999, 999].

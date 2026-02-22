@@ -1,3 +1,14 @@
+"""
+Multi-core parallel episode trainer with hyperparameter evolution and CPU affinity.
+
+This module implements distributed SAC training across multiple CPU cores via episode-level
+parallelization. Features OptimizedCPUAffinityTrainer class that manages worker pool,
+optimizes CPU affinity, evolves hyperparameters, and selects best performing configuration
+based on episode rewards.
+
+Key class: OptimizedCPUAffinityTrainer - orchestrates parallel training and evolution.
+Main function: worker_training_job() - single worker episode execution.
+"""
 import multiprocessing as mp
 from multiprocessing import Manager
 import numpy as np

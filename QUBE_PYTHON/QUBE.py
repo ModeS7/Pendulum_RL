@@ -1,3 +1,19 @@
+"""
+Hardware abstraction layer for QUBE-Servo 2 serial communication.
+
+Manages serial communication with QUBE hardware via RS-232 interface. Handles encoding
+of control commands (motor voltage, RGB LED) and decoding of sensor measurements
+(encoder angles, RPM, current). Implements bit-level protocol for bidirectional data
+exchange with configurable baudrate and timeout.
+
+Key methods:
+- setMotorVoltage/setMotorSpeed: Motor control
+- resetMotorEncoder/resetPendulumEncoder: Encoder reset
+- getMotorAngle/getPendulumAngle: Position feedback
+- getMotorRPM/getMotorCurrent: Velocity and current measurement
+- setRGB: LED control
+"""
+
 import serial
 import time
 

@@ -1,3 +1,13 @@
+"""
+System identification for 2-DOF QUBE-Servo pendulum without cable effects.
+
+This module provides system identification via simulation of the QUBE-Servo 2 pendulum
+dynamics based on research paper parameters. Implements Lagrangian dynamics with full
+nonlinear equations, momentum conservation, and Coriolis effects without encoder cable modeling.
+
+Main function: pendulum_dynamics() for physics-based simulation.
+Utilities: Step and zero voltage control functions, performance metrics calculation.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp

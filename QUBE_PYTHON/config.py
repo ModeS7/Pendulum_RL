@@ -1,4 +1,10 @@
-# Plotting config settings
+"""
+Plotting and system configuration constants.
+
+Defines real-time plot display settings (update frequency, data point limits, axis labels)
+and control targets (motor angle, pendulum angle, RPM). Configures live plot appearance
+and selects which sensor data to display in each subplot.
+"""
 
 # Performance settings. Adjust if needed
 UPDATE_FREQUENCY = 10 # How many times per second to update the plotview
