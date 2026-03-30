@@ -22,7 +22,7 @@ build/
 Thumbs.db
 
 # PyTorch (validated models are tracked intentionally)
-# *.pth
+*.pth
 
 # Logs
 *.log
