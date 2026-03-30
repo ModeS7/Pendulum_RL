@@ -27,6 +27,9 @@ Thumbs.db
 # Plots
 *.png
 
+# Text files
+*.txt
+
 # Logs
 *.log
 logs/
