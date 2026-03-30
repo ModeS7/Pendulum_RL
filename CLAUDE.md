@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Reinforcement Learning control of a QUBE-Servo 2 inverted pendulum, comparing SAC (Soft Actor-Critic) agents against traditional PID/LQR controllers. The project spans simulation-based training, robustness evaluation under parameter variation, and deployment to real hardware.
+Reinforcement learning control system for the Quanser QUBE-Servo 2 inverted pendulum. Implements SAC/PPO training in physics-based simulation, hardware deployment via serial, and benchmarking against PID/LQR baselines.
 
 ## Commands
 
@@ -12,59 +12,70 @@ Reinforcement Learning control of a QUBE-Servo 2 inverted pendulum, comparing SA
 # Install dependencies
 pip install -r requirements.txt
 
-# Train SAC agent (main entry point)
-python SimRL.py
+# Training
+python SimRL.py                      # Main SAC training
+python SimRLSimple.py                # Simplified SAC variant
+python SimRLPPO.py                   # PPO training
+python SimRLPar.py                   # Parallel multi-core training launcher
+python episode_parallel_trainer.py   # Multi-core training with hyperparameter evolution
 
-# Train PPO variant
-python SimRLPPO.py
+# Hardware deployment (requires QUBE connected via serial)
+cd QUBE_PYTHON && python main.py     # Real-time control loop
+cd QUBE_PYTHON && python gui.py      # PyQt GUI for monitoring
 
-# Parallel episode training
-python episode_parallel_trainer.py
+# Visualization & analysis
+python RewardViz.py                  # Interactive reward function explorer
+python PIDvsRL/plots.py              # PID vs RL comparison plots
 
-# Visualize reward function (interactive Tkinter GUI)
-python RewardViz.py
-
-# Run on real QUBE-Servo 2 hardware
-cd QUBE_PYTHON && python main.py
-
-# Compare PID vs RL performance
-python PIDvsRL/plots.py
+# System identification
+python SimSI.py                      # Basic system identification
+python SimSI2.0.py                   # Enhanced system identification
+python SimEI.py                      # Energy-based system identification
 ```
 
-No formal test suite, linter, or build system exists.
+No build system, test runner, or linter is configured. No formal test suite exists.
 
 ## Architecture
 
-**Simulation & Training (`SimRL.py`)** — self-contained ~900-line file containing:
-- Lagrangian physics model with RK4 integration (`dynamics_step()`, numba-JIT compiled)
-- `ParameterManager` — randomizes system parameters (mass, inertia, damping, motor constants) between episodes for robustness
-- `VariableTimeGenerator` — produces non-uniform time steps to train robust policies
-- `PendulumEnv` — Gym-like environment. State: `[theta_0, theta_1, theta_0_dot, theta_1_dot]` (arm angle, pendulum angle from upright, angular velocities). Observation: 6D (sin/cos of angles + scaled velocities). Action: continuous `[-1, 1]` mapped to motor voltage.
-- `Actor` / `Critic` / `SACAgent` — standard SAC with dual Q-networks, automatic entropy tuning, and replay buffer
-- `train()` — main loop with multi-seed aggregation, TensorBoard logging, and robustness evaluation at 15%/25%/50% parameter variation
+**Two main pipelines: simulation training and hardware deployment.**
 
-**Hardware Control (`QUBE_PYTHON/`)** — interfaces with physical QUBE-Servo 2 over serial:
-- `ControlRL.py` (and 2.0/3.0 versions) — loads trained actor network, applies to hardware readings
-- `ControlPID.py`, `ControlLQR.py` — baseline controllers
-- `pendulum_kalman_filter.py` — state estimation for noisy sensor data
-- `main.py` — entry point with multithreading for real-time control
+### Simulation & Training (`SimRL.py` and variants)
 
-**Simulation Variants** — experimental iterations on the core SimRL approach:
-- `SimWC.py`/`SimWCF.py` — world coordinate frame
-- `SimSI.py`/`SimSI2.0.py` — SI unit variants
-- `SimEI.py` — energy-informed reward
-- `SimRLPar.py` — parallel training variant
+Each `SimXX.py` file is self-contained with its own copies of:
+- `PendulumEnv` — Gymnasium-compatible environment with RK4 physics integration, domain randomization (`ParameterManager`), and variable timesteps (`VariableTimeGenerator`)
+- `SACAgent` / `PPOAgent` — Actor-Critic networks with `ReplayBuffer`
+- Training loop with TensorBoard logging
 
-**Analysis (`PIDvsRL/`, `SAC/`)** — performance comparison data, trained models, and plotting scripts.
+State space: `[θ_arm, θ_pendulum, θ̇_arm, θ̇_pendulum]`. Physics uses Lagrangian mechanics with motor back-EMF and viscous damping.
 
-## Key Physics & Domain Details
+`SimWC.py` / `SimWCF.py` add cable dynamics and frequency-dependent damping respectively.
 
-- Motor deadzone: voltages in `[-0.2, 0.2]V` produce zero torque
-- Arm angle hard limits: `[-2.2, 2.2]` radians (reflects physical stops)
-- Base max voltage: 6.0V; training varies voltage range (typically 2.0–6.0V)
-- Parameter variation during training: typically 40%, tested at 15%/25%/50%
-- Reward function: multi-component (upright bonus, stability, arm centering, energy efficiency, limit penalties, voltage change penalties)
+### Hardware Control (`QUBE_PYTHON/`)
 
-## Additional Hardware Dependencies
+- `main.py` — Entry point; runs the control loop calling `control_system()` from `control.py`
+- `QUBE.py` — Serial protocol handler for QUBE hardware
+- `ControlRL.py` / `ControlPID.py` / `ControlLQR.py` — Swappable controller implementations
+- `gui.py` + `liveplot.py` — PyQt5 real-time visualization
+- `com.py` — COM port and serial settings
+- `config.py` — Plot display settings
 
-For `QUBE_PYTHON/`: `pyserial`, `PyQt5`, `pyqtgraph` (not in requirements.txt).
+### Parallel Training (`episode_parallel_trainer.py`, `SimRLPar.py`)
+
+`OptimizedCPUAffinityTrainer` runs per-episode training across cores with Gaussian hyperparameter evolution, selecting best configs by reward.
+
+### Supporting Artifacts
+
+- `models/` — Trained PyTorch policy weights (`.pth` files)
+- `matlab/` — MATLAB validation: parameter estimation (WyNDA), model comparison, dynamics simulation
+- `PIDvsRL/` — Benchmarking data (Excel/CSV) comparing PID and RL at various voltage limits
+- `QUBE/examples/` — Arduino firmware for encoder reading and serial communication
+
+## Key Dependencies
+
+PyTorch (torch, torchrl), Gymnasium, NumPy, Numba (JIT for physics), SciPy, PySerial, PyQt5, pyqtgraph, TensorBoard, lion-pytorch, psutil.
+
+## Important Notes
+
+- System parameters (motor resistance, damping coefficients, etc.) are hardcoded in each `SimXX.py` file — they are not shared via a central config.
+- The `SimXX.py` variants duplicate significant code (env, agent, buffer). Changes to core logic may need replication across files.
+- Hardware code assumes a specific COM port configured in `QUBE_PYTHON/com.py`.

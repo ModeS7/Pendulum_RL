@@ -14,7 +14,7 @@ User defines:
 from PID import *
 
 # Arduino COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 # Using mac?
 USING_MAC = False

@@ -21,7 +21,7 @@ import numpy as np
 import os
 
 # Update with your COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 
 # PID Controller class

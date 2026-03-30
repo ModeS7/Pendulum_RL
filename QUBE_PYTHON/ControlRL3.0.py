@@ -29,7 +29,7 @@ import threading
 from pendulum_kalman_filter import PendulumKalmanFilter  # Save the previous code as this file
 
 # Update with your COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 # System parameters (copied from your training code)
 # Assuming you've defined these in a separate file

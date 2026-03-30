@@ -23,7 +23,7 @@ import csv
 from datetime import datetime
 
 # Update with your COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 # Control mode constants (from simulation)
 EMERGENCY_MODE = 0

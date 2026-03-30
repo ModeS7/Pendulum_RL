@@ -27,7 +27,7 @@ import numpy as np
 from datetime import datetime
 import argparse
 # Update with your COM port
-COM_PORT = "COM10"
+COM_PORT = "COM3"
 
 
 class SimpleSimulator:
