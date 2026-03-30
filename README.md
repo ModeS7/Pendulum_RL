@@ -2,6 +2,21 @@
 
 Reinforcement learning controller for the Quanser QUBE-Servo 2 inverted pendulum. This project trains a Soft Actor-Critic (SAC) agent in simulation and deploys it on real hardware, comparing performance against classical PID and LQR controllers.
 
+## Demo
+
+### PID Swing-Up and Balance
+![PID swing-up and balance](PID.gif)
+
+### RL Swing-Up
+RL achieves significantly faster swing-up than PID.
+
+![RL swing-up](RL_swingup.gif)
+
+### RL Disturbance Recovery
+RL recovers quickly after the pendulum is pushed.
+
+![RL disturbance recovery](RL_control.gif)
+
 ## Overview
 
 The project covers the full pipeline from system identification and simulation to RL training and hardware deployment:

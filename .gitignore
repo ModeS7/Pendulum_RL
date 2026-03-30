@@ -34,3 +34,17 @@ runs/
 # Environment
 .env
 venv/
+
+# Claude Code
+.claude/
+
+# Profiling
+*.prof
+
+# Parallel training output
+episode_parallel_results*/
+
+# Temp/experimental
+temp/
+expe/
+expierment/
