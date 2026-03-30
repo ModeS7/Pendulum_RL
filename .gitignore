@@ -24,6 +24,9 @@ Thumbs.db
 # PyTorch (validated models are tracked intentionally)
 *.pth
 
+# Plots
+*.png
+
 # Logs
 *.log
 logs/
